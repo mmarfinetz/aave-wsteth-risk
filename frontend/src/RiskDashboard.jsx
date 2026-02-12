@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect, useCallback, useContext, createContext } from "react";
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -9,12 +9,13 @@ import {
   ChevronDown, ChevronRight, Info, ExternalLink,
   Database, Zap, Lock, DollarSign, Percent,
   Clock, Users, GitBranch, BarChart3, Layers,
+  RefreshCw, Wifi, WifiOff, Loader2,
 } from "lucide-react";
 
 /* ═══════════════════════════════════════════════════════════════
-   DATA PAYLOAD — Full simulation output
+   DATA PAYLOAD — Embedded demo/fallback data
    ═══════════════════════════════════════════════════════════════ */
-const DATA = {
+const DEMO_DATA = {
   timestamp: "2026-02-12T15:30:00+00:00",
   data_sources: {
     params: "on-chain + DeFiLlama (defaults used)",
@@ -222,6 +223,33 @@ const DATA = {
 
 
 /* ═══════════════════════════════════════════════════════════════
+   DATA CONTEXT — allows all subcomponents to read simulation data
+   ═══════════════════════════════════════════════════════════════ */
+const DataContext = createContext(null);
+const useData = () => useContext(DataContext);
+
+const API_URL = "/api/dashboard";
+
+/**
+ * Fetch simulation results from the API backend.
+ * Returns { data, error } — data is the parsed JSON or null.
+ */
+async function fetchDashboardData(signal) {
+  const resp = await fetch(API_URL, { signal });
+  if (resp.status === 202) {
+    /* Simulation still running — caller should retry */
+    const body = await resp.json();
+    throw new Error(body.message || "Simulation in progress, retrying...");
+  }
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.error || `API returned ${resp.status}`);
+  }
+  return resp.json();
+}
+
+
+/* ═══════════════════════════════════════════════════════════════
    FORMATTING UTILITIES
    ═══════════════════════════════════════════════════════════════ */
 const fmtPct = (v, decimals = 2) => {
@@ -399,7 +427,8 @@ function ChartTooltip({ active, payload, label, formatter }) {
 /* ═══════════════════════════════════════════════════════════════
    SECTION A: MASTHEAD
    ═══════════════════════════════════════════════════════════════ */
-function Masthead() {
+function Masthead({ dataSourceSlot }) {
+  const DATA = useData();
   const pos = DATA.position_summary;
   const rm = DATA.risk_metrics;
   const hf = pos.health_factor;
@@ -418,6 +447,7 @@ function Masthead() {
           </span>
         </div>
         <div className="flex items-center gap-4">
+          {dataSourceSlot}
           <span className="font-mono text-[10px] px-2 py-0.5 bg-[rgba(45,212,191,0.08)] text-[#2dd4bf] border border-[rgba(45,212,191,0.15)]">
             {fmtNum(rm.n_simulations, 0)} paths × {rm.horizon_days}d horizon
           </span>
@@ -474,6 +504,7 @@ function VitalPill({ label, value, color, sublabel }) {
    SECTION B: APY & RATE RISK
    ═══════════════════════════════════════════════════════════════ */
 function ApyWaterfall() {
+  const DATA = useData();
   const apy = DATA.current_apy;
   const bars = [
     { name: "Gross Yield", value: apy.gross, color: "#2dd4bf", cumulative: apy.gross },
@@ -554,6 +585,7 @@ function ApyWaterfall() {
 
 
 function BorrowRateFanChart() {
+  const DATA = useData();
   const fan = DATA.rate_forecast.borrow_rate_fan_pct;
   const chartData = fan["50"].map((_, i) => ({
     day: i,
@@ -660,6 +692,7 @@ function BorrowRateFanChart() {
    SECTION C: RISK ANALYTICS
    ═══════════════════════════════════════════════════════════════ */
 function RiskDecompositionDonut() {
+  const DATA = useData();
   const rd = DATA.risk_decomposition;
   const segments = [
     { name: "Carry / Rate", pct: rd.carry_risk_pct, eth: rd.carry_var_95_eth, color: "#f0b429" },
@@ -733,6 +766,7 @@ function RiskDecompositionDonut() {
 
 
 function RiskMetricsGrid() {
+  const DATA = useData();
   const rm = DATA.risk_metrics;
   const rd = DATA.risk_decomposition;
   const metrics = [
@@ -791,6 +825,7 @@ function RiskMetricsGrid() {
    SECTION D: UTILIZATION DYNAMICS
    ═══════════════════════════════════════════════════════════════ */
 function UtilizationPanel() {
+  const DATA = useData();
   const ua = DATA.utilization_analytics;
 
   /* Approximate the beta PDF for visual display */
@@ -956,6 +991,7 @@ function UtilizationPanel() {
    SECTION E: STRESS TESTING
    ═══════════════════════════════════════════════════════════════ */
 function StressTestTable() {
+  const DATA = useData();
   const [expanded, setExpanded] = useState(null);
   const tests = DATA.stress_tests;
 
@@ -1082,6 +1118,7 @@ function StressTestTable() {
    SECTION F: UNWIND & EXECUTION RISK
    ═══════════════════════════════════════════════════════════════ */
 function UnwindCostPanel() {
+  const DATA = useData();
   const uw = DATA.unwind_costs;
   const levels = ["10pct", "25pct", "50pct", "100pct"];
   const labels = { "10pct": "10%", "25pct": "25%", "50pct": "50%", "100pct": "100%" };
@@ -1204,6 +1241,7 @@ function UnwindCostPanel() {
    SECTION G: DATA PROVENANCE & CONFIGURATION
    ═══════════════════════════════════════════════════════════════ */
 function DataProvenancePanel() {
+  const DATA = useData();
   const ds = DATA.data_sources;
   const sc = DATA.simulation_config;
 
@@ -1378,6 +1416,7 @@ function DataProvenancePanel() {
    SECTION H: METHODOLOGY & FORMULAS
    ═══════════════════════════════════════════════════════════════ */
 function MethodologySection() {
+  const DATA = useData();
   const F = ({ children }) => (
     <span className="font-mono text-[#f0b429]">{children}</span>
   );
@@ -1618,6 +1657,7 @@ function FormulaBlock({ id, title, formula, note, insight }) {
    SECTION I: FOOTER
    ═══════════════════════════════════════════════════════════════ */
 function Footer() {
+  const DATA = useData();
   return (
     <footer className="border-t border-[rgba(255,255,255,0.06)] py-6 px-6">
       <div className="flex items-center justify-between font-mono text-[10px] text-txt-muted">
@@ -1647,62 +1687,253 @@ function Footer() {
 
 
 /* ═══════════════════════════════════════════════════════════════
+   LOADING & ERROR STATES
+   ═══════════════════════════════════════════════════════════════ */
+function LoadingScreen({ message, isRetrying }) {
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center" style={{ background: "#0a0b0d" }}>
+      <div className="text-center max-w-md">
+        <Shield size={32} className="mx-auto mb-4" style={{ color: "#f0b429" }} />
+        <h1 className="font-mono text-lg font-semibold text-txt-primary mb-2">
+          wstETH/WETH Risk Dashboard
+        </h1>
+        <div className="flex items-center justify-center gap-2 mb-4">
+          <Loader2 size={16} className="animate-spin" style={{ color: "#f0b429" }} />
+          <span className="font-mono text-sm text-txt-secondary">
+            {message || "Fetching simulation data..."}
+          </span>
+        </div>
+        {isRetrying && (
+          <div className="font-mono text-[10px] text-txt-muted mt-2 px-4 py-2 bg-[rgba(240,180,41,0.06)] border border-[rgba(240,180,41,0.15)]">
+            Simulation running on backend — Monte Carlo paths take time to compute. Retrying automatically...
+          </div>
+        )}
+        <div className="mt-6 h-px w-48 mx-auto" style={{ background: "linear-gradient(90deg, transparent, #f0b42940, transparent)" }} />
+      </div>
+    </div>
+  );
+}
+
+function ErrorScreen({ error, onRetry, onUseDemoData }) {
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center" style={{ background: "#0a0b0d" }}>
+      <div className="text-center max-w-lg">
+        <WifiOff size={32} className="mx-auto mb-4" style={{ color: "#ef4444" }} />
+        <h1 className="font-mono text-lg font-semibold text-txt-primary mb-2">
+          Cannot Reach API Server
+        </h1>
+        <div className="font-mono text-xs text-txt-secondary mb-4 leading-relaxed px-4">
+          {error}
+        </div>
+        <div className="bg-[#111318] border border-[rgba(255,255,255,0.06)] p-4 text-left mb-6">
+          <div className="font-mono text-[10px] tracking-[0.08em] uppercase text-txt-muted mb-2">
+            TO START THE API SERVER
+          </div>
+          <div className="font-mono text-xs text-[#f0b429] space-y-1">
+            <div># Live mode (runs full simulation on first request):</div>
+            <div className="text-txt-primary">python api.py</div>
+            <div className="mt-2 text-[#f0b429]"># Demo mode (serve cached results from out.json):</div>
+            <div className="text-txt-primary">python run_dashboard.py --json {">"} out.json</div>
+            <div className="text-txt-primary">python api.py --demo</div>
+          </div>
+        </div>
+        <div className="flex items-center justify-center gap-3">
+          <button
+            onClick={onRetry}
+            className="font-mono text-xs px-4 py-2 border border-[rgba(255,255,255,0.12)] text-txt-primary hover:bg-[rgba(255,255,255,0.04)] transition-colors flex items-center gap-2"
+          >
+            <RefreshCw size={12} /> Retry Connection
+          </button>
+          <button
+            onClick={onUseDemoData}
+            className="font-mono text-xs px-4 py-2 bg-[rgba(240,180,41,0.1)] border border-[rgba(240,180,41,0.25)] text-[#f0b429] hover:bg-[rgba(240,180,41,0.15)] transition-colors"
+          >
+            Use Demo Data
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Data source indicator shown in the masthead area */
+function DataSourceBadge({ source, fetchedAt, onRefresh, isRefreshing }) {
+  const isLive = source === "api";
+  return (
+    <div className="flex items-center gap-2">
+      {isLive ? (
+        <span className="flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 bg-[rgba(45,212,191,0.08)] text-[#2dd4bf] border border-[rgba(45,212,191,0.15)]">
+          <Wifi size={10} /> LIVE
+        </span>
+      ) : (
+        <span className="flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 bg-[rgba(240,180,41,0.08)] text-[#f0b429] border border-[rgba(240,180,41,0.15)]">
+          <Database size={10} /> DEMO
+        </span>
+      )}
+      {fetchedAt && (
+        <span className="font-mono text-[10px] text-txt-muted">
+          fetched {new Date(fetchedAt).toLocaleTimeString()}
+        </span>
+      )}
+      <button
+        onClick={onRefresh}
+        disabled={isRefreshing}
+        className="p-1 hover:bg-[rgba(255,255,255,0.04)] transition-colors rounded disabled:opacity-30"
+        title="Refresh data from API"
+      >
+        <RefreshCw size={12} className={`text-txt-secondary ${isRefreshing ? "animate-spin" : ""}`} />
+      </button>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════
    MAIN DASHBOARD COMPONENT
    ═══════════════════════════════════════════════════════════════ */
 export default function RiskDashboard() {
+  const [data, setData] = useState(null);
+  const [dataSource, setDataSource] = useState(null); // "api" | "demo"
+  const [fetchedAt, setFetchedAt] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState(null);
+  const [retryMsg, setRetryMsg] = useState(null);
+
+  const loadFromApi = useCallback(async (isRefresh = false) => {
+    if (isRefresh) {
+      setIsRefreshing(true);
+    } else {
+      setLoading(true);
+      setError(null);
+    }
+    setRetryMsg(null);
+
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 4000;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const result = await fetchDashboardData();
+        setData(result);
+        setDataSource("api");
+        setFetchedAt(Date.now());
+        setLoading(false);
+        setIsRefreshing(false);
+        setError(null);
+        return;
+      } catch (err) {
+        /* If the simulation is still running (202), retry after delay */
+        if (attempt < MAX_RETRIES && err.message.includes("in progress")) {
+          setRetryMsg(`Simulation running... retry ${attempt + 1}/${MAX_RETRIES}`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY));
+          continue;
+        }
+        /* Final failure */
+        if (!isRefresh) {
+          setError(err.message);
+          setLoading(false);
+        }
+        setIsRefreshing(false);
+        return;
+      }
+    }
+  }, []);
+
+  const useDemoData = useCallback(() => {
+    setData(DEMO_DATA);
+    setDataSource("demo");
+    setFetchedAt(null);
+    setLoading(false);
+    setError(null);
+  }, []);
+
+  /* On mount: try API, fall back to demo on network error */
+  useEffect(() => {
+    loadFromApi(false);
+  }, [loadFromApi]);
+
+  /* Loading state */
+  if (loading) {
+    return <LoadingScreen message={retryMsg} isRetrying={!!retryMsg} />;
+  }
+
+  /* Error state — no data loaded yet */
+  if (error && !data) {
+    return (
+      <ErrorScreen
+        error={error}
+        onRetry={() => loadFromApi(false)}
+        onUseDemoData={useDemoData}
+      />
+    );
+  }
+
+  /* Data loaded — render dashboard */
   return (
-    <div className="min-h-screen" style={{ background: "#0a0b0d" }}>
-      {/* Section A: Masthead */}
-      <Masthead />
+    <DataContext.Provider value={data}>
+      <div className="min-h-screen" style={{ background: "#0a0b0d" }}>
+        {/* Section A: Masthead (with data source badge injected) */}
+        <Masthead
+          dataSourceSlot={
+            <DataSourceBadge
+              source={dataSource}
+              fetchedAt={fetchedAt}
+              onRefresh={() => loadFromApi(true)}
+              isRefreshing={isRefreshing}
+            />
+          }
+        />
 
-      <GoldRule />
+        <GoldRule />
 
-      {/* Main content grid */}
-      <div className="max-w-[1600px] mx-auto px-6 py-6">
-        {/* 60/40 asymmetric layout */}
-        <div className="grid grid-cols-1 xl:grid-cols-[1fr_0.67fr] gap-5">
-          {/* LEFT COLUMN — Primary risk panels */}
-          <div className="space-y-5">
-            {/* Section B: APY & Rate Risk */}
-            <ApyWaterfall />
-            <BorrowRateFanChart />
+        {/* Main content grid */}
+        <div className="max-w-[1600px] mx-auto px-6 py-6">
+          {/* 60/40 asymmetric layout */}
+          <div className="grid grid-cols-1 xl:grid-cols-[1fr_0.67fr] gap-5">
+            {/* LEFT COLUMN — Primary risk panels */}
+            <div className="space-y-5">
+              {/* Section B: APY & Rate Risk */}
+              <ApyWaterfall />
+              <BorrowRateFanChart />
 
-            {/* Section C: Risk Analytics */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-              <RiskDecompositionDonut />
-              <RiskMetricsGrid />
+              {/* Section C: Risk Analytics */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <RiskDecompositionDonut />
+                <RiskMetricsGrid />
+              </div>
+
+              {/* Section D: Utilization Dynamics */}
+              <UtilizationPanel />
             </div>
 
-            {/* Section D: Utilization Dynamics */}
-            <UtilizationPanel />
+            {/* RIGHT COLUMN — Secondary panels */}
+            <div className="space-y-5">
+              {/* Section E: Stress Testing */}
+              <StressTestTable />
+
+              {/* Section F: Unwind & Execution Risk */}
+              <UnwindCostPanel />
+
+              {/* Section G: Data Provenance */}
+              <DataProvenancePanel />
+            </div>
           </div>
 
-          {/* RIGHT COLUMN — Secondary panels */}
-          <div className="space-y-5">
-            {/* Section E: Stress Testing */}
-            <StressTestTable />
+          <div className="mt-6">
+            <GoldRule />
+          </div>
 
-            {/* Section F: Unwind & Execution Risk */}
-            <UnwindCostPanel />
-
-            {/* Section G: Data Provenance */}
-            <DataProvenancePanel />
+          {/* Section H: Methodology (full width) */}
+          <div className="mt-6">
+            <MethodologySection />
           </div>
         </div>
 
-        <div className="mt-6">
-          <GoldRule />
-        </div>
-
-        {/* Section H: Methodology (full width) */}
-        <div className="mt-6">
-          <MethodologySection />
-        </div>
+        {/* Section I: Footer */}
+        <GoldRule />
+        <Footer />
       </div>
-
-      {/* Section I: Footer */}
-      <GoldRule />
-      <Footer />
-    </div>
+    </DataContext.Provider>
   );
 }
