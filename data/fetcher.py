@@ -2,7 +2,7 @@
 On-chain and API data fetcher for Aave V3, wstETH, Curve, and ETH market data.
 
 Sources:
-- Aave V3 PoolDataProvider: 0x7B4EB56E7CD4b454BA8ff71E4518426c84533203
+- Aave V3 PoolDataProvider: 0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3
 - wstETH contract: 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0
 - DeFiLlama API: https://api.llama.fi
 - CoinGecko API: https://api.coingecko.com/api/v3
@@ -12,6 +12,7 @@ All fetched parameters are logged with source and timestamp.
 Fallback: timestamped JSON cache with stale-data warnings.
 """
 
+import copy
 import json
 import os
 import time
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from config.params import DEFAULT_GAS_PRICE_GWEI
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_FILE = CACHE_DIR / "params_cache.json"
@@ -31,6 +33,63 @@ CACHE_FILE = CACHE_DIR / "params_cache.json"
 # Stale threshold: 24 hours
 STALE_THRESHOLD_SECONDS = 86400
 _LAST_HTTP_ERROR_CODE: int | None = None
+
+# Aave V3 Ethereum mainnet addresses
+AAVE_V3_POOL_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3"
+AAVE_V3_POOL = "0x87870Bca3F3fD6335C3f4ce8392D69350B4fa4E2"
+AAVE_V3_ADDRESSES_PROVIDER = "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e"
+WETH_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+WSTETH_ADDRESS = "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+ETH_CORRELATED_EMODE_CATEGORY = 1
+
+# Curve stETH/ETH pool
+CURVE_STETH_POOL = "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022"
+
+# Public Ethereum JSON-RPC endpoints (free, no auth required)
+DEFAULT_RPC_ENDPOINTS = [
+    "https://ethereum-rpc.publicnode.com",  # PublicNode — free, no auth
+    "https://1rpc.io/eth",                  # 1RPC — free, no auth
+    "https://eth.drpc.org",                 # dRPC — free, no auth
+    "https://eth.llamarpc.com",             # DeFiLlama — free, no auth
+    "https://cloudflare-eth.com",           # Cloudflare — free, no auth
+]
+
+# Function selectors (first 4 bytes of keccak256(signature))
+SEL_GET_EMODE_CATEGORY_DATA = "6c6f6ae1"  # getEModeCategoryData(uint8)
+SEL_GET_RESERVE_CONFIGURATION_DATA = "3e150141"  # getReserveConfigurationData(address)
+SEL_GET_INTEREST_RATE_STRATEGY_ADDRESS = "6744362a"  # getInterestRateStrategyAddress(address)
+SEL_GET_PRICE_ORACLE = "fca513a8"  # getPriceOracle()
+SEL_OPTIMAL_USAGE_RATIO = "54c365c6"  # OPTIMAL_USAGE_RATIO()
+SEL_OPTIMAL_USAGE_RATIO_BY_ASSET = "7191ef16"  # OPTIMAL_USAGE_RATIO(address)
+SEL_GET_OPTIMAL_USAGE_RATIO = "aa33f063"  # getOptimalUsageRatio(address) — V3.1
+SEL_GET_BASE_VARIABLE_BORROW_RATE = "34762ca5"  # getBaseVariableBorrowRate()
+SEL_GET_BASE_VARIABLE_BORROW_RATE_BY_ASSET = "cca22ea1"  # getBaseVariableBorrowRate(address)
+SEL_GET_VARIABLE_RATE_SLOPE1 = "0b3429a2"  # getVariableRateSlope1()
+SEL_GET_VARIABLE_RATE_SLOPE1_BY_ASSET = "5b651bae"  # getVariableRateSlope1(address)
+SEL_GET_VARIABLE_RATE_SLOPE2 = "f4202409"  # getVariableRateSlope2()
+SEL_GET_VARIABLE_RATE_SLOPE2_BY_ASSET = "8f4b0d5d"  # getVariableRateSlope2(address)
+SEL_STETH_PER_TOKEN = "035faf82"  # stEthPerToken()
+SEL_CURVE_A = "f446c1d0"              # A()
+SEL_CURVE_BALANCES = "4903b0d1"       # balances(uint256)
+SEL_GET_RESERVE_DATA = "35ea6a75"     # getReserveData(address)
+SEL_TOTAL_SUPPLY = "18160ddd"         # totalSupply()
+
+STRICT_AAVE_REQUIRED_PARAMS = {
+    "ltv",
+    "liquidation_threshold",
+    "liquidation_bonus",
+    "base_rate",
+    "slope1",
+    "slope2",
+    "optimal_utilization",
+    "reserve_factor",
+    "current_weth_utilization",
+    "weth_total_supply",
+    "weth_total_borrows",
+    "eth_collateral_fraction",
+    "steth_supply_apy",
+    "aave_oracle_address",
+}
 
 
 @dataclass
@@ -68,7 +127,8 @@ class FetchedData:
     # Market
     steth_eth_price: float = 1.0
     eth_usd_price: float = 2500.0
-    gas_price_gwei: float = 0.0
+    gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI
+    aave_oracle_address: str = ""
 
     # Curve pool
     curve_amp_factor: int = 50
@@ -76,6 +136,9 @@ class FetchedData:
 
     # ETH price history (daily closes, last 90 days)
     eth_price_history: list[float] = field(default_factory=list)
+    steth_eth_price_history: list[float] = field(default_factory=list)
+    weth_borrow_apy_history: list[float] = field(default_factory=list)
+    weth_borrow_apy_timestamps: list[int] = field(default_factory=list)
 
     # Metadata
     last_updated: str = ""
@@ -101,6 +164,11 @@ def _coingecko_api_key() -> str | None:
     return os.getenv("COINGECKO_API_KEY") or os.getenv("COINGECKO_DEMO_API_KEY")
 
 
+def _etherscan_api_key() -> str | None:
+    """Read Etherscan API key from environment, if provided."""
+    return os.getenv("ETHERSCAN_API_KEY") or os.getenv("ETHERSCAN_KEY")
+
+
 def _with_coingecko_api_key(url: str) -> str:
     """Attach CoinGecko demo API key query param when available."""
     if "api.coingecko.com" not in url:
@@ -117,12 +185,30 @@ def _with_coingecko_api_key(url: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(query=new_query))
 
 
+def _with_etherscan_api_key(url: str) -> str:
+    """Attach Etherscan API key query param when available."""
+    if "api.etherscan.io" not in url:
+        return url
+    key = _etherscan_api_key()
+    if not key:
+        return url
+
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    if "apikey" not in query:
+        query["apikey"] = [key]
+    new_query = urllib.parse.urlencode(query, doseq=True)
+    return urllib.parse.urlunparse(parsed._replace(query=new_query))
+
+
 def _redact_url(url: str) -> str:
     """Redact sensitive query values from URLs before logging."""
     parsed = urllib.parse.urlparse(url)
     query = urllib.parse.parse_qs(parsed.query)
     if "x_cg_demo_api_key" in query:
         query["x_cg_demo_api_key"] = ["***"]
+    if "apikey" in query:
+        query["apikey"] = ["***"]
     safe_query = urllib.parse.urlencode(query, doseq=True)
     return urllib.parse.urlunparse(parsed._replace(query=safe_query))
 
@@ -132,6 +218,7 @@ def _http_get_json(url: str, timeout: int = 15) -> dict | list | None:
     global _LAST_HTTP_ERROR_CODE
     _LAST_HTTP_ERROR_CODE = None
     url = _with_coingecko_api_key(url)
+    url = _with_etherscan_api_key(url)
     retries = 2
     backoff = 1.0
     for attempt in range(retries + 1):
@@ -159,11 +246,680 @@ def _http_get_json(url: str, timeout: int = 15) -> dict | list | None:
     return None
 
 
-def fetch_aave_weth_params(data: FetchedData) -> bool:
+def _abi_encode_uint256(value: int) -> str:
+    """Encode uint256 as 32-byte hex (without 0x)."""
+    return f"{int(value):064x}"
+
+
+def _abi_encode_address(address: str) -> str:
+    """Encode address as 32-byte ABI word (without 0x)."""
+    clean = address.lower().replace("0x", "")
+    return clean.rjust(64, "0")
+
+
+def _decode_abi_words(result_hex: str | None) -> list[int]:
+    """Decode ABI-encoded uint256 words from an eth_call hex payload."""
+    if not result_hex or not isinstance(result_hex, str) or not result_hex.startswith("0x"):
+        return []
+    payload = result_hex[2:]
+    if len(payload) == 0 or len(payload) % 64 != 0:
+        return []
+    words = []
+    for i in range(0, len(payload), 64):
+        words.append(int(payload[i:i + 64], 16))
+    return words
+
+
+def _decode_first_word(result_hex: str | None) -> int | None:
+    """Decode the first ABI uint256 word from an eth_call result."""
+    words = _decode_abi_words(result_hex)
+    if not words:
+        return None
+    return words[0]
+
+
+def _decode_address_word(result_hex: str | None) -> str | None:
+    """Decode an ABI address (right-most 20 bytes of first return word)."""
+    value = _decode_first_word(result_hex)
+    if value is None:
+        return None
+    return f"0x{value:040x}"
+
+
+def _ray_to_float(raw_value: int | None) -> float | None:
+    """Convert Aave RAY (1e27) fixed-point values to floats."""
+    if raw_value is None:
+        return None
+    return raw_value / 1e27
+
+
+def _positive_float(value: Any) -> float | None:
+    """Parse positive numeric values, returning None for blanks/invalids."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0.0:
+        return None
+    return numeric
+
+
+def _timestamp_to_unix_seconds(value: Any) -> int | None:
+    """Parse timestamps from DeFiLlama/CoinGecko payloads into Unix seconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, np.integer)):
+        ts = int(value)
+        # Some APIs return milliseconds.
+        if ts > 10**12:
+            ts //= 1000
+        if ts > 0:
+            return ts
+        return None
+    if isinstance(value, float):
+        ts = int(value)
+        if ts > 10**12:
+            ts //= 1000
+        if ts > 0:
+            return ts
+        return None
+    if isinstance(value, str):
+        # Numeric string.
+        try:
+            return _timestamp_to_unix_seconds(float(value))
+        except ValueError:
+            pass
+        # ISO-8601 timestamp.
+        iso = value.strip()
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(iso)
+        except ValueError:
+            return None
+        return int(parsed.timestamp())
+    return None
+
+
+def _has_logged_param(data: FetchedData, name: str) -> bool:
+    """Return True if a parameter was logged in the current fetch run."""
+    return any(
+        isinstance(entry, dict) and entry.get("name") == name
+        for entry in data.params_log
+    )
+
+
+def _is_live_aave_source(source: str) -> bool:
+    """Return True when source provenance is on-chain Aave/wstETH or DeFiLlama."""
+    lower = source.lower()
+    return (
+        "aave" in lower
+        or "on-chain" in lower
+        or "onchain" in lower
+        or "wsteth contract" in lower
+        or "defillama" in lower
+    )
+
+
+def _validate_strict_aave_sources(data: FetchedData) -> tuple[bool, list[str]]:
     """
-    Fetch Aave V3 WETH reserve data from DeFiLlama.
-    Source: DeFiLlama Aave V3 Ethereum WETH pool.
+    Validate strict Aave sourcing for critical fields.
+
+    In strict mode, every critical Aave field must be fetched in the current run
+    and sourced from Aave/wstETH on-chain calls or DeFiLlama fallback.
     """
+    latest_source_by_name: dict[str, str] = {}
+    for entry in data.params_log:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        source = entry.get("source")
+        if isinstance(name, str) and isinstance(source, str):
+            latest_source_by_name[name] = source
+
+    errors = []
+    for name in sorted(STRICT_AAVE_REQUIRED_PARAMS):
+        source = latest_source_by_name.get(name)
+        if source is None:
+            errors.append(f"{name}: missing live value")
+            continue
+        if not _is_live_aave_source(source):
+            errors.append(f"{name}: invalid source '{source}'")
+
+    return (len(errors) == 0, errors)
+
+
+def _fetch_eth_usd_spot_from_defillama(data: FetchedData) -> bool:
+    """Fetch ETH/USD spot from DeFiLlama coins endpoint."""
+    url = "https://coins.llama.fi/prices/current/coingecko:ethereum"
+    result = _http_get_json(url, timeout=20)
+    if not isinstance(result, dict):
+        return False
+
+    coins = result.get("coins")
+    if not isinstance(coins, dict):
+        return False
+
+    eth_entry = coins.get("coingecko:ethereum")
+    if not isinstance(eth_entry, dict):
+        return False
+
+    price = _positive_float(eth_entry.get("price"))
+    if price is None:
+        return False
+
+    data.eth_usd_price = float(price)
+    data.log_param(
+        "eth_usd_price",
+        round(data.eth_usd_price, 2),
+        "DeFiLlama coins API ETH/USD spot",
+    )
+    return True
+
+
+def _fetch_eth_usd_spot_from_coingecko(data: FetchedData) -> bool:
+    """Fetch ETH/USD spot from CoinGecko simple price endpoint."""
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+    result = _http_get_json(url, timeout=20)
+    if not isinstance(result, dict):
+        return False
+
+    eth_entry = result.get("ethereum")
+    if not isinstance(eth_entry, dict):
+        return False
+
+    price = _positive_float(eth_entry.get("usd"))
+    if price is None:
+        return False
+
+    data.eth_usd_price = float(price)
+    data.log_param(
+        "eth_usd_price",
+        round(data.eth_usd_price, 2),
+        "CoinGecko ETH/USD simple price",
+    )
+    return True
+
+
+def _resolve_weth_price_usd(data: FetchedData) -> float | None:
+    """
+    Resolve WETH/USD using explicit, non-default sources.
+
+    Priority:
+    1) ETH/USD from fetched price history
+    2) DeFiLlama coins spot ETH/USD
+    3) CoinGecko simple spot ETH/USD
+    """
+    if data.eth_price_history:
+        hist_price = _positive_float(data.eth_usd_price)
+        if hist_price is not None:
+            print(
+                "  [INFO] DeFiLlama WETH price missing — using ETH/USD from "
+                "price history fallback."
+            )
+            return hist_price
+
+    if _fetch_eth_usd_spot_from_defillama(data):
+        print(
+            "  [INFO] DeFiLlama WETH price missing — using ETH/USD from "
+            "DeFiLlama spot fallback."
+        )
+        return _positive_float(data.eth_usd_price)
+
+    if _fetch_eth_usd_spot_from_coingecko(data):
+        print(
+            "  [INFO] DeFiLlama WETH price missing — using ETH/USD from "
+            "CoinGecko spot fallback."
+        )
+        return _positive_float(data.eth_usd_price)
+
+    return None
+
+
+def _get_rpc_url() -> str | None:
+    """Read optional user-provided Ethereum RPC URL from environment."""
+    return os.getenv("ETH_RPC_URL") or None
+
+
+def _rpc_json_request(endpoint: str, payload: dict,
+                      timeout: int = 10) -> dict | None:
+    """Send a JSON-RPC POST request. Returns parsed JSON on success, else None."""
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "aave-risk-dashboard/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+            OSError, TimeoutError):
+        return None
+
+
+def _rpc_eth_call(to_address: str, call_data: str,
+                  timeout: int = 10) -> str | None:
+    """
+    Execute eth_call via public JSON-RPC endpoints.
+
+    Tries ETH_RPC_URL first (if set), then DEFAULT_RPC_ENDPOINTS in order.
+    Returns raw hex payload on success, else None.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": to_address, "data": call_data}, "latest"],
+    }
+    endpoints = []
+    user_rpc = _get_rpc_url()
+    if user_rpc:
+        endpoints.append(user_rpc)
+    endpoints.extend(DEFAULT_RPC_ENDPOINTS)
+
+    for endpoint in endpoints:
+        result = _rpc_json_request(endpoint, payload, timeout=timeout)
+        if result and isinstance(result.get("result"), str):
+            value = result["result"]
+            if value.startswith("0x") and len(value) > 2:
+                return value
+    return None
+
+
+def _rpc_gas_price(timeout: int = 10) -> str | None:
+    """
+    Execute eth_gasPrice via public JSON-RPC endpoints.
+
+    Returns raw hex gas price on success, else None.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_gasPrice",
+        "params": [],
+    }
+    endpoints = []
+    user_rpc = _get_rpc_url()
+    if user_rpc:
+        endpoints.append(user_rpc)
+    endpoints.extend(DEFAULT_RPC_ENDPOINTS)
+
+    for endpoint in endpoints:
+        result = _rpc_json_request(endpoint, payload, timeout=timeout)
+        if result and isinstance(result.get("result"), str):
+            value = result["result"]
+            if value.startswith("0x"):
+                return value
+    return None
+
+
+def _etherscan_eth_call_direct(to_address: str, call_data: str,
+                               timeout: int = 15) -> str | None:
+    """
+    Execute eth_call via Etherscan proxy API.
+
+    Returns raw hex payload on success, else None.
+    """
+    query = urllib.parse.urlencode(
+        {
+            "module": "proxy",
+            "action": "eth_call",
+            "to": to_address,
+            "data": call_data,
+            "tag": "latest",
+        }
+    )
+    url = f"https://api.etherscan.io/api?{query}"
+    result = _http_get_json(url, timeout=timeout)
+    if not isinstance(result, dict):
+        return None
+    payload = result.get("result")
+    if isinstance(payload, str) and payload.startswith("0x"):
+        return payload
+    return None
+
+
+def _eth_call(to_address: str, call_data: str,
+              timeout: int = 15) -> str | None:
+    """
+    Execute eth_call with public RPC as primary, Etherscan as fallback.
+
+    1. Try public JSON-RPC endpoints (free, no auth)
+    2. Fall back to Etherscan proxy API
+    """
+    result = _rpc_eth_call(to_address, call_data, timeout=timeout)
+    if result is not None:
+        return result
+    return _etherscan_eth_call_direct(to_address, call_data, timeout=timeout)
+
+
+def _valid_bps(value: int, lo: int = 0, hi: int = 10000) -> bool:
+    return lo <= value <= hi
+
+
+def _decode_emode_category_bps(result_hex: str | None) -> tuple[int, int, int] | None:
+    """
+    Decode (ltv, liquidation_threshold, liquidation_bonus) from eMode call result.
+
+    Supports both layouts seen across tooling/providers:
+    - Static tuple head starts at word 0
+    - ABI dynamic top-level tuple where word 0 is an offset (typically 0x20)
+      and tuple head starts at that offset.
+    """
+    words = _decode_abi_words(result_hex)
+    if len(words) < 3:
+        return None
+
+    candidate_starts: list[int] = []
+    first_word = words[0]
+    if first_word % 32 == 0:
+        offset_start = first_word // 32
+        if offset_start + 2 < len(words):
+            candidate_starts.append(offset_start)
+    candidate_starts.append(0)
+
+    for start in candidate_starts:
+        ltv_bps = words[start]
+        lt_bps = words[start + 1]
+        bonus_bps = words[start + 2]
+        if (
+            _valid_bps(ltv_bps, 1, 10000)
+            and _valid_bps(lt_bps, 1, 10000)
+            and _valid_bps(bonus_bps, 10000, 13000)
+        ):
+            return int(ltv_bps), int(lt_bps), int(bonus_bps)
+    return None
+
+
+def _fetch_aave_onchain_pool_params(data: FetchedData) -> bool:
+    """
+    Fetch live Aave V3 pool parameters from on-chain contracts via Etherscan.
+
+    Covers:
+    - eMode LTV / liquidation threshold / liquidation bonus
+    - WETH reserve factor
+    - WETH interest rate strategy parameters (base, slopes, kink)
+    - Oracle contract address
+    """
+    fetched_any = False
+    emode_loaded = False
+
+    # eMode category (ETH-correlated): ltv, liquidationThreshold, liquidationBonus
+    emode_call = "0x" + SEL_GET_EMODE_CATEGORY_DATA + _abi_encode_uint256(
+        ETH_CORRELATED_EMODE_CATEGORY
+    )
+    emode_raw = _eth_call(AAVE_V3_POOL, emode_call)
+    emode_bps = _decode_emode_category_bps(emode_raw)
+    if emode_bps is not None:
+        ltv_bps, lt_bps, bonus_bps = emode_bps
+        data.ltv = round(ltv_bps / 10_000.0, 4)
+        data.liquidation_threshold = round(lt_bps / 10_000.0, 4)
+        data.liquidation_bonus = round((bonus_bps - 10_000) / 10_000.0, 6)
+        data.log_param(
+            "ltv",
+            data.ltv,
+            "Aave V3 Pool getEModeCategoryData(1)",
+        )
+        data.log_param(
+            "liquidation_threshold",
+            data.liquidation_threshold,
+            "Aave V3 Pool getEModeCategoryData(1)",
+        )
+        data.log_param(
+            "liquidation_bonus",
+            data.liquidation_bonus,
+            "Aave V3 Pool getEModeCategoryData(1)",
+        )
+        fetched_any = True
+        emode_loaded = True
+
+    # Global price oracle address from addresses provider.
+    oracle_raw = _eth_call(
+        AAVE_V3_ADDRESSES_PROVIDER,
+        "0x" + SEL_GET_PRICE_ORACLE,
+    )
+    oracle_addr = _decode_address_word(oracle_raw)
+    if oracle_addr:
+        data.aave_oracle_address = oracle_addr
+        data.log_param(
+            "aave_oracle_address",
+            oracle_addr,
+            "Aave V3 PoolAddressesProvider getPriceOracle()",
+        )
+        fetched_any = True
+
+    # WETH reserve configuration (includes reserve factor).
+    reserve_cfg_call = (
+        "0x"
+        + SEL_GET_RESERVE_CONFIGURATION_DATA
+        + _abi_encode_address(WETH_ADDRESS)
+    )
+    reserve_cfg_raw = _eth_call(AAVE_V3_POOL_DATA_PROVIDER, reserve_cfg_call)
+    reserve_words = _decode_abi_words(reserve_cfg_raw)
+    if len(reserve_words) >= 5:
+        # V3 layout is typically: decimals, ltv, lt, bonus, reserveFactor, ...
+        if reserve_words[0] <= 36:
+            ltv_bps = reserve_words[1]
+            lt_bps = reserve_words[2]
+            bonus_bps = reserve_words[3]
+            reserve_factor_bps = reserve_words[4]
+        else:
+            # Fallback for alternate layout.
+            ltv_bps = reserve_words[0]
+            lt_bps = reserve_words[1]
+            bonus_bps = reserve_words[2]
+            reserve_factor_bps = reserve_words[4]
+
+        if _valid_bps(reserve_factor_bps, 0, 10000):
+            data.reserve_factor = round(reserve_factor_bps / 10_000.0, 6)
+            data.log_param(
+                "reserve_factor",
+                data.reserve_factor,
+                "Aave V3 PoolDataProvider getReserveConfigurationData(WETH)",
+            )
+            fetched_any = True
+
+        # If eMode fetch failed, fallback to reserve-level LTV/LT/bonus.
+        if (
+            not emode_loaded
+            and _valid_bps(ltv_bps, 1, 10000)
+            and _valid_bps(lt_bps, 1, 10000)
+            and _valid_bps(bonus_bps, 10000, 13000)
+        ):
+            data.ltv = round(ltv_bps / 10_000.0, 4)
+            data.liquidation_threshold = round(lt_bps / 10_000.0, 4)
+            data.liquidation_bonus = round((bonus_bps - 10_000) / 10_000.0, 6)
+            data.log_param(
+                "ltv",
+                data.ltv,
+                "Aave V3 PoolDataProvider getReserveConfigurationData(WETH)",
+            )
+            data.log_param(
+                "liquidation_threshold",
+                data.liquidation_threshold,
+                "Aave V3 PoolDataProvider getReserveConfigurationData(WETH)",
+            )
+            data.log_param(
+                "liquidation_bonus",
+                data.liquidation_bonus,
+                "Aave V3 PoolDataProvider getReserveConfigurationData(WETH)",
+            )
+            fetched_any = True
+
+    # Get strategy contract for WETH.
+    strategy_addr_call = (
+        "0x"
+        + SEL_GET_INTEREST_RATE_STRATEGY_ADDRESS
+        + _abi_encode_address(WETH_ADDRESS)
+    )
+    strategy_addr_raw = _eth_call(AAVE_V3_POOL_DATA_PROVIDER, strategy_addr_call)
+    strategy_addr = _decode_address_word(strategy_addr_raw)
+    if strategy_addr:
+        data.log_param(
+            "weth_interest_rate_strategy",
+            strategy_addr,
+            "Aave V3 PoolDataProvider getInterestRateStrategyAddress(WETH)",
+        )
+
+        def _read_strategy_rate(selector_with_asset: str,
+                                selector_no_arg: str) -> float | None:
+            raw = _eth_call(
+                strategy_addr,
+                "0x" + selector_with_asset + _abi_encode_address(WETH_ADDRESS),
+            )
+            value = _decode_first_word(raw)
+            if value is None:
+                raw = _eth_call(strategy_addr, "0x" + selector_no_arg)
+                value = _decode_first_word(raw)
+            return _ray_to_float(value)
+
+        base_rate = _read_strategy_rate(
+            SEL_GET_BASE_VARIABLE_BORROW_RATE_BY_ASSET,
+            SEL_GET_BASE_VARIABLE_BORROW_RATE,
+        )
+        slope1 = _read_strategy_rate(
+            SEL_GET_VARIABLE_RATE_SLOPE1_BY_ASSET,
+            SEL_GET_VARIABLE_RATE_SLOPE1,
+        )
+        slope2 = _read_strategy_rate(
+            SEL_GET_VARIABLE_RATE_SLOPE2_BY_ASSET,
+            SEL_GET_VARIABLE_RATE_SLOPE2,
+        )
+
+        optimal_raw = _eth_call(
+            strategy_addr,
+            "0x" + SEL_OPTIMAL_USAGE_RATIO_BY_ASSET + _abi_encode_address(WETH_ADDRESS),
+        )
+        optimal_u = _ray_to_float(_decode_first_word(optimal_raw))
+        if optimal_u is None:
+            optimal_raw = _eth_call(strategy_addr, "0x" + SEL_OPTIMAL_USAGE_RATIO)
+            optimal_u = _ray_to_float(_decode_first_word(optimal_raw))
+        if optimal_u is None:
+            # V3.1 DefaultReserveInterestRateStrategyV2 uses getOptimalUsageRatio(address)
+            optimal_raw = _eth_call(
+                strategy_addr,
+                "0x" + SEL_GET_OPTIMAL_USAGE_RATIO + _abi_encode_address(WETH_ADDRESS),
+            )
+            optimal_u = _ray_to_float(_decode_first_word(optimal_raw))
+
+        if base_rate is not None:
+            data.base_rate = float(base_rate)
+            data.log_param(
+                "base_rate",
+                round(data.base_rate, 6),
+                "Aave V3 strategy getBaseVariableBorrowRate(WETH)",
+            )
+            fetched_any = True
+        if slope1 is not None:
+            data.slope1 = float(slope1)
+            data.log_param(
+                "slope1",
+                round(data.slope1, 6),
+                "Aave V3 strategy getVariableRateSlope1(WETH)",
+            )
+            fetched_any = True
+        if slope2 is not None:
+            data.slope2 = float(slope2)
+            data.log_param(
+                "slope2",
+                round(data.slope2, 6),
+                "Aave V3 strategy getVariableRateSlope2(WETH)",
+            )
+            fetched_any = True
+        if optimal_u is not None and 0.0 < optimal_u < 1.0:
+            data.optimal_utilization = float(optimal_u)
+            data.log_param(
+                "optimal_utilization",
+                round(data.optimal_utilization, 6),
+                "Aave V3 strategy optimal usage ratio on-chain (WETH)",
+            )
+            fetched_any = True
+
+    return fetched_any
+
+
+def _fetch_weth_reserve_data_onchain(data: FetchedData) -> bool:
+    """
+    Fetch WETH supply/borrows from Aave V3 Pool getReserveData(WETH) on-chain.
+
+    getReserveData returns ReserveDataLegacy struct (ABI-encoded as a tuple of
+    15 static fields, each padded to 32 bytes):
+      [0] configuration, [1] liquidityIndex, [2] currentLiquidityRate,
+      [3] variableBorrowIndex, [4] currentVariableBorrowRate,
+      [5] currentStableBorrowRate, [6] lastUpdateTimestamp, [7] id,
+      [8] aTokenAddress, [9] stableDebtTokenAddress,
+      [10] variableDebtTokenAddress, [11] interestRateStrategyAddress,
+      [12] accruedToTreasury, [13] unbacked, [14] isolationModeTotalDebt
+
+    We extract aToken (word 8) and variableDebtToken (word 10), then call
+    totalSupply() on each to get actual WETH supply and borrows in wei.
+    """
+    reserve_call = "0x" + SEL_GET_RESERVE_DATA + _abi_encode_address(WETH_ADDRESS)
+    reserve_raw = _eth_call(AAVE_V3_POOL, reserve_call)
+    words = _decode_abi_words(reserve_raw)
+    if len(words) < 11:
+        return False
+
+    atoken_addr = f"0x{words[8]:040x}"
+    debt_token_addr = f"0x{words[10]:040x}"
+
+    # Sanity: addresses should be non-zero
+    if words[8] == 0 or words[10] == 0:
+        return False
+
+    supply_call = "0x" + SEL_TOTAL_SUPPLY
+    supply_raw = _eth_call(atoken_addr, supply_call)
+    supply_wei = _decode_first_word(supply_raw)
+
+    borrow_call = "0x" + SEL_TOTAL_SUPPLY
+    borrow_raw = _eth_call(debt_token_addr, borrow_call)
+    borrow_wei = _decode_first_word(borrow_raw)
+
+    if supply_wei is None or borrow_wei is None or supply_wei == 0:
+        return False
+
+    supply_eth = supply_wei / 1e18
+    borrow_eth = borrow_wei / 1e18
+    utilization = borrow_eth / supply_eth
+
+    data.weth_total_supply = round(supply_eth, 2)
+    data.weth_total_borrows = round(borrow_eth, 2)
+    data.current_weth_utilization = round(min(max(utilization, 0.0), 1.0), 4)
+    data.log_param(
+        "weth_total_supply", data.weth_total_supply,
+        "Aave V3 Pool getReserveData(WETH) → aToken.totalSupply()",
+    )
+    data.log_param(
+        "weth_total_borrows", data.weth_total_borrows,
+        "Aave V3 Pool getReserveData(WETH) → variableDebtToken.totalSupply()",
+    )
+    data.log_param(
+        "current_weth_utilization", data.current_weth_utilization,
+        "On-chain WETH borrows / supply",
+    )
+    return True
+
+
+def _fetch_defillama_weth_market_state(data: FetchedData) -> bool:
+    """
+    Fetch ETH collateral fraction and (when available) WETH utilization from
+    DeFiLlama.
+
+    Primary value: eth_collateral_fraction (cross-pool aggregate — only
+    available from an API that lists all Aave V3 Ethereum pools).
+
+    WETH supply/borrows are best sourced on-chain via getReserveData; this
+    function only overrides them when DeFiLlama provides complete data.
+    """
+    fetched = False
+    have_onchain_weth_state = (
+        _has_logged_param(data, "weth_total_supply")
+        and _has_logged_param(data, "weth_total_borrows")
+    )
     url = "https://yields.llama.fi/pools"
     result = _http_get_json(url, timeout=20)
     if result is None or not isinstance(result, dict):
@@ -171,6 +927,7 @@ def fetch_aave_weth_params(data: FetchedData) -> bool:
 
     pools = result.get("data", [])
 
+    # --- ETH collateral fraction (cross-pool aggregate) ---
     aave_eth_pools = [
         pool for pool in pools
         if pool.get("project") == "aave-v3" and pool.get("chain") == "Ethereum"
@@ -194,7 +951,9 @@ def fetch_aave_weth_params(data: FetchedData) -> bool:
             data.eth_collateral_fraction,
             "DeFiLlama yields API — Aave V3 Ethereum ETH-symbol collateral share",
         )
+        fetched = True
 
+    # --- WETH supply/borrows (supplement on-chain if DeFiLlama has full data) ---
     weth_pool = None
     for pool in pools:
         if (pool.get("project") == "aave-v3"
@@ -204,89 +963,156 @@ def fetch_aave_weth_params(data: FetchedData) -> bool:
             break
 
     if weth_pool is None:
-        print("  [WARN] Could not find Aave V3 WETH pool on DeFiLlama")
-        return False
+        return fetched
 
-    # Extract utilization and TVL
-    tvl = float(weth_pool.get("tvlUsd") or 0.0)
-    total_supply_usd = float(weth_pool.get("totalSupplyUsd") or tvl or 0.0)
+    total_supply_usd = float(weth_pool.get("totalSupplyUsd") or weth_pool.get("tvlUsd") or 0.0)
     total_borrow_usd_raw = (
         weth_pool.get("totalBorrowUsd")
         or weth_pool.get("totalBorrowUSD")
         or weth_pool.get("totalBorrow")
     )
 
-    if total_supply_usd > 0 and total_borrow_usd_raw is not None:
-        total_borrow_usd = float(total_borrow_usd_raw)
-        utilization = total_borrow_usd / total_supply_usd
-        data.current_weth_utilization = round(min(max(utilization, 0.0), 1.0), 4)
-        data.log_param("current_weth_utilization", data.current_weth_utilization,
-                       "DeFiLlama yields API — Aave V3 Ethereum WETH")
-    else:
-        print("  [WARN] WETH borrow/supply fields missing — keeping existing utilization")
+    if total_supply_usd <= 0 or total_borrow_usd_raw is None:
+        if have_onchain_weth_state:
+            print(
+                "  [INFO] DeFiLlama WETH borrows missing — keeping on-chain "
+                "reserve totals."
+            )
+            return True
+        if _fetch_weth_reserve_data_onchain(data):
+            print("  [INFO] DeFiLlama WETH borrows missing — used on-chain fallback")
+            return True
+        return fetched
 
-    # APY data
-    apy_base = weth_pool.get("apyBase", 0)
-    if apy_base is not None:
-        data.log_param("weth_supply_apy", round(apy_base, 4),
-                       "DeFiLlama yields API")
+    total_borrow_usd = max(float(total_borrow_usd_raw), 0.0)
+    if have_onchain_weth_state:
+        print(
+            "  [INFO] DeFiLlama WETH totals available — retaining on-chain "
+            "reserve totals."
+        )
+        return True
 
-    data.data_source = "DeFiLlama API"
-    return True
+    utilization = total_borrow_usd / total_supply_usd
+    data.current_weth_utilization = round(min(max(utilization, 0.0), 1.0), 4)
+    data.log_param(
+        "current_weth_utilization",
+        data.current_weth_utilization,
+        "DeFiLlama yields API — Aave V3 Ethereum WETH",
+    )
+
+    # WETH price: try DeFiLlama fields, then ETH/USD (WETH = wrapped ETH,
+    # they are fungible by definition so ETH/USD IS the WETH price).
+    weth_price_usd = None
+    for key in ("underlyingTokenPriceUsd", "priceUsd", "price"):
+        weth_price_usd = _positive_float(weth_pool.get(key))
+        if weth_price_usd is not None:
+            break
+    if weth_price_usd is None:
+        weth_price_usd = _resolve_weth_price_usd(data)
+
+    if weth_price_usd is not None:
+        total_supply_eth = total_supply_usd / weth_price_usd
+        total_borrow_eth = total_borrow_usd / weth_price_usd
+        if total_supply_eth > 0:
+            total_borrow_eth = min(max(total_borrow_eth, 0.0), total_supply_eth)
+            data.weth_total_supply = round(total_supply_eth, 2)
+            data.weth_total_borrows = round(total_borrow_eth, 2)
+            data.log_param(
+                "weth_total_supply",
+                data.weth_total_supply,
+                "DeFiLlama yields API — Aave V3 Ethereum WETH totalSupplyUsd",
+            )
+            data.log_param(
+                "weth_total_borrows",
+                data.weth_total_borrows,
+                "DeFiLlama yields API — Aave V3 Ethereum WETH totalBorrowUsd",
+            )
+    fetched = True
+
+    return fetched
+
+
+def fetch_aave_weth_params(data: FetchedData) -> bool:
+    """
+    Fetch Aave WETH market state + core risk params.
+
+    Live sources (in priority order):
+    - On-chain via public RPC (fallback: Etherscan proxy) eth_call:
+      eMode LTV/LT/bonus, reserve factor, rate strategy params, oracle address,
+      WETH supply/borrows via getReserveData + totalSupply
+    - DeFiLlama:
+      ETH collateral fraction (cross-pool aggregate), WETH supply/borrows
+      (supplements on-chain when available)
+    """
+    onchain_ok = _fetch_aave_onchain_pool_params(data)
+    reserve_ok = _fetch_weth_reserve_data_onchain(data)
+    llama_ok = _fetch_defillama_weth_market_state(data)
+    any_ok = onchain_ok or reserve_ok or llama_ok
+    if any_ok:
+        sources = []
+        if onchain_ok or reserve_ok:
+            sources.append("on-chain")
+        if llama_ok:
+            sources.append("DeFiLlama")
+        data.data_source = " + ".join(sources) + " APIs"
+    return any_ok
+
+
+def _parse_gas_hex(raw: str, source: str, data: FetchedData) -> bool:
+    """Parse hex gas price string to gwei and store in data. Returns True on success."""
+    try:
+        gas_wei = int(raw, 16)
+        gas_gwei = gas_wei / 1e9
+        if gas_gwei > 0:
+            data.gas_price_gwei = round(gas_gwei, 3)
+            data.log_param("gas_price_gwei", data.gas_price_gwei, source)
+            return True
+    except ValueError:
+        pass
+    return False
 
 
 def fetch_eth_gas_price(data: FetchedData) -> bool:
     """
     Fetch current Ethereum gas price (gwei).
-    Source: Etherscan proxy eth_gasPrice RPC endpoint.
+    Source 1: Public RPC eth_gasPrice. Source 2: Etherscan proxy.
     """
+    # Try public RPC first
+    rpc_raw = _rpc_gas_price()
+    if rpc_raw and _parse_gas_hex(rpc_raw, "Public RPC eth_gasPrice", data):
+        return True
+
+    # Fallback to Etherscan proxy
     url = "https://api.etherscan.io/api?module=proxy&action=eth_gasPrice"
     result = _http_get_json(url)
     if result and isinstance(result, dict):
         raw = result.get("result")
         if isinstance(raw, str):
-            try:
-                gas_wei = int(raw, 16)
-                gas_gwei = gas_wei / 1e9
-                if gas_gwei > 0:
-                    data.gas_price_gwei = round(gas_gwei, 3)
-                    data.log_param(
-                        "gas_price_gwei",
-                        data.gas_price_gwei,
-                        "Etherscan proxy API eth_gasPrice",
-                    )
-                    return True
-            except ValueError:
-                return False
+            return _parse_gas_hex(raw, "Etherscan proxy API eth_gasPrice", data)
     return False
 
 
 def fetch_wsteth_exchange_rate(data: FetchedData) -> bool:
     """
     Fetch wstETH/stETH exchange rate.
-    Source: DeFiLlama stETH/wstETH data or CoinGecko.
-    The rate comes from stEthPerToken() on 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0.
+    Source: on-chain stEthPerToken() via public RPC (fallback: Etherscan proxy).
     """
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=wrapped-steth&vs_currencies=eth"
-    result = _http_get_json(url)
-    if result and "wrapped-steth" in result:
-        wsteth_eth = result["wrapped-steth"].get("eth")
-        if wsteth_eth and wsteth_eth > 1.0:
-            data.wsteth_steth_rate = round(float(wsteth_eth), 6)
-            data.log_param("wsteth_steth_rate", data.wsteth_steth_rate,
-                           "CoinGecko wstETH/ETH price (proxy for exchange rate)")
-            return True
+    call_data = "0x" + SEL_STETH_PER_TOKEN
+    raw = _eth_call(WSTETH_ADDRESS, call_data)
+    steth_per_token_raw = _decode_first_word(raw)
+    if steth_per_token_raw is None:
+        return False
 
-    # Fallback: DeFiLlama
-    url2 = "https://coins.llama.fi/prices/current/ethereum:0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
-    result2 = _http_get_json(url2)
-    if result2 and "coins" in result2:
-        coin_key = "ethereum:0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
-        coin_data = result2["coins"].get(coin_key, {})
-        price_usd = coin_data.get("price")
-        if price_usd:
-            data.log_param("wsteth_price_usd", price_usd, "DeFiLlama price API")
-            return True
+    # stEthPerToken() is a 1e18-scaled exchange rate.
+    rate = steth_per_token_raw / 1e18
+    if 1.0 < rate < 2.0:
+        data.wsteth_steth_rate = round(float(rate), 6)
+        data.log_param(
+            "wsteth_steth_rate",
+            data.wsteth_steth_rate,
+            "wstETH contract stEthPerToken() via Etherscan proxy eth_call",
+        )
+        return True
 
     return False
 
@@ -330,11 +1156,164 @@ def fetch_eth_price_history(data: FetchedData, days: int = 90) -> bool:
     return False
 
 
+def fetch_steth_eth_price_history(data: FetchedData, days: int = 365) -> bool:
+    """
+    Fetch stETH/ETH daily price history from CoinGecko.
+
+    Used to calibrate depeg jump-diffusion and slashing tail severity from data.
+    """
+    url = (
+        "https://api.coingecko.com/api/v3/coins/staked-ether/market_chart"
+        f"?vs_currency=eth&days={days}&interval=daily"
+    )
+    result = _http_get_json(url, timeout=20)
+    if result and "prices" in result:
+        prices = [float(p[1]) for p in result["prices"] if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if len(prices) >= 30:
+            data.steth_eth_price_history = [round(p, 6) for p in prices]
+            # Keep spot aligned to latest history point if available.
+            data.steth_eth_price = round(prices[-1], 6)
+            data.log_param(
+                "steth_eth_price_history",
+                f"{len(prices)} daily prices over {days}d",
+                f"CoinGecko stETH/ETH market chart ({days}d)",
+            )
+            return True
+    return False
+
+
+def _resolve_defillama_weth_pool_id() -> str | None:
+    """Resolve the DeFiLlama pool id for Aave V3 Ethereum WETH."""
+    payload = _http_get_json("https://yields.llama.fi/pools", timeout=20)
+    if not isinstance(payload, dict):
+        return None
+    pools = payload.get("data", [])
+    if not isinstance(pools, list):
+        return None
+
+    for pool in pools:
+        if not isinstance(pool, dict):
+            continue
+        if (
+            pool.get("project") == "aave-v3"
+            and pool.get("chain") == "Ethereum"
+            and str(pool.get("symbol", "")).upper() == "WETH"
+        ):
+            pool_id = pool.get("pool")
+            if isinstance(pool_id, str) and pool_id:
+                return pool_id
+    return None
+
+
+def fetch_weth_borrow_apy_history(data: FetchedData, min_points: int = 30) -> bool:
+    """
+    Fetch Aave V3 Ethereum WETH borrow APY history from DeFiLlama chart API.
+
+    Preference order for APY keys:
+    1) apyBaseBorrow
+    2) apyBorrow
+    3) apy
+    4) apyBase (fallback when borrow-specific keys are missing)
+    """
+    pool_id = _resolve_defillama_weth_pool_id()
+    if not pool_id:
+        return False
+
+    chart_url = f"https://yields.llama.fi/chart/{pool_id}"
+    payload = _http_get_json(chart_url, timeout=20)
+    if not isinstance(payload, dict):
+        return False
+    points = payload.get("data")
+    if not isinstance(points, list) or len(points) < min_points:
+        return False
+
+    rates: list[float] = []
+    timestamps: list[int] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+
+        rate_pct = None
+        for key in ("apyBaseBorrow", "apyBorrow", "apy", "apyBase"):
+            candidate = point.get(key)
+            if candidate is None:
+                continue
+            try:
+                rate_pct = float(candidate)
+            except (TypeError, ValueError):
+                rate_pct = None
+            if rate_pct is not None:
+                break
+        if rate_pct is None:
+            continue
+
+        ts = _timestamp_to_unix_seconds(point.get("timestamp"))
+        if ts is None:
+            continue
+
+        # DeFiLlama APY fields are percentages.
+        rate_decimal = rate_pct / 100.0
+        if rate_decimal < 0.0:
+            continue
+        rates.append(float(rate_decimal))
+        timestamps.append(ts)
+
+    if len(rates) < min_points:
+        return False
+
+    order = np.argsort(np.asarray(timestamps, dtype=np.int64))
+    data.weth_borrow_apy_history = [float(rates[i]) for i in order]
+    data.weth_borrow_apy_timestamps = [int(timestamps[i]) for i in order]
+    data.log_param(
+        "weth_borrow_apy_history",
+        f"{len(data.weth_borrow_apy_history)} points",
+        f"DeFiLlama chart API ({pool_id})",
+    )
+    return True
+
+
 def fetch_steth_supply_apy(data: FetchedData) -> bool:
     """
-    Fetch stETH supply APY on Aave (income from stETH being borrowed).
-    Source: DeFiLlama Aave V3 Ethereum wstETH pool.
+    Fetch stETH supply APY on Aave.
+
+    Priority:
+    1) On-chain Aave getReserveData(wstETH).currentLiquidityRate
+    2) DeFiLlama fallback
     """
+    if _fetch_steth_supply_apy_onchain(data):
+        return True
+
+    return _fetch_steth_supply_apy_from_defillama(data)
+
+
+def _fetch_steth_supply_apy_onchain(data: FetchedData) -> bool:
+    """
+    Fetch wstETH supply APY from Aave on-chain liquidity rate.
+
+    Uses Aave V3 Pool getReserveData(wstETH) and reads field [2]
+    currentLiquidityRate (RAY, 1e27).
+    """
+    reserve_call = "0x" + SEL_GET_RESERVE_DATA + _abi_encode_address(WSTETH_ADDRESS)
+    reserve_raw = _eth_call(AAVE_V3_POOL, reserve_call)
+    words = _decode_abi_words(reserve_raw)
+    if len(words) < 3:
+        return False
+
+    liquidity_rate = _ray_to_float(words[2])
+    if liquidity_rate is None or liquidity_rate < 0.0:
+        return False
+
+    data.steth_supply_apy = round(float(liquidity_rate), 6)
+    data.log_param(
+        "steth_supply_apy",
+        data.steth_supply_apy,
+        "Aave V3 Pool getReserveData(wstETH) currentLiquidityRate",
+    )
+    return True
+
+
+def _fetch_steth_supply_apy_from_defillama(data: FetchedData) -> bool:
+    """Fallback: fetch stETH supply APY from DeFiLlama."""
     url = "https://yields.llama.fi/pools"
     result = _http_get_json(url, timeout=20)
     if result is None or not isinstance(result, dict):
@@ -360,10 +1339,48 @@ def fetch_steth_supply_apy(data: FetchedData) -> bool:
     return False
 
 
+def _fetch_curve_pool_onchain(data: FetchedData) -> bool:
+    """
+    Fetch Curve stETH/ETH pool parameters directly from on-chain contracts.
+
+    Calls A() for amplification coefficient and balances(0)/balances(1) for
+    ETH and stETH reserves. Pool depth = (ETH + stETH) / 2.
+    """
+    # A() — amplification coefficient
+    a_raw = _eth_call(CURVE_STETH_POOL, "0x" + SEL_CURVE_A)
+    a_value = _decode_first_word(a_raw)
+
+    # balances(0) — ETH balance, balances(1) — stETH balance
+    bal0_raw = _eth_call(CURVE_STETH_POOL,
+                         "0x" + SEL_CURVE_BALANCES + _abi_encode_uint256(0))
+    bal0 = _decode_first_word(bal0_raw)
+
+    bal1_raw = _eth_call(CURVE_STETH_POOL,
+                         "0x" + SEL_CURVE_BALANCES + _abi_encode_uint256(1))
+    bal1 = _decode_first_word(bal1_raw)
+
+    if a_value is None or bal0 is None or bal1 is None:
+        return False
+
+    if a_value <= 0 or bal0 == 0 or bal1 == 0:
+        return False
+
+    data.curve_amp_factor = int(a_value)
+    eth_balance = bal0 / 1e18
+    steth_balance = bal1 / 1e18
+    data.curve_pool_depth_eth = round((eth_balance + steth_balance) / 2, 0)
+
+    data.log_param("curve_amp_factor", data.curve_amp_factor,
+                   f"Curve stETH pool A() on-chain ({CURVE_STETH_POOL})")
+    data.log_param("curve_pool_depth_eth", data.curve_pool_depth_eth,
+                   f"Curve stETH pool balances() on-chain ({CURVE_STETH_POOL})")
+    return True
+
+
 def fetch_curve_pool_params(data: FetchedData) -> bool:
     """
     Fetch Curve stETH/ETH pool parameters.
-    Source: DeFiLlama or Curve API.
+    Source 1: Curve API. Source 2: On-chain A() + balances().
     Pool: 0xDC24316b9AE028F1497c275EB9192a3Ea0f67022
     """
     url = "https://api.curve.fi/api/getPools/ethereum/main"
@@ -388,7 +1405,9 @@ def fetch_curve_pool_params(data: FetchedData) -> bool:
                     data.log_param("curve_amp_factor", data.curve_amp_factor,
                                    "Curve API amplification factor")
                 return True
-    return False
+
+    # Curve API failed — try on-chain fallback
+    return _fetch_curve_pool_onchain(data)
 
 
 def _save_cache(data: FetchedData) -> None:
@@ -413,11 +1432,16 @@ def _save_cache(data: FetchedData) -> None:
         "steth_eth_price": data.steth_eth_price,
         "eth_usd_price": data.eth_usd_price,
         "gas_price_gwei": data.gas_price_gwei,
+        "aave_oracle_address": data.aave_oracle_address,
         "curve_amp_factor": data.curve_amp_factor,
         "curve_pool_depth_eth": data.curve_pool_depth_eth,
         "eth_price_history": data.eth_price_history,
+        "steth_eth_price_history": data.steth_eth_price_history,
+        "weth_borrow_apy_history": data.weth_borrow_apy_history,
+        "weth_borrow_apy_timestamps": data.weth_borrow_apy_timestamps,
         "last_updated": data.last_updated,
         "data_source": data.data_source,
+        "params_log": data.params_log,
     }
     with open(CACHE_FILE, "w") as f:
         json.dump(cache_dict, f, indent=2)
@@ -441,6 +1465,8 @@ def _load_cache() -> FetchedData | None:
                 and data.weth_total_borrows > 0):
             util = data.weth_total_borrows / data.weth_total_supply
             data.current_weth_utilization = round(min(max(util, 0.0), 1.0), 4)
+        if data.gas_price_gwei <= 0.0:
+            data.gas_price_gwei = DEFAULT_GAS_PRICE_GWEI
 
         return data
     except (json.JSONDecodeError, KeyError, TypeError):
@@ -452,6 +1478,34 @@ def _needs_refresh(data: FetchedData) -> bool:
     if data.current_weth_utilization <= 0.0:
         return True
     if not (0.0 < data.eth_collateral_fraction <= 1.0):
+        return True
+    if not (0.0 < data.ltv <= 1.0):
+        return True
+    if not (0.0 < data.liquidation_threshold <= 1.0):
+        return True
+    if not (0.0 <= data.liquidation_bonus <= 0.5):
+        return True
+    if not (0.0 < data.optimal_utilization < 1.0):
+        return True
+
+    required_pool_params = {
+        "ltv",
+        "liquidation_threshold",
+        "liquidation_bonus",
+        "base_rate",
+        "slope1",
+        "slope2",
+        "optimal_utilization",
+        "reserve_factor",
+        "weth_total_supply",
+        "weth_total_borrows",
+    }
+    fetched_names = {
+        entry.get("name")
+        for entry in data.params_log
+        if isinstance(entry, dict)
+    }
+    if not required_pool_params.issubset(fetched_names):
         return True
     return False
 
@@ -468,26 +1522,34 @@ def _is_stale(data: FetchedData) -> bool:
         return True
 
 
-def fetch_all(use_cache: bool = True, force_refresh: bool = False) -> FetchedData:
+def fetch_all(
+    use_cache: bool = True,
+    force_refresh: bool = False,
+    strict_aave: bool = True,
+) -> FetchedData:
     """
     Fetch all protocol parameters from on-chain/API sources.
 
     Strategy:
     1. Try to fetch from live APIs
-    2. On failure, fall back to cache with stale-data warning
-    3. Cache successful fetches with timestamps
+    2. In strict mode, require live Aave fields from on-chain/DeFiLlama only
+    3. Outside strict mode, fall back to cache with stale-data warning
+    4. Cache successful fetches with timestamps
 
     Parameters:
         use_cache: If True, use cache as fallback when APIs fail
         force_refresh: If True, skip cache and always try APIs first
+        strict_aave: If True, do not allow cache/defaults for critical Aave
+            fields. Require live values from on-chain (preferred) or
+            DeFiLlama fallback.
 
     Returns:
         FetchedData with all parameters and provenance log
     """
     cached = _load_cache() if use_cache else None
 
-    # Try cache first if not forcing refresh
-    if use_cache and not force_refresh:
+    # In non-strict mode, try cache first if not forcing refresh.
+    if use_cache and not force_refresh and not strict_aave:
         if cached and not _is_stale(cached):
             if _needs_refresh(cached):
                 print(
@@ -499,19 +1561,24 @@ def fetch_all(use_cache: bool = True, force_refresh: bool = False) -> FetchedDat
                 print(f"  [INFO] Using cached data from {cached.last_updated}")
                 return cached
 
-    # Start from cache so failed fetchers don't wipe previously-good values.
-    data = cached or FetchedData()
+    # In strict mode, start from clean defaults so stale cache values cannot
+    # silently satisfy critical Aave fields.
+    data = FetchedData() if strict_aave else (copy.deepcopy(cached) if cached else FetchedData())
+    # Fresh provenance for this fetch attempt.
+    data.params_log = []
     fetch_succeeded = False
 
     print("  [INFO] Fetching live protocol data...")
 
     # Fetch each data source, track successes
     sources = [
+        ("ETH price history", fetch_eth_price_history),
+        ("stETH/ETH price history", fetch_steth_eth_price_history),
         ("Aave WETH params", fetch_aave_weth_params),
         ("ETH gas price", fetch_eth_gas_price),
         ("wstETH exchange rate", fetch_wsteth_exchange_rate),
         ("stETH/ETH market price", fetch_steth_eth_price),
-        ("ETH price history", fetch_eth_price_history),
+        ("WETH borrow APY history", fetch_weth_borrow_apy_history),
         ("stETH supply APY", fetch_steth_supply_apy),
         ("Curve pool params", fetch_curve_pool_params),
     ]
@@ -529,8 +1596,27 @@ def fetch_all(use_cache: bool = True, force_refresh: bool = False) -> FetchedDat
 
     data.last_updated = datetime.now(timezone.utc).isoformat()
 
+    if strict_aave:
+        strict_ok, strict_errors = _validate_strict_aave_sources(data)
+        if not strict_ok:
+            print("  [ERROR] Strict Aave sourcing check failed:")
+            for err in strict_errors:
+                print(f"    - {err}")
+            if use_cache and cached:
+                print(
+                    "  [WARN] Strict mode forbids using cached Aave values; "
+                    "not falling back to cache."
+                )
+            raise RuntimeError(
+                "Strict Aave fetch failed: missing/invalid live sources for "
+                "critical Aave fields."
+            )
+
     if fetch_succeeded:
-        data.data_source = "live API"
+        if strict_aave:
+            data.data_source = "live API (Aave strict: on-chain + DeFiLlama fallback)"
+        else:
+            data.data_source = "live API"
         _save_cache(data)
     elif use_cache:
         # Fall back to cache
@@ -621,12 +1707,14 @@ def fetch_historical_stress_data() -> list[dict]:
           "eth_usd_price_7d_prior": ..., "source": ...}, ...]
     """
     cache = _load_historical_stress_cache()
+    timestamp_by_name = {entry["name"]: int(entry["timestamp"]) for entry in HISTORICAL_STRESS_DATES}
     if _historical_cache_complete(cache):
         cached_results = []
         for entry in HISTORICAL_STRESS_DATES:
             name = entry["name"]
             cached_record = dict(cache[name])
             cached_record["name"] = name
+            cached_record["timestamp"] = int(cached_record.get("timestamp", timestamp_by_name.get(name, 0)))
             source = str(cached_record.get("source", "historical cache"))
             if "cache" not in source:
                 cached_record["source"] = f"cache — {source}"
@@ -649,6 +1737,7 @@ def fetch_historical_stress_data() -> list[dict]:
             steth_eth = steth_usd / eth_usd if eth_usd > 0 else 1.0
             record = {
                 "name": name,
+                "timestamp": int(ts),
                 "steth_eth_price": round(steth_eth, 6),
                 "eth_usd_price": round(eth_usd, 2),
                 "eth_usd_price_7d_prior": round(prior_data["eth_usd"], 2),
@@ -663,6 +1752,7 @@ def fetch_historical_stress_data() -> list[dict]:
         if cache and name in cache:
             cached_record = dict(cache[name])
             cached_record["name"] = name
+            cached_record["timestamp"] = int(cached_record.get("timestamp", timestamp_by_name.get(name, 0)))
             if "source" not in cached_record or "cache" not in cached_record["source"]:
                 cached_record["source"] = f"cache — {cached_record.get('source', 'unknown')}"
             results.append(cached_record)

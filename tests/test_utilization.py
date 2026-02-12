@@ -1,12 +1,10 @@
 """Tests for utilization model and rate forecast."""
 
 import numpy as np
-import pytest
 
 from models.utilization_model import UtilizationModel
 from models.rate_forecast import RateForecast
 from models.aave_model import InterestRateModel
-from config.params import UTILIZATION
 
 
 class TestUtilizationModel:

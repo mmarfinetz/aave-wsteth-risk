@@ -1,11 +1,12 @@
 """
-WETH utilization model: Ornstein-Uhlenbeck process with market-driven target.
+WETH utilization model: latent mean-reverting state with cascade shocks.
 
-dU = κ_u * (U_target - U) * dt + σ_u * dW
+dU = κ_u * (U_target - U) * dt + σ_u * dW + dC
 
-U_target = U_bar + β_vol * σ_ETH + β_price * Δ_ETH
-
-Clipped to [0.40, 0.99].
+Where:
+- U_target is a latent utilization anchor (constant by default)
+- dC is an exogenous cascade shock increment
+- legacy ETH-vol/price target mapping remains available for backwards compatibility
 """
 
 import numpy as np
@@ -46,6 +47,8 @@ class UtilizationModel:
 
     def simulate(self, n_paths: int, n_steps: int, dt: float,
                  u0: float = 0.78,
+                 latent_target_paths: np.ndarray | None = None,
+                 cascade_shock_paths: np.ndarray | None = None,
                  eth_vol_paths: np.ndarray | None = None,
                  eth_price_change_paths: np.ndarray | None = None,
                  rng: np.random.Generator | None = None) -> np.ndarray:
@@ -57,8 +60,11 @@ class UtilizationModel:
             n_steps: Number of time steps
             dt: Time step (year fraction)
             u0: Initial utilization
-            eth_vol_paths: (n_paths, n_steps) annualized ETH vol
-            eth_price_change_paths: (n_paths, n_steps) cumulative log returns
+            latent_target_paths: (n_paths, n_steps) latent target utilization
+            cascade_shock_paths: (n_paths, n_steps) additive utilization shocks
+                applied at each step (e.g., liquidation-cascade effects)
+            eth_vol_paths: Legacy (n_paths, n_steps) annualized ETH vol
+            eth_price_change_paths: Legacy (n_paths, n_steps) cumulative log returns
             rng: Random generator
 
         Returns:
@@ -67,13 +73,22 @@ class UtilizationModel:
         if rng is None:
             rng = np.random.default_rng(42)
 
-        # Default to constant target if no drivers provided
-        if eth_vol_paths is None:
-            eth_vol_paths = np.full((n_paths, n_steps), 0.60)
-        if eth_price_change_paths is None:
-            eth_price_change_paths = np.zeros((n_paths, n_steps))
+        if latent_target_paths is not None:
+            if latent_target_paths.shape != (n_paths, n_steps):
+                raise ValueError("latent_target_paths must have shape (n_paths, n_steps)")
+            targets = np.clip(latent_target_paths, self.clip_min, self.clip_max)
+        else:
+            # Backward-compatible ETH-driven target when explicit latent target absent.
+            if eth_vol_paths is None:
+                eth_vol_paths = np.full((n_paths, n_steps), 0.60)
+            if eth_price_change_paths is None:
+                eth_price_change_paths = np.zeros((n_paths, n_steps))
+            targets = self.compute_target(eth_vol_paths, eth_price_change_paths)
 
-        targets = self.compute_target(eth_vol_paths, eth_price_change_paths)
+        if cascade_shock_paths is None:
+            cascade_shock_paths = np.zeros((n_paths, n_steps))
+        elif cascade_shock_paths.shape != (n_paths, n_steps):
+            raise ValueError("cascade_shock_paths must have shape (n_paths, n_steps)")
 
         u = np.full((n_paths, n_steps + 1), u0)
         dW = rng.standard_normal((n_paths, n_steps))
@@ -81,7 +96,7 @@ class UtilizationModel:
         for t in range(n_steps):
             drift = self.kappa * (targets[:, t] - u[:, t]) * dt
             diffusion = self.sigma * np.sqrt(dt) * dW[:, t]
-            u[:, t + 1] = u[:, t] + drift + diffusion
+            u[:, t + 1] = u[:, t] + drift + diffusion + cascade_shock_paths[:, t]
             u[:, t + 1] = np.clip(u[:, t + 1], self.clip_min, self.clip_max)
 
         return u
@@ -116,4 +131,12 @@ class UtilizationModel:
         # Cumulative returns
         cum_returns = np.cumsum(log_returns, axis=1)
 
-        return self.simulate(n_paths, n_steps, dt, u0, eth_vol, cum_returns, rng)
+        return self.simulate(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            u0=u0,
+            eth_vol_paths=eth_vol,
+            eth_price_change_paths=cum_returns,
+            rng=rng,
+        )

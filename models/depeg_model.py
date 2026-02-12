@@ -35,7 +35,8 @@ class DepegModel:
                  unwind_sensitivity: float = 2.0,
                  max_daily_unwind_frac: float = 0.05,
                  total_looped_tvl_eth: float = 500_000.0,
-                 available_liquidity_eth: float = 100_000.0):
+                 available_liquidity_eth: float = 100_000.0,
+                 reference_leverage_state: float = 0.78):
         """
         Parameters:
             params: Jump-diffusion model parameters
@@ -44,6 +45,8 @@ class DepegModel:
             max_daily_unwind_frac: Max fraction of TVL that unwinds per day
             total_looped_tvl_eth: Approximate total wstETH/ETH looped TVL in ETH
             available_liquidity_eth: DEX liquidity available to absorb unwinds
+            reference_leverage_state: Baseline leverage state used to normalize
+                dynamic leverage-path inputs (e.g., utilization)
         """
         self.kappa = params.mean_reversion_speed
         self.sigma_normal = params.normal_vol
@@ -60,9 +63,11 @@ class DepegModel:
         self.max_daily_unwind_frac = max_daily_unwind_frac
         self.total_looped_tvl = total_looped_tvl_eth
         self.available_liquidity = available_liquidity_eth
+        self.reference_leverage_state = max(reference_leverage_state, np.finfo(float).eps)
 
     def _compute_borrow_spread_pressure(self, borrow_rates: np.ndarray,
-                                        depeg: np.ndarray) -> np.ndarray:
+                                        depeg: np.ndarray,
+                                        leverage_state: np.ndarray | None = None) -> np.ndarray:
         """
         Compute unwind pressure from negative borrow spread.
 
@@ -82,8 +87,18 @@ class DepegModel:
             self.max_daily_unwind_frac
         )
 
+        # Scale effective unwind size with leverage state (e.g., utilization path).
+        leverage_scale = 1.0
+        if leverage_state is not None:
+            leverage_state_arr = np.asarray(leverage_state, dtype=float)
+            leverage_scale = np.clip(
+                leverage_state_arr / self.reference_leverage_state,
+                0.25,
+                3.0,
+            )
+
         # Sell volume in ETH
-        steth_sell_volume = self.total_looped_tvl * unwind_rate
+        steth_sell_volume = self.total_looped_tvl * unwind_rate * leverage_scale
 
         # Depeg pressure = sell volume / available liquidity
         # Also factor in reflexive loop: deeper depeg → more positions underwater
@@ -96,6 +111,7 @@ class DepegModel:
                  eth_vol_paths: np.ndarray | None = None,
                  sell_pressure_paths: np.ndarray | None = None,
                  borrow_rate_paths: np.ndarray | None = None,
+                 leverage_state_paths: np.ndarray | None = None,
                  p0: float = 1.0,
                  rng: np.random.Generator | None = None) -> np.ndarray:
         """
@@ -108,6 +124,8 @@ class DepegModel:
             eth_vol_paths: (n_paths, n_steps) annualized ETH vol for regime switching
             sell_pressure_paths: (n_paths, n_steps) normalized sell pressure [0, 1]
             borrow_rate_paths: (n_paths, n_steps) borrow rates for spread feedback
+            leverage_state_paths: (n_paths, n_steps) leverage-state proxy paths
+                (e.g., utilization) used to scale unwind feedback intensity
             p0: Initial peg ratio (default 1.0)
             rng: Random generator
 
@@ -145,8 +163,11 @@ class DepegModel:
 
             # Borrow spread feedback (rate-driven unwind pressure)
             if borrow_rate_paths is not None:
+                lev_state = None
+                if leverage_state_paths is not None:
+                    lev_state = leverage_state_paths[:, t]
                 spread_pressure = self._compute_borrow_spread_pressure(
-                    borrow_rate_paths[:, t], p[:, t]
+                    borrow_rate_paths[:, t], p[:, t], leverage_state=lev_state
                 )
                 sigma = sigma * (1.0 + 1.5 * spread_pressure)
                 jump_intensity = jump_intensity * (1.0 + 2.0 * spread_pressure)
@@ -182,6 +203,7 @@ class DepegModel:
     def simulate_correlated(self, n_paths: int, n_steps: int, dt: float,
                             eth_price_paths: np.ndarray,
                             borrow_rate_paths: np.ndarray | None = None,
+                            leverage_state_paths: np.ndarray | None = None,
                             p0: float = 1.0,
                             rng: np.random.Generator | None = None) -> np.ndarray:
         """
@@ -218,7 +240,16 @@ class DepegModel:
         elif borrow_rate_paths is not None:
             br_input = borrow_rate_paths
 
+        lev_input = None
+        if leverage_state_paths is not None and leverage_state_paths.shape[1] > n_steps:
+            lev_input = leverage_state_paths[:, :n_steps]
+        elif leverage_state_paths is not None:
+            lev_input = leverage_state_paths
+
         return self.simulate(
             n_paths, n_steps, dt, eth_vol, sell_pressure,
-            borrow_rate_paths=br_input, p0=p0, rng=rng,
+            borrow_rate_paths=br_input,
+            leverage_state_paths=lev_input,
+            p0=p0,
+            rng=rng,
         )

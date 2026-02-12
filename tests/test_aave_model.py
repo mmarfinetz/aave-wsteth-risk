@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from models.aave_model import InterestRateModel, LiquidationEngine, PoolState
-from config.params import WETH_RATES, EMODE
 
 
 class TestInterestRateModel:
@@ -74,7 +73,8 @@ class TestPoolState:
 
 class TestLiquidationEngine:
     def setup_method(self):
-        self.engine = LiquidationEngine()
+        self.engine = LiquidationEngine(price_mode="market")
+        self.oracle_engine = LiquidationEngine()
 
     def test_health_factor_at_peg(self):
         # 60.16 wstETH collateral, 63.7 WETH debt, stETH/ETH = 1.0
@@ -92,6 +92,11 @@ class TestLiquidationEngine:
         # HF = (60.16 * 1.225 * 0.94 * 0.95) / 63.7 ≈ 1.033
         assert hf < 1.10
         assert hf > 1.0
+
+    def test_oracle_mode_ignores_market_depeg(self):
+        hf_peg = self.oracle_engine.health_factor(60.16, 63.7, 1.0)
+        hf_depeg = self.oracle_engine.health_factor(60.16, 63.7, 0.88)
+        assert hf_peg == pytest.approx(hf_depeg, rel=1e-12)
 
     def test_liquidation_threshold(self):
         # Find stETH/ETH price where HF = 1.0
@@ -124,11 +129,23 @@ class TestLiquidationEngine:
         assert result.remaining_collateral < 60.16
 
     def test_full_liquidation_deep_underwater(self):
-        # HF well below 0.95 → 100% close factor
-        result = self.engine.simulate_liquidation(10.0, 20.0, 0.80)
+        # HF <= 0.95 triggers 100% close factor, but collateral may still cap repayment.
+        result = self.engine.simulate_liquidation(20.0, 20.0, 0.80)
         assert result is not None
-        # 100% close factor means all debt repaid
-        assert result.debt_repaid == pytest.approx(20.0, rel=1e-6)
+        hf_before = self.engine.health_factor(20.0, 20.0, 0.80)
+        assert hf_before <= 0.95
+        assert self.engine.close_factor(hf_before) == 1.0
+        assert result.debt_repaid < 20.0
+        assert result.remaining_debt > 0.0
+
+    def test_insufficient_collateral_caps_debt_repaid(self):
+        # Collateral is far too small to repay all debt even with full close factor.
+        result = self.engine.simulate_liquidation(1.0, 100.0, 0.80)
+        assert result is not None
+        max_repay = 1.0 * self.engine.wsteth_steth_rate * 0.80 / (1.0 + self.engine.bonus)
+        assert result.debt_repaid == pytest.approx(max_repay, rel=1e-6)
+        assert result.collateral_seized == pytest.approx(1.0, rel=1e-6)
+        assert result.remaining_debt > 0
 
     def test_vectorized_health_factor(self):
         collateral = np.array([60.16, 60.16, 60.16])

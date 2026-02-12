@@ -6,7 +6,6 @@ import numpy as np
 
 from models.aave_model import InterestRateModel
 from models.utilization_model import UtilizationModel
-from config.params import WETH_RATES, UTILIZATION
 
 
 class RateForecast:

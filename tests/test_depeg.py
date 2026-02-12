@@ -5,7 +5,6 @@ import pytest
 
 from models.depeg_model import DepegModel
 from models.slippage_model import CurveSlippageModel
-from config.params import DEPEG
 
 
 class TestCurveSlippage:
@@ -148,3 +147,62 @@ class TestDepegModel:
         assert depeg_paths.shape == (1000, 31)
         assert np.all(depeg_paths >= 0.50)
         assert np.all(depeg_paths <= 1.05)
+
+    def test_borrow_spread_pressure_scales_with_leverage_state(self):
+        borrow_rates = np.array([0.20, 0.20, 0.20])
+        depeg = np.array([1.0, 0.99, 0.98])
+        low_lev = np.array([0.55, 0.55, 0.55])
+        high_lev = np.array([0.95, 0.95, 0.95])
+
+        low_pressure = self.model._compute_borrow_spread_pressure(
+            borrow_rates, depeg, leverage_state=low_lev
+        )
+        high_pressure = self.model._compute_borrow_spread_pressure(
+            borrow_rates, depeg, leverage_state=high_lev
+        )
+        assert np.mean(high_pressure) > np.mean(low_pressure)
+
+
+class TestDepegSlippageCoupling:
+    """Tests for depeg-slippage coupling in MC unwind cost distribution."""
+
+    def setup_method(self):
+        self.model = CurveSlippageModel()
+
+    def test_deeper_depeg_increases_unwind_costs(self):
+        """Deeper stETH/ETH depeg should produce higher unwind costs at equal vol."""
+        n_paths = 500
+        vol_paths = np.full(n_paths, 0.60)
+
+        # No depeg: stETH/ETH = 1.0
+        result_peg = self.model.unwind_cost_distribution(
+            portfolio_pct=1.0, position_size_eth=100.0,
+            vol_paths=vol_paths, steth_eth_terminal=np.ones(n_paths),
+        )
+
+        # Deep depeg: stETH/ETH = 0.90
+        result_depeg = self.model.unwind_cost_distribution(
+            portfolio_pct=1.0, position_size_eth=100.0,
+            vol_paths=vol_paths, steth_eth_terminal=np.full(n_paths, 0.90),
+        )
+
+        assert result_depeg["avg_eth"] > result_peg["avg_eth"]
+        assert result_depeg["var95_eth"] > result_peg["var95_eth"]
+
+    def test_steth_eth_terminal_none_backward_compat(self):
+        """steth_eth_terminal=None should give identical results to =np.ones(n)."""
+        n_paths = 200
+        rng = np.random.default_rng(42)
+        vol_paths = np.clip(rng.normal(0.60, 0.10, n_paths), 0.10, 3.0)
+
+        result_none = self.model.unwind_cost_distribution(
+            portfolio_pct=0.50, position_size_eth=100.0,
+            vol_paths=vol_paths, steth_eth_terminal=None,
+        )
+        result_ones = self.model.unwind_cost_distribution(
+            portfolio_pct=0.50, position_size_eth=100.0,
+            vol_paths=vol_paths, steth_eth_terminal=np.ones(n_paths),
+        )
+
+        assert result_none["avg_eth"] == pytest.approx(result_ones["avg_eth"], rel=1e-12)
+        assert result_none["var95_eth"] == pytest.approx(result_ones["var95_eth"], rel=1e-12)

@@ -6,7 +6,7 @@ import numpy as np
 from dataclasses import dataclass
 
 from models.slippage_model import CurveSlippageModel
-from config.params import CURVE_POOL
+from config.params import DEFAULT_GAS_PRICE_GWEI
 
 
 @dataclass
@@ -20,6 +20,21 @@ class RiskOutput:
     max_drawdown_95: float
     prob_liquidation: float
     expected_shortfall: float
+
+
+@dataclass
+class RiskDecompositionOutput:
+    """Risk decomposition aligned to carry, execution, and tail drivers."""
+    carry_var_95: float
+    carry_cvar_95: float
+    unwind_cost_var_95: float
+    unwind_cost_cvar_95: float
+    unwind_cost_var_95_conditional_exit: float
+    slashing_tail_loss_95: float
+    slashing_tail_loss_99: float
+    governance_var_95: float
+    governance_cvar_95: float
+    exit_probability: float
 
 
 @dataclass
@@ -42,7 +57,8 @@ class RiskMetrics:
         Value at Risk: the loss threshold at the given confidence level.
         Returns a positive number representing the loss.
         """
-        return float(-np.percentile(pnl_terminal, 100 * (1 - confidence)))
+        raw = float(-np.percentile(pnl_terminal, 100 * (1 - confidence)))
+        return max(raw, 0.0)
 
     @staticmethod
     def cvar(pnl_terminal: np.ndarray, confidence: float = 0.95) -> float:
@@ -53,7 +69,8 @@ class RiskMetrics:
         tail = pnl_terminal[pnl_terminal <= threshold]
         if len(tail) == 0:
             return 0.0
-        return float(-np.mean(tail))
+        raw = float(-np.mean(tail))
+        return max(raw, 0.0)
 
     @staticmethod
     def max_drawdown(pnl_paths: np.ndarray) -> np.ndarray:
@@ -70,6 +87,71 @@ class RiskMetrics:
         """Fraction of paths where HF ever drops below 1.0."""
         min_hf = np.min(hf_paths, axis=1)
         return float(np.mean(min_hf < 1.0))
+
+    @staticmethod
+    def first_breach_step(paths: np.ndarray, threshold: float = 1.0) -> np.ndarray:
+        """
+        First step index where a path breaches the threshold.
+
+        Returns:
+            Array of shape (n_paths,) with first breach step, or -1 if never breached.
+        """
+        breached = paths < threshold
+        any_breach = np.any(breached, axis=1)
+        first = np.argmax(breached, axis=1)
+        return np.where(any_breach, first, -1)
+
+    @staticmethod
+    def _loss_var(losses: np.ndarray, confidence: float = 0.95) -> float:
+        """VaR for non-negative loss samples."""
+        if losses.size == 0:
+            return 0.0
+        q = 100.0 * confidence
+        return float(np.percentile(np.asarray(losses, dtype=float), q))
+
+    @staticmethod
+    def _loss_cvar(losses: np.ndarray, confidence: float = 0.95) -> float:
+        """CVaR for non-negative loss samples."""
+        if losses.size == 0:
+            return 0.0
+        loss_arr = np.asarray(losses, dtype=float)
+        threshold = np.percentile(loss_arr, 100.0 * confidence)
+        tail = loss_arr[loss_arr >= threshold]
+        if tail.size == 0:
+            return float(threshold)
+        return float(np.mean(tail))
+
+    def decompose(
+        self,
+        carry_terminal_pnl: np.ndarray,
+        unwind_costs: np.ndarray,
+        slashing_losses: np.ndarray,
+        governance_losses: np.ndarray,
+        exit_mask: np.ndarray,
+    ) -> RiskDecompositionOutput:
+        """
+        Decompose risk into carry, unwind execution, slashing tail, and governance shocks.
+        """
+        carry_terminal_pnl = np.asarray(carry_terminal_pnl, dtype=float)
+        unwind_costs = np.asarray(unwind_costs, dtype=float)
+        slashing_losses = np.asarray(slashing_losses, dtype=float)
+        governance_losses = np.asarray(governance_losses, dtype=float)
+        exit_mask = np.asarray(exit_mask, dtype=bool)
+        carry_losses = np.maximum(-carry_terminal_pnl, 0.0)
+
+        conditional_unwind = unwind_costs[exit_mask]
+        return RiskDecompositionOutput(
+            carry_var_95=self._loss_var(carry_losses, 0.95),
+            carry_cvar_95=self._loss_cvar(carry_losses, 0.95),
+            unwind_cost_var_95=self._loss_var(unwind_costs, 0.95),
+            unwind_cost_cvar_95=self._loss_cvar(unwind_costs, 0.95),
+            unwind_cost_var_95_conditional_exit=self._loss_var(conditional_unwind, 0.95),
+            slashing_tail_loss_95=self._loss_var(slashing_losses, 0.95),
+            slashing_tail_loss_99=self._loss_var(slashing_losses, 0.99),
+            governance_var_95=self._loss_var(governance_losses, 0.95),
+            governance_cvar_95=self._loss_cvar(governance_losses, 0.95),
+            exit_probability=float(np.mean(exit_mask)) if exit_mask.size else 0.0,
+        )
 
     def compute_all(self, pnl_paths: np.ndarray,
                     hf_paths: np.ndarray | None = None) -> RiskOutput:
@@ -141,12 +223,19 @@ class UnwindCostEstimator:
 
     def portfolio_pct_costs(self, total_debt_weth: float,
                             vol_paths: np.ndarray | None = None,
-                            gas_price_gwei: float = 30.0) -> dict:
+                            gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+                            steth_eth_terminal: np.ndarray | None = None) -> dict:
         """
         Compute unwind costs for each portfolio % bucket.
 
         If vol_paths provided, computes MC distribution with VaR95.
         Otherwise uses static estimate.
+
+        Parameters:
+            total_debt_weth: Total WETH debt to unwind
+            vol_paths: (n_paths,) terminal annualized vol per path
+            gas_price_gwei: Base gas price
+            steth_eth_terminal: (n_paths,) terminal stETH/ETH price per path
 
         Returns dict keyed by pct label: {"10pct": {...}, "25pct": {...}, ...}
         """
@@ -155,7 +244,8 @@ class UnwindCostEstimator:
             label = f"{int(pct * 100)}pct"
             if vol_paths is not None and len(vol_paths) > 0:
                 dist = self.slippage_model.unwind_cost_distribution(
-                    pct, total_debt_weth, vol_paths, gas_price_gwei
+                    pct, total_debt_weth, vol_paths, gas_price_gwei,
+                    steth_eth_terminal=steth_eth_terminal,
                 )
                 result[label] = {
                     "avg_eth": dist["avg_eth"],

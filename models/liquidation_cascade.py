@@ -10,7 +10,6 @@ import numpy as np
 from dataclasses import dataclass
 
 from models.aave_model import InterestRateModel, LiquidationEngine, PoolState
-from config.params import EMODE, WETH_RATES, WSTETH
 
 
 @dataclass
@@ -50,7 +49,8 @@ class LiquidationCascade:
                  max_iterations: int = 50,
                  convergence_threshold: float = 1e-6):
         self.rate_model = rate_model or InterestRateModel()
-        self.liq_engine = liq_engine or LiquidationEngine()
+        # Cascade proxy is intentionally mark-to-market (not oracle-immune position HF).
+        self.liq_engine = liq_engine or LiquidationEngine(price_mode="market")
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
 
@@ -160,7 +160,9 @@ class LiquidationCascade:
                                      base_borrows: float = 2_496_000.0,
                                      eth_collateral_fraction: float = 0.30,
                                      avg_ltv: float = 0.70,
-                                     avg_lt: float = 0.80) -> np.ndarray:
+                                     avg_lt: float = 0.80,
+                                     close_factor_proxy: float = 0.50,
+                                     weth_borrow_reduction_fraction: float = 0.15) -> np.ndarray:
         """
         Estimate utilization impact from ETH-price-driven liquidation cascades.
 
@@ -186,32 +188,38 @@ class LiquidationCascade:
         """
         n_paths, n_cols = eth_price_paths.shape
 
-        # Compute cumulative ETH price change from starting price
+        base_deposits = max(float(base_deposits), np.finfo(float).eps)
+        base_borrows = float(np.clip(base_borrows, 0.0, base_deposits))
+        eth_collateral_fraction = float(np.clip(eth_collateral_fraction, 0.0, 1.0))
+        avg_ltv = float(max(avg_ltv, np.finfo(float).eps))
+        avg_lt = float(max(avg_lt, np.finfo(float).eps))
+        close_factor_proxy = float(np.clip(close_factor_proxy, 0.0, 1.0))
+        weth_borrow_reduction_fraction = float(
+            np.clip(weth_borrow_reduction_fraction, 0.0, 1.0)
+        )
+
+        # Compute cumulative ETH price change from starting price.
         price_change = eth_price_paths / eth_price_paths[:, 0:1] - 1.0
+        price_factor = np.maximum(1.0 + price_change, np.finfo(float).eps)
 
-        # ETH collateral value relative to starting
-        eth_collateral_value = base_deposits * eth_collateral_fraction * (1.0 + price_change)
-
-        # Debt doesn't change with ETH price (stablecoin debt)
-        eth_backed_debt = base_deposits * eth_collateral_fraction * avg_ltv
-
-        # HF for the aggregate ETH-collateral position
-        with np.errstate(divide='ignore', invalid='ignore'):
-            aggregate_hf = (eth_collateral_value * avg_lt) / eth_backed_debt
-        aggregate_hf = np.where(eth_backed_debt <= 0, np.inf, aggregate_hf)
+        # Aggregate HF proxy for ETH-collateral positions borrowing non-WETH assets.
+        aggregate_hf = price_factor * avg_lt / avg_ltv
 
         # When aggregate HF < 1.0, liquidations occur
         # Approximate: fraction liquidated ≈ max(0, 1 - HF) * close_factor_proxy
-        liquidation_fraction = np.clip(1.0 - aggregate_hf, 0.0, 1.0) * 0.5
+        liquidation_fraction = np.clip(1.0 - aggregate_hf, 0.0, 1.0) * close_factor_proxy
 
-        # WETH supply reduction from liquidated collateral
+        # Liquidated ETH collateral leaves the WETH supply side.
+        eth_collateral_value = base_deposits * eth_collateral_fraction * price_factor
         weth_supply_reduction = eth_collateral_value * liquidation_fraction
 
-        # Utilization change: deposits decrease, borrows decrease by debt repaid
-        # Net effect: deposits drop more than borrows → utilization increases
-        debt_repaid = eth_backed_debt * liquidation_fraction
-        new_deposits = np.maximum(base_deposits - weth_supply_reduction, base_borrows)
-        new_borrows = np.maximum(base_borrows - debt_repaid, 0.0)
+        # ETH-collateral liquidations primarily repay stablecoin debt.
+        # Only a fraction feeds through to lower WETH borrows (forced deleveraging/unwinds).
+        weth_borrow_reduction = (
+            base_borrows * liquidation_fraction * weth_borrow_reduction_fraction
+        )
+        new_borrows = np.maximum(base_borrows - weth_borrow_reduction, 0.0)
+        new_deposits = np.maximum(base_deposits - weth_supply_reduction, new_borrows)
 
         with np.errstate(divide='ignore', invalid='ignore'):
             cascade_utilization = new_borrows / new_deposits

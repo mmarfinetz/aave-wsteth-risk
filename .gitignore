@@ -7,3 +7,4 @@ CLAUDE.md
 *.egg-info/
 .venv/
 venv/
+out.json

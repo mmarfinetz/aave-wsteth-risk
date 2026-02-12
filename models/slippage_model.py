@@ -12,9 +12,8 @@ Includes:
 
 import numpy as np
 from math import ceil
-from scipy.optimize import brentq
 
-from config.params import CURVE_POOL, CurvePoolParams
+from config.params import CURVE_POOL, CurvePoolParams, DEFAULT_GAS_PRICE_GWEI
 
 
 class CurveSlippageModel:
@@ -182,7 +181,7 @@ class CurveSlippageModel:
 
     def total_unwind_cost(self, portfolio_pct: float,
                           position_size_eth: float,
-                          gas_price_gwei: float = 30.0,
+                          gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI,
                           stress_multiplier: float = 1.0,
                           max_per_tx_eth: float = 5000.0) -> dict:
         """
@@ -224,7 +223,8 @@ class CurveSlippageModel:
     def unwind_cost_distribution(self, portfolio_pct: float,
                                  position_size_eth: float,
                                  vol_paths: np.ndarray,
-                                 gas_price_gwei: float = 30.0) -> dict:
+                                 gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+                                 steth_eth_terminal: np.ndarray | None = None) -> dict:
         """
         Simulate unwind costs across Monte Carlo paths.
 
@@ -236,6 +236,8 @@ class CurveSlippageModel:
             position_size_eth: Position size in ETH
             vol_paths: (n_paths,) terminal annualized vol per path
             gas_price_gwei: Base gas price
+            steth_eth_terminal: (n_paths,) terminal stETH/ETH price per path.
+                When provided, deeper depeg reduces effective pool liquidity.
 
         Returns dict with avg and VaR95 unwind costs.
         """
@@ -245,6 +247,12 @@ class CurveSlippageModel:
         # At baseline vol (0.60), multiplier = 1.0
         # At crisis vol (1.20), multiplier = 0.30 (70% liquidity reduction)
         stress_multipliers = np.clip(1.0 - (vol_paths - 0.40) * 0.7, 0.10, 1.0)
+
+        # Depeg liquidity factor: stETH trading below peg reduces effective
+        # Curve pool depth (imbalanced pool, arbs withdrawing ETH side).
+        if steth_eth_terminal is not None:
+            depeg_factor = np.clip(steth_eth_terminal, 0.10, 1.0)
+            stress_multipliers *= depeg_factor
 
         # Gas price correlates with vol (historical: gas spikes during ETH crashes)
         gas_prices = gas_price_gwei * (1.0 + 2.0 * np.maximum(vol_paths - 0.60, 0.0))

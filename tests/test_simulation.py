@@ -73,18 +73,6 @@ class TestGBMSimulator:
         paths_anti = sim.simulate(s0=100.0)
         mean_anti = np.mean(paths_anti[:, -1])
 
-        # Non-antithetic: just use raw draws
-        rng = np.random.default_rng(42)
-        n_steps = 30
-        dt = config_large.dt
-        z = rng.standard_normal((10000, n_steps))
-        drift = -0.5 * 0.60 ** 2 * dt
-        diffusion = 0.60 * np.sqrt(dt) * z
-        log_returns = drift + diffusion
-        log_prices = np.cumsum(log_returns, axis=1)
-        raw_finals = 100.0 * np.exp(log_prices[:, -1])
-        mean_raw = np.mean(raw_finals)
-
         # Both should center near s0 (mu=0), but antithetic should be closer
         # Just verify antithetic mean is reasonable
         assert abs(mean_anti - 100.0) < 5.0
@@ -156,3 +144,27 @@ class TestLiquidationCascade:
         assert not liquidatable[0]  # Healthy at peg
         assert not liquidatable[1]  # Marginal at 0.94
         assert liquidatable[2]  # Underwater at 0.85
+
+    def test_utilization_impact_increases_on_eth_drop(self):
+        cascade = LiquidationCascade()
+        eth_paths = np.array([
+            [1.0, 0.85],
+            [1.0, 0.70],
+        ])
+        impact = cascade.estimate_utilization_impact(
+            eth_paths,
+            base_deposits=3_200_000.0,
+            base_borrows=2_496_000.0,
+            eth_collateral_fraction=0.45,
+            avg_ltv=0.80,
+            avg_lt=0.82,
+        )
+        assert impact.shape == (2, 2)
+        assert impact[0, 0] == pytest.approx(0.0, abs=1e-12)
+        assert impact[1, 1] > impact[0, 1] > 0.0
+
+    def test_utilization_impact_zero_without_shock(self):
+        cascade = LiquidationCascade()
+        eth_paths = np.ones((10, 5))
+        impact = cascade.estimate_utilization_impact(eth_paths)
+        assert np.allclose(impact, 0.0)

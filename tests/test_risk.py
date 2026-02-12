@@ -226,6 +226,28 @@ class TestRiskMetrics:
         assert result.var_99 >= result.var_95
         assert result.prob_liquidation == 0.0
 
+    def test_var_and_cvar_are_floored_at_zero_for_positive_pnl(self):
+        pnl_terminal = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
+        assert self.metrics.var(pnl_terminal, 0.95) == 0.0
+        assert self.metrics.cvar(pnl_terminal, 0.95) == 0.0
+
+    def test_carry_decomposition_uses_non_negative_loss_tail(self):
+        carry_terminal_pnl = np.array([0.10, 0.08, 0.05, -0.02, -0.03])
+        unwind = np.zeros_like(carry_terminal_pnl)
+        slashing = np.zeros_like(carry_terminal_pnl)
+        governance = np.zeros_like(carry_terminal_pnl)
+        exit_mask = np.zeros_like(carry_terminal_pnl, dtype=bool)
+
+        out = self.metrics.decompose(
+            carry_terminal_pnl=carry_terminal_pnl,
+            unwind_costs=unwind,
+            slashing_losses=slashing,
+            governance_losses=governance,
+            exit_mask=exit_mask,
+        )
+        assert out.carry_var_95 >= 0.0
+        assert out.carry_cvar_95 >= out.carry_var_95
+
 
 class TestUnwindCost:
     def setup_method(self):

@@ -4,21 +4,28 @@ hypotheticals, and sensitivity sweeps.
 
 Scenario sources:
 - Baseline: fetched market state (utilization, stETH/ETH price, gas)
-- Historical: CoinGecko historical API with cache fallback
-- Hypothetical: computed from cascade model, rate model, and depeg regression
+- Historical: DeFiLlama historical API with cache fallback
+- Hypothetical: computed from cascade model and rate/utilization stress
+- Tail: slashing and governance parameter-shock scenarios
 
 ORACLE NOTE: For wstETH/WETH positions, the Aave oracle uses the contract
 exchange rate, NOT the market stETH/ETH price. Therefore stETH depeg does
-NOT affect health factor. It affects P&L and unwind costs only.
+NOT affect health factor. In this module, depeg is treated as an execution
+artifact for unwind-cost stress only.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 
-from config.params import CURVE_POOL, EMODE, MARKET
+from config.params import CURVE_POOL, DEFAULT_GAS_PRICE_GWEI, EMODE, MARKET
 from models.aave_model import InterestRateModel
 from models.position_model import LoopedPosition
+from src.oracle_dynamics.exchange_rate import generate_lido_exchange_rate
+
+
+DEFAULT_CASCADE_AVG_LTV = 0.70
+DEFAULT_CASCADE_AVG_LT = 0.80
 
 
 @dataclass
@@ -33,6 +40,12 @@ class StressScenario:
     utilization_spike: float
     description: str
     source: str
+    slash_probability: float = 0.0
+    slash_severity: float = 0.0
+    single_slash_event: bool = False
+    lt_multiplier: float = 1.0
+    rate_spread: float = 0.0
+    forced_exit: bool = False
 
 
 @dataclass
@@ -50,6 +63,7 @@ class StressResult:
     borrow_rate_peak: float
     unwind_cost_100pct_avg: float
     source: str
+    time_to_hf_breach_days: float | None = None
 
 
 def _conditional_depeg(eth_drop_abs: float, beta: float, exponent: float) -> float:
@@ -65,13 +79,32 @@ def _conditional_depeg(eth_drop_abs: float, beta: float, exponent: float) -> flo
     return max(0.0, 1.0 - depeg_magnitude)
 
 
+def _execution_depeg_from_flow(
+    sell_volume: float,
+    effective_liquidity: float,
+    alpha: float = 0.55,
+    exponent: float = 0.75,
+) -> float:
+    """
+    Execution-layer depeg from unwind flow vs available liquidity.
+
+    This is intentionally not an HF/oracle driver.
+    """
+    if sell_volume <= 0.0:
+        return 1.0
+    liquidity = max(float(effective_liquidity), np.finfo(float).eps)
+    ratio = sell_volume / liquidity
+    magnitude = alpha * (ratio ** exponent)
+    return float(np.clip(1.0 - magnitude, 0.85, 1.0))
+
+
 class StressTestEngine:
     """
     Runs stress scenarios and sensitivity sweeps against a looped position.
 
-    Hypothetical shocks and depeg regression are calibrated from available
-    market inputs/history (or explicit market_state overrides), not embedded
-    fixed constants.
+    Utilization/rates are primary stress drivers. Exchange-rate slashing and
+    governance parameter jumps are modeled as explicit tail scenarios. Depeg
+    is reserved for execution/unwind-cost stress and is not an HF trigger.
     """
 
     def __init__(
@@ -111,9 +144,14 @@ class StressTestEngine:
                 "weth_total_supply": base_supply,
                 "weth_total_borrows": base_supply * current_util,
                 "eth_collateral_fraction": float(MARKET.eth_collateral_fraction),
-                "avg_ltv": float(self.position.ltv),
-                "avg_lt": float(self.position.lt),
+                # Broad ETH-collateral borrower cohort calibration (not eMode loop params).
+                "avg_ltv": DEFAULT_CASCADE_AVG_LTV,
+                "avg_lt": DEFAULT_CASCADE_AVG_LT,
                 "eth_price_history": [],
+                "slashing_intensity_annual": 0.02,
+                "slashing_severity": 0.08,
+                "governance_lt_haircut": 0.02,
+                "governance_ir_spread": 0.04,
             }
 
         ms = dict(market_state)
@@ -125,7 +163,9 @@ class StressTestEngine:
             ms.get("current_borrow_rate", self.rate_model.borrow_rate(current_util))
         )
         ms["steth_eth_price"] = float(ms.get("steth_eth_price", MARKET.steth_eth_price))
-        ms["gas_price_gwei"] = float(ms.get("gas_price_gwei", MARKET.gas_price_gwei))
+        ms["gas_price_gwei"] = self._resolve_gas_price_gwei(
+            ms.get("gas_price_gwei", MARKET.gas_price_gwei)
+        )
 
         default_supply = max(float(self.position.total_collateral_eth), 1.0)
         default_borrows = float(np.clip(default_supply * current_util, 0.0, default_supply))
@@ -138,16 +178,40 @@ class StressTestEngine:
         ms["eth_collateral_fraction"] = float(
             ms.get("eth_collateral_fraction", MARKET.eth_collateral_fraction)
         )
-        ms["avg_ltv"] = float(ms.get("avg_ltv", self.position.ltv))
-        ms["avg_lt"] = float(ms.get("avg_lt", self.position.lt))
+        ms["avg_ltv"] = float(
+            ms.get("avg_ltv", ms.get("cascade_avg_ltv", DEFAULT_CASCADE_AVG_LTV))
+        )
+        ms["avg_lt"] = float(
+            ms.get("avg_lt", ms.get("cascade_avg_lt", DEFAULT_CASCADE_AVG_LT))
+        )
         ms["eth_price_history"] = list(ms.get("eth_price_history", []))
         ms["stress_horizon_days"] = int(ms.get("stress_horizon_days", 30))
+        ms["weth_borrow_reduction_fraction"] = float(
+            ms.get("weth_borrow_reduction_fraction", 0.15)
+        )
+        ms["slashing_intensity_annual"] = float(ms.get("slashing_intensity_annual", 0.02))
+        ms["slashing_severity"] = float(ms.get("slashing_severity", 0.08))
+        ms["governance_lt_haircut"] = float(ms.get("governance_lt_haircut", 0.02))
+        ms["governance_ir_spread"] = float(ms.get("governance_ir_spread", 0.04))
 
         return ms
 
     @staticmethod
+    def _resolve_gas_price_gwei(gas_price_gwei: float | None) -> float:
+        """Use a non-zero fallback so unwind costs remain comparable across modules."""
+        gas = float(gas_price_gwei or 0.0)
+        if gas > 0.0:
+            return gas
+        return DEFAULT_GAS_PRICE_GWEI
+
+    @staticmethod
     def _sanitize_drop_values(values: list[float]) -> list[float]:
-        """Normalize ETH drops as unique negative fractions, sorted by severity."""
+        """Normalize ETH drops as unique negative fractions, sorted by severity.
+
+        Rounds to 2 decimal places (1% granularity) so that drops from
+        different sources that display identically (e.g. -0.349 and -0.354
+        both format as "ETH -35%") are deduplicated.
+        """
         drops = []
         for value in values:
             try:
@@ -156,10 +220,17 @@ class StressTestEngine:
                 continue
             if raw == 0.0:
                 continue
-            drop = -abs(raw)
+            drop = round(-abs(raw), 2)
+            if drop == 0.0:
+                continue
             if drop > -1.0:
-                drops.append(round(drop, 6))
+                drops.append(drop)
         return sorted(set(drops))
+
+    @staticmethod
+    def _format_hypothetical_name(drop: float) -> str:
+        """Format an ETH-drop scenario name with rounded percent labeling."""
+        return f"ETH {drop:+.0%} Hypothetical"
 
     def _load_historical_data(self) -> list[dict]:
         """Load historical stress records from market_state override or fetcher."""
@@ -226,8 +297,10 @@ class StressTestEngine:
     def _derive_eth_drop_scenarios(self) -> list[float]:
         """Build hypothetical ETH-drop shocks from overrides/history/fallbacks."""
         override = self.market_state.get("hypothetical_eth_drops")
-        if isinstance(override, list) and len(override) > 0:
-            drops = self._sanitize_drop_values(override)
+        if isinstance(override, np.ndarray):
+            override = override.tolist()
+        if isinstance(override, (list, tuple)) and len(override) > 0:
+            drops = self._sanitize_drop_values(list(override))
             if drops:
                 return drops
 
@@ -242,9 +315,13 @@ class StressTestEngine:
         if not drops:
             drops = [-max(float(self.market_state["current_utilization"]), np.finfo(float).eps)]
 
+        # Ensure the canonical ETH -20% scenario is always present.
+        if -0.20 not in drops:
+            drops = sorted(set(drops + [-0.20]))
+
         target_n = int(self.market_state.get("n_hypothetical_scenarios", len(drops)))
         target_n = max(1, min(target_n, len(drops)))
-        idx = np.linspace(0, len(drops) - 1, num=target_n, dtype=int)
+        idx = sorted(set(np.linspace(0, len(drops) - 1, num=target_n, dtype=int).tolist()))
         return [drops[i] for i in idx]
 
     def _calibrate_depeg_regression(self) -> tuple[float, float, str]:
@@ -316,10 +393,31 @@ class StressTestEngine:
 
     def _stressed_gas_price(self, eth_drop_abs: float) -> float:
         """Scale base gas by stress severity using inferred sensitivity."""
-        base_gas = max(float(self.market_state.get("gas_price_gwei", 0.0)), 0.0)
-        if base_gas <= 0.0:
-            return 0.0
+        base_gas = self._resolve_gas_price_gwei(self.market_state.get("gas_price_gwei"))
         return base_gas * (1.0 + self._gas_sensitivity() * eth_drop_abs)
+
+    def _execution_depeg(self, utilization: float, borrow_rate: float,
+                         forced_sell_volume: float | None = None) -> float:
+        """
+        Depeg is treated as an execution artifact from unwind flow / liquidity.
+        """
+        net_yield = float(self.position.staking_apy + self.position.steth_supply_apy)
+        spread_stress = max(borrow_rate - net_yield, 0.0)
+        util_excess = max(utilization - float(self.rate_model.u_opt), 0.0)
+        unwind_fraction = float(np.clip(2.5 * spread_stress + 1.5 * util_excess, 0.0, 0.30))
+
+        if forced_sell_volume is None:
+            sell_volume = unwind_fraction * float(self.position.total_debt_weth)
+        else:
+            sell_volume = max(float(forced_sell_volume), 0.0)
+
+        util_den = max(1.0 - float(self.rate_model.u_opt), np.finfo(float).eps)
+        liquidity_haircut = float(np.clip(1.0 - 0.6 * (util_excess / util_den), 0.20, 1.00))
+        effective_liquidity = (
+            max(float(self.market_state.get("curve_pool_depth", CURVE_POOL.pool_depth_eth)), 1.0)
+            * liquidity_haircut
+        )
+        return _execution_depeg_from_flow(sell_volume, effective_liquidity)
 
     def _build_baseline(self) -> list[StressScenario]:
         """Build baseline scenario from current market state."""
@@ -415,31 +513,48 @@ class StressTestEngine:
         close_factor = EMODE.close_factor_normal
         if self.cascade_model is not None:
             liq_engine = getattr(self.cascade_model, "liq_engine", None)
-            emode = getattr(liq_engine, "emode", None)
-            if emode is not None and hasattr(emode, "close_factor_normal"):
-                close_factor = float(emode.close_factor_normal)
+            if liq_engine is not None and hasattr(liq_engine, "close_factor_normal"):
+                close_factor = float(liq_engine.close_factor_normal)
+        close_factor = float(np.clip(close_factor, 0.0, 1.0))
 
+        weth_borrow_reduction_fraction = float(
+            np.clip(ms.get("weth_borrow_reduction_fraction", 0.15), 0.0, 1.0)
+        )
+
+        # Use the same cascade model as the Monte Carlo pipeline for consistency.
+        if self.cascade_model is not None:
+            eth_path = np.array([[1.0, max(1.0 + eth_drop, np.finfo(float).eps)]], dtype=float)
+            util_adj = self.cascade_model.estimate_utilization_impact(
+                eth_path,
+                base_deposits=base_deposits,
+                base_borrows=base_borrows,
+                eth_collateral_fraction=eth_collateral_fraction,
+                avg_ltv=avg_ltv,
+                avg_lt=avg_lt,
+                close_factor_proxy=close_factor,
+                weth_borrow_reduction_fraction=weth_borrow_reduction_fraction,
+            )
+            stressed_util = base_util + float(util_adj[0, -1])
+            return float(np.clip(stressed_util, 0.0, 0.99))
+
+        # Fallback when no cascade model was injected.
         price_factor = max(1.0 + eth_drop, np.finfo(float).eps)
         aggregate_hf = price_factor * avg_lt / avg_ltv
-
-        if aggregate_hf >= 1.0:
-            return float(np.clip(base_util, 0.0, 0.99))
-
         liquidation_fraction = float(np.clip(1.0 - aggregate_hf, 0.0, 1.0) * close_factor)
 
         eth_coll_value = base_deposits * eth_collateral_fraction * price_factor
         weth_supply_reduction = eth_coll_value * liquidation_fraction
-        debt_repaid = base_deposits * eth_collateral_fraction * avg_ltv * liquidation_fraction
+        weth_borrow_reduction = (
+            base_borrows * liquidation_fraction * weth_borrow_reduction_fraction
+        )
 
-        new_deposits = max(base_deposits - weth_supply_reduction, base_borrows)
-        new_borrows = max(base_borrows - debt_repaid, 0.0)
-
+        new_borrows = max(base_borrows - weth_borrow_reduction, 0.0)
+        new_deposits = max(base_deposits - weth_supply_reduction, new_borrows)
         if new_deposits <= 0.0:
             return 0.99
 
         cascade_util = new_borrows / new_deposits
-        lower_bound = min(base_util, base_borrows / max(base_deposits, np.finfo(float).eps))
-        return float(np.clip(cascade_util, lower_bound, 0.99))
+        return float(np.clip(cascade_util, 0.0, 0.99))
 
     def _build_hypothetical(self, eth_drops: list[float] | None = None) -> list[StressScenario]:
         """
@@ -448,7 +563,7 @@ class StressTestEngine:
         For each ETH drop:
         - Utilization from cascade impact model
         - Borrow rate from Aave rate model
-        - stETH/ETH depeg from calibrated regression
+        - execution-layer depeg from unwind flow/liquidity
         - Gas from utilization-conditioned stress scaling
         """
         if eth_drops is None:
@@ -458,21 +573,18 @@ class StressTestEngine:
             return []
 
         scenarios = []
-        source = (
-            "computed: cascade_model → rate_model → depeg_regression"
-            f" ({self.depeg_calibration_source})"
-        )
+        source = "computed: cascade_model → utilization/rate primary; depeg execution-layer"
 
         for drop in eth_drops:
             abs_drop = abs(drop)
             stressed_util = self._estimate_stressed_utilization(drop)
             borrow_rate = float(self.rate_model.borrow_rate(stressed_util))
-            steth_eth = _conditional_depeg(abs_drop, self.depeg_beta, self.depeg_exponent)
+            steth_eth = self._execution_depeg(stressed_util, borrow_rate)
             gas_price = self._stressed_gas_price(abs_drop)
 
             scenarios.append(
                 StressScenario(
-                    name=f"ETH {int(drop * 100):+d}% Hypothetical",
+                    name=self._format_hypothetical_name(drop),
                     steth_eth_price=round(steth_eth, 6),
                     borrow_rate=borrow_rate,
                     eth_price_change=drop,
@@ -491,7 +603,7 @@ class StressTestEngine:
         target_util_spike = self.target_utilization_spike
         anchor_drop = float(np.median(np.abs(eth_drops)))
         spike_rate = float(self.rate_model.borrow_rate(target_util_spike))
-        spike_depeg = _conditional_depeg(anchor_drop, self.depeg_beta, self.depeg_exponent)
+        spike_depeg = self._execution_depeg(target_util_spike, spike_rate)
         scenarios.append(
             StressScenario(
                 name="Rate Superspike",
@@ -511,20 +623,11 @@ class StressTestEngine:
         extreme_drop = min(eth_drops)
         extreme_util = max(target_util_spike, self._estimate_stressed_utilization(extreme_drop))
         extreme_rate = float(self.rate_model.borrow_rate(extreme_util))
-        model_extreme_depeg = _conditional_depeg(
-            abs(extreme_drop),
-            self.depeg_beta,
-            self.depeg_exponent,
+        extreme_depeg = self._execution_depeg(
+            extreme_util,
+            extreme_rate,
+            forced_sell_volume=self.position.total_debt_weth,
         )
-        historical_floor = min(
-            [
-                float(r.get("steth_eth_price", 1.0))
-                for r in self.historical_data
-                if float(r.get("steth_eth_price", 1.0)) > 0.0
-            ],
-            default=1.0,
-        )
-        extreme_depeg = min(model_extreme_depeg, historical_floor)
         extreme_gas = max(self._stressed_gas_price(abs(extreme_drop)), self._stressed_gas_price(anchor_drop))
         scenarios.append(
             StressScenario(
@@ -534,9 +637,9 @@ class StressTestEngine:
                 eth_price_change=extreme_drop,
                 gas_price_gwei=round(extreme_gas, 3),
                 utilization_spike=extreme_util,
+                forced_exit=True,
                 description=(
-                    f"Combined extreme: ETH {extreme_drop:+.0%}, "
-                    f"depeg={extreme_depeg:.3f}, "
+                    f"Combined extreme: ETH {extreme_drop:+.0%}, execution_depeg={extreme_depeg:.3f}, "
                     f"util={extreme_util:.0%}, "
                     f"rate={extreme_rate:.2%}"
                 ),
@@ -546,40 +649,124 @@ class StressTestEngine:
 
         return scenarios
 
+    def _build_tail_scenarios(self) -> list[StressScenario]:
+        """Add slashing and governance parameter-shock tails."""
+        util = self.target_utilization_spike
+        rate = float(self.rate_model.borrow_rate(util))
+        slash_severity = float(np.clip(self.market_state.get("slashing_severity", 0.08), 0.0, 0.50))
+        lt_haircut = float(np.clip(self.market_state.get("governance_lt_haircut", 0.02), 0.0, 0.20))
+        ir_spread = max(float(self.market_state.get("governance_ir_spread", 0.04)), 0.0)
+
+        return [
+            StressScenario(
+                name="Slashing Tail",
+                steth_eth_price=self._execution_depeg(util, rate),
+                borrow_rate=rate,
+                eth_price_change=-0.05,
+                gas_price_gwei=round(self._stressed_gas_price(0.05), 3),
+                utilization_spike=util,
+                slash_probability=1.0,
+                slash_severity=slash_severity,
+                single_slash_event=True,
+                forced_exit=True,
+                description=(
+                    f"Exchange-rate slashing tail: severity={slash_severity:.1%}, util={util:.0%}"
+                ),
+                source="computed: slashing tail process on oracle exchange rate",
+            ),
+            StressScenario(
+                name="Governance Shock",
+                steth_eth_price=self._execution_depeg(util, rate + ir_spread),
+                borrow_rate=rate,
+                eth_price_change=-0.05,
+                gas_price_gwei=round(self._stressed_gas_price(0.05), 3),
+                utilization_spike=util,
+                lt_multiplier=1.0 - lt_haircut,
+                rate_spread=ir_spread,
+                forced_exit=True,
+                description=(
+                    f"Governance LT/IR jump: LT -{lt_haircut:.1%}, IR +{ir_spread:.1%}"
+                ),
+                source="computed: governance parameter shock",
+            ),
+        ]
+
     def build_scenarios(self) -> list[StressScenario]:
         """Build all stress scenarios from data/model calibration."""
         scenarios = []
         scenarios.extend(self._build_baseline())
         scenarios.extend(self._build_historical())
         scenarios.extend(self._build_hypothetical())
+        scenarios.extend(self._build_tail_scenarios())
         return scenarios
 
     def run_scenario(self, scenario: StressScenario) -> StressResult:
         """
         Apply one scenario to the looped position.
 
-        HF uses oracle exchange rate only.
-        P&L uses explicit exchange-rate accrual + market depeg path.
+        HF is driven by oracle exchange rate, debt accrual, and optional LT shocks.
+        Depeg is execution-only and applied to unwind costs, not HF.
         """
-        hf = float(self.position.health_factor())
-        liquidated = hf < 1.0
-        net_apy = float(self.position.net_apy(scenario.borrow_rate))
-
         horizon_days = max(int(self.market_state.get("stress_horizon_days", 30)), 1)
         n_cols = horizon_days + 1
-        borrow_path = np.full((1, n_cols), scenario.borrow_rate)
-        steth_path = np.full((1, n_cols), scenario.steth_eth_price)
-        pnl_30d = float(
+        dt = 1.0 / 365.0
+
+        borrow_rate = max(float(scenario.borrow_rate) + float(scenario.rate_spread), 0.0)
+        borrow_path = np.full((1, n_cols), borrow_rate)
+        lt_mult = float(np.clip(scenario.lt_multiplier, 0.70, 1.0))
+        lt_paths = np.full((1, n_cols), self.position.lt * lt_mult)
+
+        slash_prob = float(np.clip(scenario.slash_probability, 0.0, 1.0))
+        slash_severity = float(np.clip(scenario.slash_severity, 0.0, 0.95))
+        single_slash_event = bool(getattr(scenario, "single_slash_event", False))
+        model_slash_prob = 0.0 if single_slash_event else slash_prob
+        exchange_rate_paths = generate_lido_exchange_rate(
+            initial_rate=float(self.position.wsteth_steth_rate),
+            staking_yield=float(self.position.staking_apy),
+            slashing_probability=model_slash_prob,
+            slashing_severity=slash_severity,
+            capo_max_growth=0.0968,
+            dt=dt,
+            n_steps=horizon_days,
+            n_paths=1,
+            seed=123,
+        )
+        if single_slash_event and slash_prob > 0.0 and slash_severity > 0.0:
+            # Scenario-mode one-off slash shock to avoid repeated daily compounding.
+            one_off_multiplier = 1.0 - np.clip(slash_prob * slash_severity, 0.0, 0.95)
+            exchange_rate_paths[:, 1:] *= one_off_multiplier
+
+        hf_path = self.position.health_factor_paths(
+            borrow_path,
+            dt=dt,
+            exchange_rate_paths=exchange_rate_paths,
+            lt_paths=lt_paths,
+        )
+        hf_min = float(np.min(hf_path[0]))
+        liquidated = bool(np.any(hf_path[0] < 1.0))
+        breach_steps = np.where(hf_path[0] < 1.0)[0]
+        time_to_hf_breach = float(breach_steps[0]) if breach_steps.size else None
+
+        net_apy = float(self.position.net_apy(borrow_rate))
+        carry_pnl = float(
             self.position.pnl_paths(
                 borrow_rate_paths=borrow_path,
-                steth_eth_paths=steth_path,
-                dt=1.0 / 365.0,
+                steth_eth_paths=np.ones((1, n_cols)),
+                exchange_rate_paths=exchange_rate_paths,
+                dt=dt,
             )[0, -1]
         )
 
-        sell_amount = self.position.total_debt_weth
+        exit_required = bool(liquidated or scenario.forced_exit)
+        sell_amount = self.position.total_debt_weth if exit_required else 0.0
+        realized_depeg = self._execution_depeg(
+            utilization=float(scenario.utilization_spike),
+            borrow_rate=borrow_rate,
+            forced_sell_volume=sell_amount if exit_required else 0.0,
+        )
+
         if self.slippage_model is not None:
-            stress_multiplier = max(min(scenario.steth_eth_price, 1.0), np.finfo(float).eps)
+            stress_multiplier = max(min(realized_depeg, 1.0), np.finfo(float).eps)
             cost_result = self.slippage_model.total_unwind_cost(
                 portfolio_pct=1.0,
                 position_size_eth=sell_amount,
@@ -588,7 +775,7 @@ class StressTestEngine:
             )
             unwind_total = float(cost_result["total_eth"])
         else:
-            liquidity_haircut = max(min(scenario.steth_eth_price, 1.0), np.finfo(float).eps)
+            liquidity_haircut = max(min(realized_depeg, 1.0), np.finfo(float).eps)
             pool_depth = max(
                 float(self.market_state.get("curve_pool_depth", 0.0)),
                 float(self.position.total_debt_weth),
@@ -600,18 +787,23 @@ class StressTestEngine:
             gas_cost = scenario.gas_price_gwei * 300_000 * tx_count / 1e9
             unwind_total = slippage_cost + gas_cost
 
+        if not exit_required:
+            unwind_total = 0.0
+        pnl_30d = carry_pnl - unwind_total
+
         return StressResult(
             scenario_name=scenario.name,
-            health_factor=hf,
+            health_factor=hf_min,
             liquidated=liquidated,
             net_apy=net_apy,
             pnl_30d=pnl_30d,
             description=scenario.description,
-            steth_depeg_realized=scenario.steth_eth_price,
+            steth_depeg_realized=realized_depeg,
             utilization_peak=scenario.utilization_spike,
-            borrow_rate_peak=scenario.borrow_rate,
+            borrow_rate_peak=borrow_rate,
             unwind_cost_100pct_avg=unwind_total,
             source=scenario.source,
+            time_to_hf_breach_days=time_to_hf_breach,
         )
 
     def run_all(self) -> list[StressResult]:

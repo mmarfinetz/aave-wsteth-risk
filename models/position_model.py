@@ -190,7 +190,9 @@ class LoopedPosition:
         return cum_pnl
 
     def health_factor_paths(self, borrow_rate_paths: np.ndarray,
-                            dt: float = 1.0 / 365.0) -> np.ndarray:
+                            dt: float = 1.0 / 365.0,
+                            exchange_rate_paths: np.ndarray | None = None,
+                            lt_paths: np.ndarray | None = None) -> np.ndarray:
         """
         Compute health factor evolution over time.
 
@@ -203,25 +205,33 @@ class LoopedPosition:
         Returns: (n_paths, n_steps + 1) health factor paths
         """
         n_paths, n_cols = borrow_rate_paths.shape
-        # Track evolving collateral (wstETH units) and debt (WETH units)
-        collateral = np.full((n_paths, n_cols), self.total_collateral_wsteth)
         debt = np.full((n_paths, n_cols), self.total_debt_weth)
 
-        exchange_rate = self._oracle_exchange_rate_paths(n_paths, n_cols, dt)
+        if exchange_rate_paths is None:
+            exchange_rate = self._oracle_exchange_rate_paths(n_paths, n_cols, dt)
+        else:
+            if exchange_rate_paths.shape != (n_paths, n_cols):
+                raise ValueError(
+                    "exchange_rate_paths must have same shape as borrow_rate_paths"
+                )
+            exchange_rate = exchange_rate_paths
+
+        if lt_paths is None:
+            lt = np.full((n_paths, n_cols), self.lt)
+        else:
+            if lt_paths.shape != (n_paths, n_cols):
+                raise ValueError("lt_paths must have same shape as borrow_rate_paths")
+            lt = lt_paths
 
         for t in range(1, n_cols):
-            # Staking yield adds collateral (in wstETH terms, via exchange rate growth)
-            # The wstETH quantity stays the same; value increases via exchange rate
-            collateral[:, t] = collateral[:, t - 1]
-
             # Interest accrual adds to debt
             daily_interest = debt[:, t - 1] * borrow_rate_paths[:, t - 1] * dt
             debt[:, t] = debt[:, t - 1] + daily_interest
 
         # HF at each step using oracle exchange rate (NOT market price)
-        collateral_eth = collateral * exchange_rate
+        collateral_eth = self.total_collateral_wsteth * exchange_rate
         with np.errstate(divide='ignore', invalid='ignore'):
-            hf = (collateral_eth * self.lt) / debt
+            hf = (collateral_eth * lt) / debt
         hf = np.where(debt <= 0, np.inf, hf)
 
         return hf

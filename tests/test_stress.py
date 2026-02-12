@@ -7,10 +7,15 @@ exchange rate (stEthPerToken()), NOT the market stETH/ETH price. Therefore:
 - Depeg only affects P&L (mark-to-market) and unwind costs
 """
 
-import numpy as np
 import pytest
 
-from models.stress_tests import StressTestEngine, StressScenario
+from config.params import DEFAULT_GAS_PRICE_GWEI
+from models.stress_tests import (
+    DEFAULT_CASCADE_AVG_LTV,
+    DEFAULT_CASCADE_AVG_LT,
+    StressTestEngine,
+    StressScenario,
+)
 from models.aave_model import InterestRateModel
 from models.position_model import LoopedPosition
 
@@ -44,6 +49,15 @@ class TestStressTests:
         """Find a scenario by name."""
         matches = [s for s in scenarios if s.name == name]
         assert len(matches) > 0, f"No scenario named '{name}' found"
+        return matches[0]
+
+    def _find_hypothetical_by_drop(self, scenarios, drop, atol=1e-9):
+        """Find a hypothetical scenario by its ETH drop value."""
+        matches = [
+            s for s in scenarios
+            if "Hypothetical" in s.name and abs(s.eth_price_change - drop) <= atol
+        ]
+        assert len(matches) > 0, f"No hypothetical scenario found for drop={drop}"
         return matches[0]
 
     def test_baseline_scenario(self):
@@ -84,8 +98,27 @@ class TestStressTests:
         assert not result.liquidated
         assert result.health_factor > 1.0
 
+    def test_liquidation_status_uses_horizon_path(self):
+        """
+        Elevated borrow rates over the stress horizon should trigger liquidation
+        even when the initial snapshot HF is healthy.
+        """
+        scenario = StressScenario(
+            name="Horizon liquidation test",
+            steth_eth_price=1.0,
+            borrow_rate=1.2,
+            eth_price_change=-0.05,
+            gas_price_gwei=80,
+            utilization_spike=0.99,
+            description="Test path-based liquidation",
+            source="test",
+        )
+        result = self.engine.run_scenario(scenario)
+        assert result.liquidated
+        assert result.health_factor < 1.0
+
     def test_depeg_affects_pnl_not_hf(self):
-        """Depeg should affect P&L (negative) but HF stays constant."""
+        """Depeg input alone should not change HF or carry when no exit is forced."""
         scenarios = self.engine.build_scenarios()
         baseline = self._find_scenario(scenarios, "Baseline")
         baseline_result = self.engine.run_scenario(baseline)
@@ -105,8 +138,36 @@ class TestStressTests:
 
         # HF should be the same (oracle-immune)
         assert baseline_result.health_factor == pytest.approx(depeg_result.health_factor, rel=1e-6)
-        # P&L should be worse with depeg
-        assert depeg_result.pnl_30d < baseline_result.pnl_30d
+        # Carry P&L is unchanged because execution depeg is only applied on exits.
+        assert depeg_result.pnl_30d == pytest.approx(baseline_result.pnl_30d, rel=1e-6)
+
+    def test_run_scenario_applies_initial_depeg_shock_transition(self):
+        """stETH/ETH scenario input should not directly create MTM carry jumps."""
+        scenario = StressScenario(
+            name="Depeg shock transition test",
+            steth_eth_price=0.90,
+            borrow_rate=float(self.rate_model.borrow_rate(self.market_state["current_utilization"])),
+            eth_price_change=-0.25,
+            gas_price_gwei=100,
+            utilization_spike=0.90,
+            description="Test",
+            source="test",
+        )
+        result = self.engine.run_scenario(scenario)
+
+        neutral = StressScenario(
+            name="Neutral depeg input",
+            steth_eth_price=1.0,
+            borrow_rate=scenario.borrow_rate,
+            eth_price_change=scenario.eth_price_change,
+            gas_price_gwei=scenario.gas_price_gwei,
+            utilization_spike=scenario.utilization_spike,
+            description="Test",
+            source="test",
+        )
+        neutral_result = self.engine.run_scenario(neutral)
+
+        assert result.pnl_30d == pytest.approx(neutral_result.pnl_30d, rel=1e-6)
 
     def test_rate_spike_negative_apy(self):
         """At high borrow rates, net APY should be deeply negative."""
@@ -123,16 +184,26 @@ class TestStressTests:
         result = self.engine.run_scenario(rate_spike)
         assert result.net_apy < 0
 
-    def test_hypothetical_eth_minus_20(self):
-        """ETH -20% hypothetical should have non-zero stress effects."""
+    def test_hypothetical_eth_drop_has_nonzero_stress_effects(self):
+        """A derived hypothetical ETH-drop scenario should have non-zero stress effects."""
         scenarios = self.engine.build_scenarios()
-        eth_20 = self._find_scenario(scenarios, "ETH -20% Hypothetical")
+        target_drop = max(self.engine.hypothetical_eth_drops)
+        scenario = self._find_hypothetical_by_drop(scenarios, target_drop)
         baseline = self._find_scenario(scenarios, "Baseline")
-        result = self.engine.run_scenario(eth_20)
+        result = self.engine.run_scenario(scenario)
         baseline_result = self.engine.run_scenario(baseline)
-        assert result.steth_depeg_realized < 1.0
+        assert 0.85 <= result.steth_depeg_realized <= 1.0
         assert result.borrow_rate_peak > 0.02
-        assert result.pnl_30d < baseline_result.pnl_30d
+        assert result.pnl_30d <= baseline_result.pnl_30d
+
+    def test_hypothetical_utilization_spikes_above_baseline(self):
+        """ETH shock should increase utilization/rates via cascade supply removal."""
+        scenarios = self.engine.build_scenarios()
+        baseline = self._find_scenario(scenarios, "Baseline")
+        severe_drop = min(self.engine.hypothetical_eth_drops)
+        severe_scenario = self._find_hypothetical_by_drop(scenarios, severe_drop)
+        assert severe_scenario.utilization_spike > baseline.utilization_spike
+        assert severe_scenario.borrow_rate > baseline.borrow_rate
 
     def test_combined_extreme_no_liquidation(self):
         """Even combined extreme: no liquidation for wstETH/WETH (oracle-immune)."""
@@ -217,34 +288,56 @@ class TestStressTests:
             assert isinstance(r.source, str)
             assert len(r.source) > 0
 
+    def test_slashing_tail_uses_single_event_mode(self):
+        scenarios = self.engine.build_scenarios()
+        slashing = self._find_scenario(scenarios, "Slashing Tail")
+        assert slashing.single_slash_event
+        result = self.engine.run_scenario(slashing)
+        # Guard against unintended repeated per-step slashing compounding.
+        assert result.health_factor > 0.5
+
+    def test_market_state_defaults_use_broad_cascade_cohort(self):
+        """Missing avg_ltv/avg_lt should fall back to broad cohort defaults."""
+        market_state = dict(self.market_state)
+        market_state.pop("avg_ltv")
+        market_state.pop("avg_lt")
+        engine = StressTestEngine(
+            self.position,
+            self.rate_model,
+            market_state=market_state,
+        )
+        assert engine.market_state["avg_ltv"] == pytest.approx(DEFAULT_CASCADE_AVG_LTV, rel=1e-12)
+        assert engine.market_state["avg_lt"] == pytest.approx(DEFAULT_CASCADE_AVG_LT, rel=1e-12)
+
     def test_hypothetical_uses_models(self):
         """
-        Hypothetical ETH -20% scenario's borrow rate should equal
+        Derived hypothetical scenario's borrow rate should equal
         rate_model.borrow_rate(computed_utilization), not a magic number.
         """
         scenarios = self.engine.build_scenarios()
-        eth_20 = self._find_scenario(scenarios, "ETH -20% Hypothetical")
+        target_drop = max(self.engine.hypothetical_eth_drops)
+        scenario = self._find_hypothetical_by_drop(scenarios, target_drop)
 
         # Recompute what the rate should be
-        computed_util = self.engine._estimate_stressed_utilization(-0.20)
+        computed_util = self.engine._estimate_stressed_utilization(target_drop)
         expected_rate = float(self.rate_model.borrow_rate(computed_util))
 
-        assert eth_20.borrow_rate == pytest.approx(expected_rate, rel=1e-10)
-        assert eth_20.utilization_spike == pytest.approx(computed_util, rel=1e-10)
-        assert "computed" in eth_20.source
+        assert scenario.borrow_rate == pytest.approx(expected_rate, rel=1e-10)
+        assert scenario.utilization_spike == pytest.approx(computed_util, rel=1e-10)
+        assert "computed" in scenario.source
 
     def test_hypothetical_depeg_from_regression(self):
-        """Hypothetical depeg should come from calibrated regression, not hardcoded."""
-        from models.stress_tests import _conditional_depeg
+        """Hypothetical depeg should be execution-driven from utilization/rates."""
         scenarios = self.engine.build_scenarios()
-        eth_30 = self._find_scenario(scenarios, "ETH -30% Hypothetical")
+        sorted_drops = sorted(self.engine.hypothetical_eth_drops)
+        target_drop = sorted_drops[len(sorted_drops) // 2]
+        scenario = self._find_hypothetical_by_drop(scenarios, target_drop)
 
-        expected_depeg = _conditional_depeg(
-            0.30,
-            self.engine.depeg_beta,
-            self.engine.depeg_exponent,
+        expected_depeg = self.engine._execution_depeg(
+            scenario.utilization_spike,
+            scenario.borrow_rate,
         )
-        assert eth_30.steth_eth_price == pytest.approx(expected_depeg, abs=0.001)
+        assert scenario.steth_eth_price == pytest.approx(expected_depeg, abs=0.001)
 
     def test_rate_superspike_computed(self):
         """Rate Superspike should compute rate from inferred target utilization."""
@@ -254,3 +347,14 @@ class TestStressTests:
         expected_rate = float(self.rate_model.borrow_rate(self.engine.target_utilization_spike))
         assert spike.borrow_rate == pytest.approx(expected_rate, rel=1e-10)
         assert spike.utilization_spike == pytest.approx(self.engine.target_utilization_spike, rel=1e-10)
+
+    def test_gas_falls_back_to_shared_default_when_missing(self):
+        market_state = dict(self.market_state)
+        market_state["gas_price_gwei"] = 0.0
+        engine = StressTestEngine(
+            self.position,
+            self.rate_model,
+            market_state=market_state,
+        )
+        baseline = self._find_scenario(engine.build_scenarios(), "Baseline")
+        assert baseline.gas_price_gwei == pytest.approx(DEFAULT_GAS_PRICE_GWEI, rel=1e-12)
