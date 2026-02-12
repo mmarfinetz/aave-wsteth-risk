@@ -8,3 +8,5 @@ CLAUDE.md
 .venv/
 venv/
 out.json
+frontend/node_modules/
+frontend/dist/
