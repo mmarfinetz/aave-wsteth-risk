@@ -20,23 +20,30 @@ import json
 import numpy as np
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from typing import Any
 
 from config.params import (
     DEFAULT_GAS_PRICE_GWEI, EMODE, WETH_RATES, WSTETH, MARKET, CURVE_POOL, SIM_CONFIG,
-    VOLATILITY, DEPEG, UTILIZATION,
+    VOLATILITY, DEPEG, UTILIZATION, WETH_EXECUTION, SPREAD_MODEL,
+    SpreadModelParams,
     SimulationConfig, load_params,
 )
 from models.aave_model import InterestRateModel, LiquidationEngine
 from models.price_simulation import GBMSimulator, VolatilityEstimator
 from models.depeg_model import DepegModel
 from models.liquidation_cascade import LiquidationCascade
-from models.account_liquidation_replay import AccountLiquidationReplayEngine, AccountState
+from models.account_liquidation_replay import (
+    AccountLiquidationReplayEngine,
+    AccountState,
+    ProtocolMarket,
+)
 from models.utilization_model import UtilizationModel
 from models.rate_forecast import RateForecast
 from models.position_model import LoopedPosition
 from models.risk_metrics import RiskMetrics, UnwindCostEstimator
 from models.slippage_model import CurveSlippageModel
 from models.stress_tests import StressTestEngine
+from models.weth_execution_cost import QuadraticCEXCostModel
 from src.oracle_dynamics.exchange_rate import generate_lido_exchange_rate
 
 
@@ -58,6 +65,11 @@ class DashboardOutput:
     utilization_analytics: dict
     stress_tests: list
     unwind_costs: dict
+    bad_debt_stats: dict
+    cost_bps_summary: dict
+    liquidation_diagnostics: dict
+    spread_forecast: dict
+    time_series_diagnostics: dict
     simulation_config: dict
 
     def to_json(self, indent: int = 2) -> str:
@@ -137,6 +149,15 @@ class Dashboard:
                     collateral_eth=float(row.get("collateral_eth", 0.0)),
                     debt_eth=float(row.get("debt_eth", 0.0)),
                     avg_lt=float(row.get("avg_lt", 0.0)),
+                    collateral_weth=float(row.get("collateral_weth", 0.0))
+                    if row.get("collateral_weth") is not None
+                    else None,
+                    debt_usdc=float(row.get("debt_usdc", 0.0))
+                    if row.get("debt_usdc") is not None
+                    else None,
+                    debt_usdt=float(row.get("debt_usdt", 0.0))
+                    if row.get("debt_usdt") is not None
+                    else None,
                 )
             except (TypeError, ValueError):
                 continue
@@ -310,6 +331,200 @@ class Dashboard:
             "driver_share_pct": driver_shares,
         }
 
+    @staticmethod
+    def _summary_stats(values: np.ndarray) -> dict:
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            return {"mean": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+        return {
+            "mean": float(np.mean(arr)),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+            "p99": float(np.percentile(arr, 99)),
+            "max": float(np.max(arr)),
+        }
+
+    @staticmethod
+    def _time_series_percentiles(paths: np.ndarray) -> dict:
+        arr = np.asarray(paths, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return {"mean": [], "p5": [], "p50": [], "p95": []}
+        return {
+            "mean": [float(v) for v in np.mean(arr, axis=0)],
+            "p5": [float(v) for v in np.percentile(arr, 5, axis=0)],
+            "p50": [float(v) for v in np.percentile(arr, 50, axis=0)],
+            "p95": [float(v) for v in np.percentile(arr, 95, axis=0)],
+        }
+
+    @staticmethod
+    def _rolling_vol_from_returns(log_returns: np.ndarray, window: int = 5) -> np.ndarray:
+        arr = np.asarray(log_returns, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError("log_returns must be 2D")
+        n_paths, n_steps = arr.shape
+        if n_steps == 0:
+            return np.zeros_like(arr)
+        out = np.zeros_like(arr)
+        window = max(int(window), 1)
+        for t in range(n_steps):
+            start = max(0, t - window + 1)
+            out[:, t] = np.std(arr[:, start:t + 1], axis=1) * np.sqrt(365.0)
+        return out
+
+    def _estimate_spread_correlation(self) -> dict[str, Any]:
+        fallback_ret = float(
+            np.clip(
+                self.params.get(
+                    "spread_corr_eth_return_default",
+                    self.spread_params.corr_eth_return_default,
+                ),
+                -0.95,
+                0.95,
+            )
+        )
+        fallback_vol = float(
+            np.clip(
+                self.params.get(
+                    "spread_corr_eth_vol_default",
+                    self.spread_params.corr_eth_vol_default,
+                ),
+                -0.95,
+                0.95,
+            )
+        )
+
+        eth_hist = np.asarray(self.eth_price_history or [], dtype=float)
+        eth_hist = eth_hist[np.isfinite(eth_hist) & (eth_hist > 0.0)]
+        borrow_hist = np.asarray(self.params.get("weth_borrow_apy_history", []), dtype=float)
+        borrow_hist = borrow_hist[np.isfinite(borrow_hist)]
+
+        n = int(min(eth_hist.size, borrow_hist.size))
+        if n < 60:
+            return {
+                "corr_eth_return": fallback_ret,
+                "corr_eth_vol": fallback_vol,
+                "method": "fallback_default",
+                "observations": n,
+            }
+
+        eth = eth_hist[-n:]
+        borrow = borrow_hist[-n:]
+        eth_ret = np.diff(np.log(np.maximum(eth, np.finfo(float).eps)))
+        spread_hist = (
+            float(self.wsteth.staking_apy)
+            + float(self.wsteth.steth_supply_apy)
+            - borrow
+        )
+        d_spread = np.diff(spread_hist)
+        if eth_ret.size == 0 or d_spread.size == 0:
+            return {
+                "corr_eth_return": fallback_ret,
+                "corr_eth_vol": fallback_vol,
+                "method": "fallback_default",
+                "observations": n,
+            }
+
+        m = int(min(eth_ret.size, d_spread.size))
+        eth_ret = eth_ret[-m:]
+        d_spread = d_spread[-m:]
+        vol_proxy = np.abs(eth_ret)
+
+        corr_ret = self._safe_corr(d_spread, eth_ret)
+        corr_vol = self._safe_corr(d_spread, vol_proxy)
+        if not np.isfinite(corr_ret):
+            corr_ret = fallback_ret
+        if not np.isfinite(corr_vol):
+            corr_vol = fallback_vol
+
+        corr_ret = float(np.clip(corr_ret, -0.95, 0.95))
+        corr_vol = float(np.clip(corr_vol, -0.95, 0.95))
+        norm = np.sqrt(corr_ret * corr_ret + corr_vol * corr_vol)
+        if norm > 0.95:
+            scale = 0.95 / norm
+            corr_ret *= scale
+            corr_vol *= scale
+
+        return {
+            "corr_eth_return": corr_ret,
+            "corr_eth_vol": corr_vol,
+            "method": "historical_params",
+            "observations": m,
+        }
+
+    def _simulate_spread_paths(
+        self,
+        borrow_rate_paths: np.ndarray,
+        eth_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        dt: float,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        n_paths, n_cols = borrow_rate_paths.shape
+        n_steps = n_cols - 1
+        eps = np.finfo(float).eps
+
+        yield_component_paths = np.full(
+            (n_paths, n_cols),
+            float(self.wsteth.staking_apy + self.wsteth.steth_supply_apy),
+            dtype=float,
+        )
+        if n_steps > 0:
+            exchange_growth = np.diff(exchange_rate_paths, axis=1) / np.maximum(
+                exchange_rate_paths[:, :-1],
+                eps,
+            )
+            yield_component_paths[:, 1:] = (
+                exchange_growth / max(dt, eps)
+                + float(self.wsteth.steth_supply_apy)
+            )
+
+        base_spread_paths = yield_component_paths - borrow_rate_paths
+        if n_steps <= 0:
+            corr_meta = self._estimate_spread_correlation()
+            corr_meta["shock_vol_annual"] = float(self.spread_params.shock_vol_annual)
+            return base_spread_paths, yield_component_paths, corr_meta
+
+        corr_meta = self._estimate_spread_correlation()
+        corr_ret = float(corr_meta["corr_eth_return"])
+        corr_vol = float(corr_meta["corr_eth_vol"])
+
+        eth_ret = np.diff(np.log(np.maximum(eth_paths, eps)), axis=1)
+        eth_vol = self._rolling_vol_from_returns(eth_ret, window=min(5, n_steps))
+
+        ret_std = float(np.std(eth_ret))
+        vol_std = float(np.std(eth_vol))
+        ret_z = (
+            (eth_ret - float(np.mean(eth_ret))) / max(ret_std, eps)
+            if ret_std > eps
+            else np.zeros_like(eth_ret)
+        )
+        vol_z = (
+            (eth_vol - float(np.mean(eth_vol))) / max(vol_std, eps)
+            if vol_std > eps
+            else np.zeros_like(eth_vol)
+        )
+
+        residual_scale = np.sqrt(max(1.0 - corr_ret * corr_ret - corr_vol * corr_vol, 0.0))
+        z = rng.standard_normal((n_paths, n_steps))
+        innovations = corr_ret * ret_z + corr_vol * vol_z + residual_scale * z
+
+        shock_sigma = max(float(self.spread_params.shock_vol_annual), 0.0)
+        spread_shocks = shock_sigma * np.sqrt(max(dt, eps)) * innovations
+        kappa = max(float(self.spread_params.mean_reversion_speed), 0.0)
+
+        spread_paths = np.zeros_like(base_spread_paths)
+        spread_paths[:, 0] = base_spread_paths[:, 0]
+        for step in range(n_steps):
+            target = base_spread_paths[:, step + 1]
+            spread_paths[:, step + 1] = (
+                spread_paths[:, step]
+                + kappa * (target - spread_paths[:, step]) * dt
+                + spread_shocks[:, step]
+            )
+
+        corr_meta["shock_vol_annual"] = shock_sigma
+        return spread_paths, yield_component_paths, corr_meta
+
     def __init__(self, capital_eth: float = 10.0, n_loops: int = 10,
                  config: SimulationConfig | None = None,
                  params: dict | None = None,
@@ -332,6 +547,8 @@ class Dashboard:
         self.vol_params = self.params.get("volatility", VOLATILITY)
         self.depeg_params = self.params.get("depeg", DEPEG)
         self.util_params = self.params.get("utilization", UTILIZATION)
+        exec_params = self.params.get("weth_execution", WETH_EXECUTION)
+        spread_params = self.params.get("spread_model", SPREAD_MODEL)
         raw_weth_total_supply = self.params.get("weth_total_supply")
         raw_weth_total_borrows = self.params.get("weth_total_borrows")
         self.base_gas_price_gwei = self._resolve_gas_price_gwei(self.market.gas_price_gwei)
@@ -363,6 +580,83 @@ class Dashboard:
         )
         self.account_replay_max_paths = int(self.params.get("account_replay_max_paths", 512))
         self.account_replay_max_accounts = int(self.params.get("account_replay_max_accounts", 5000))
+
+        if isinstance(exec_params, dict):
+            adv_default = float(exec_params.get("adv_weth", WETH_EXECUTION.adv_weth))
+            k_default = float(exec_params.get("k_bps", WETH_EXECUTION.k_bps))
+            min_default = float(exec_params.get("min_bps", WETH_EXECUTION.min_bps))
+            max_default = float(exec_params.get("max_bps", WETH_EXECUTION.max_bps))
+        else:
+            adv_default = float(getattr(exec_params, "adv_weth", WETH_EXECUTION.adv_weth))
+            k_default = float(getattr(exec_params, "k_bps", WETH_EXECUTION.k_bps))
+            min_default = float(getattr(exec_params, "min_bps", WETH_EXECUTION.min_bps))
+            max_default = float(getattr(exec_params, "max_bps", WETH_EXECUTION.max_bps))
+
+        self.adv_weth = float(self.params.get("adv_weth", adv_default))
+        self.k_bps = float(self.params.get("k_bps", k_default))
+        self.min_bps = float(self.params.get("min_bps", min_default))
+        self.max_bps = float(self.params.get("max_bps", max_default))
+
+        if isinstance(spread_params, dict):
+            shock_vol_default = float(
+                spread_params.get("shock_vol_annual", SPREAD_MODEL.shock_vol_annual)
+            )
+            mean_reversion_default = float(
+                spread_params.get(
+                    "mean_reversion_speed",
+                    SPREAD_MODEL.mean_reversion_speed,
+                )
+            )
+            corr_ret_default = float(
+                spread_params.get(
+                    "corr_eth_return_default",
+                    SPREAD_MODEL.corr_eth_return_default,
+                )
+            )
+            corr_vol_default = float(
+                spread_params.get(
+                    "corr_eth_vol_default",
+                    SPREAD_MODEL.corr_eth_vol_default,
+                )
+            )
+        else:
+            shock_vol_default = float(
+                getattr(spread_params, "shock_vol_annual", SPREAD_MODEL.shock_vol_annual)
+            )
+            mean_reversion_default = float(
+                getattr(
+                    spread_params,
+                    "mean_reversion_speed",
+                    SPREAD_MODEL.mean_reversion_speed,
+                )
+            )
+            corr_ret_default = float(
+                getattr(
+                    spread_params,
+                    "corr_eth_return_default",
+                    SPREAD_MODEL.corr_eth_return_default,
+                )
+            )
+            corr_vol_default = float(
+                getattr(
+                    spread_params,
+                    "corr_eth_vol_default",
+                    SPREAD_MODEL.corr_eth_vol_default,
+                )
+            )
+
+        self.spread_params = SpreadModelParams(
+            shock_vol_annual=float(self.params.get("spread_shock_vol_annual", shock_vol_default)),
+            mean_reversion_speed=float(
+                self.params.get("spread_mean_reversion_speed", mean_reversion_default)
+            ),
+            corr_eth_return_default=float(
+                self.params.get("spread_corr_eth_return_default", corr_ret_default)
+            ),
+            corr_eth_vol_default=float(
+                self.params.get("spread_corr_eth_vol_default", corr_vol_default)
+            ),
+        )
 
         cascade_ltv_value = self.params.get("cascade_avg_ltv")
         cascade_lt_value = self.params.get("cascade_avg_lt")
@@ -419,11 +713,19 @@ class Dashboard:
             raw_weth_total_borrows,
         )
         self.rate_model = InterestRateModel(self.weth_rates)
+        self.weth_execution_cost_model = QuadraticCEXCostModel(
+            adv_weth=max(self.adv_weth, np.finfo(float).eps),
+            k_bps=max(self.k_bps, 0.0),
+            min_bps=max(self.min_bps, 0.0),
+            max_bps=max(self.max_bps, 0.0),
+        )
         self.cascade_model = LiquidationCascade(
             rate_model=self.rate_model,
             liq_engine=LiquidationEngine(self.emode, self.wsteth, price_mode="market"),
         )
-        self.account_cascade_model = AccountLiquidationReplayEngine()
+        self.account_cascade_model = AccountLiquidationReplayEngine(
+            execution_cost_model=self.weth_execution_cost_model
+        )
 
         # Prefer price history from params unless explicitly provided
         if eth_price_history is None:
@@ -630,6 +932,10 @@ class Dashboard:
             n_steps=n_steps,
             rng=rng,
         )
+        eth_usd_paths = np.maximum(
+            eth_paths * max(float(self.market.eth_usd_price), np.finfo(float).eps),
+            np.finfo(float).eps,
+        )
 
         # === Phase 2: Liquidation cascade effects ===
         # ETH drop → liquidations of ETH-collateral/stablecoin-borrow positions
@@ -647,6 +953,8 @@ class Dashboard:
             "collateral_coverage": 1.0,
         }
         replay_diagnostics_summary = None
+        replay_diag = None
+        replay_diag_projected: dict[str, np.ndarray] = {}
         if self.use_account_level_cascade and self.account_cascade_cohort:
             replay_accounts, replay_account_coverage = self._trim_accounts_by_debt(
                 self.account_cascade_cohort,
@@ -657,6 +965,7 @@ class Dashboard:
                 self.account_replay_max_paths,
             )
             replay_eth_paths = eth_paths[replay_path_idx]
+            replay_eth_usd_paths = eth_usd_paths[replay_path_idx]
             replay_path_count = int(replay_eth_paths.shape[0])
 
             replay_result = self.account_cascade_model.simulate(
@@ -664,6 +973,14 @@ class Dashboard:
                 accounts=replay_accounts,
                 base_deposits=self.weth_total_supply,
                 base_borrows=self.weth_total_borrows,
+                eth_usd_price_paths=replay_eth_usd_paths,
+                execution_cost_model=self.weth_execution_cost_model,
+                protocol_market=ProtocolMarket(
+                    weth_total_deposits=self.weth_total_supply,
+                    weth_total_borrows=self.weth_total_borrows,
+                    weth_borrow_reduction_fraction=self.account_cascade_model.weth_borrow_reduction_fraction,
+                ),
+                borrow_rate_fn=self.rate_model.borrow_rate,
             )
             replay_adj = replay_result.adjustment_array
             if replay_adj.shape == eth_paths.shape:
@@ -701,6 +1018,38 @@ class Dashboard:
 
             replay_diag = replay_result.diagnostics
             replay_diag.replay_projection = replay_projection
+
+            def _project_diag(arr: np.ndarray | None) -> np.ndarray:
+                if arr is None:
+                    return np.zeros((n_paths, n_cols), dtype=float)
+                arr_f = np.asarray(arr, dtype=float)
+                if arr_f.shape == (n_paths, n_cols):
+                    return arr_f
+                if arr_f.shape == (replay_eth_paths.shape[0], n_cols):
+                    return self._project_replay_adjustments(
+                        full_eth_paths=eth_paths,
+                        replay_eth_paths=replay_eth_paths,
+                        replay_adjustments=arr_f,
+                    )
+                return np.zeros((n_paths, n_cols), dtype=float)
+
+            replay_diag_projected = {
+                "liquidation_counts": np.rint(_project_diag(replay_diag.liquidation_counts)).astype(int),
+                "debt_at_risk_eth": _project_diag(replay_diag.debt_at_risk_eth),
+                "debt_liquidated_eth": _project_diag(replay_diag.debt_liquidated_eth),
+                "collateral_seized_eth": _project_diag(replay_diag.collateral_seized_eth),
+                "weth_supply_reduction": _project_diag(replay_diag.weth_supply_reduction),
+                "weth_borrow_reduction": _project_diag(replay_diag.weth_borrow_reduction),
+                "repaid_usdc_usd": _project_diag(replay_diag.repaid_usdc_usd),
+                "repaid_usdt_usd": _project_diag(replay_diag.repaid_usdt_usd),
+                "v_stables_usd": _project_diag(replay_diag.v_stables_usd),
+                "v_weth": _project_diag(replay_diag.v_weth),
+                "cost_bps": _project_diag(replay_diag.cost_bps),
+                "realized_execution_haircut": _project_diag(replay_diag.realized_execution_haircut),
+                "bad_debt_usd": _project_diag(replay_diag.bad_debt_usd),
+                "bad_debt_eth": _project_diag(replay_diag.bad_debt_eth),
+                "utilization": _project_diag(replay_diag.utilization),
+            }
             replay_diagnostics_summary = {
                 "paths_processed": int(replay_diag.paths_processed),
                 "accounts_processed": int(replay_diag.accounts_processed),
@@ -723,6 +1072,24 @@ class Dashboard:
                     self.cascade_fallback_reason
                     or "Account-level cascade cohort unavailable"
                 )
+        if not replay_diag_projected:
+            replay_diag_projected = {
+                "liquidation_counts": np.zeros((n_paths, n_cols), dtype=int),
+                "debt_at_risk_eth": np.zeros((n_paths, n_cols), dtype=float),
+                "debt_liquidated_eth": np.zeros((n_paths, n_cols), dtype=float),
+                "collateral_seized_eth": np.zeros((n_paths, n_cols), dtype=float),
+                "weth_supply_reduction": np.zeros((n_paths, n_cols), dtype=float),
+                "weth_borrow_reduction": np.zeros((n_paths, n_cols), dtype=float),
+                "repaid_usdc_usd": np.zeros((n_paths, n_cols), dtype=float),
+                "repaid_usdt_usd": np.zeros((n_paths, n_cols), dtype=float),
+                "v_stables_usd": np.zeros((n_paths, n_cols), dtype=float),
+                "v_weth": np.zeros((n_paths, n_cols), dtype=float),
+                "cost_bps": np.zeros((n_paths, n_cols), dtype=float),
+                "realized_execution_haircut": np.zeros((n_paths, n_cols), dtype=float),
+                "bad_debt_usd": np.zeros((n_paths, n_cols), dtype=float),
+                "bad_debt_eth": np.zeros((n_paths, n_cols), dtype=float),
+                "utilization": np.zeros((n_paths, n_cols), dtype=float),
+            }
 
         # === Phase 3: Utilization paths (latent OU + cascade shocks) ===
         util_rng = np.random.default_rng(rng.integers(0, 2**31))
@@ -783,6 +1150,40 @@ class Dashboard:
             n_cols=n_cols,
             dt=dt,
         )
+
+        # === Phase 5b: Spread dynamics (yield component - borrow rate) ===
+        spread_rng = np.random.default_rng(rng.integers(0, 2**31))
+        spread_paths, yield_component_paths, spread_corr_meta = self._simulate_spread_paths(
+            borrow_rate_paths=borrow_rate_paths,
+            eth_paths=eth_paths,
+            exchange_rate_paths=exchange_rate_paths,
+            dt=dt,
+            rng=spread_rng,
+        )
+        spread_terminal = spread_paths[:, -1]
+        spread_forecast_payload = {
+            "horizon_days": n_steps,
+            "ci_68_pct": [
+                round(float(np.percentile(spread_terminal, 16) * 100.0), 3),
+                round(float(np.percentile(spread_terminal, 84) * 100.0), 3),
+            ],
+            "ci_95_pct": [
+                round(float(np.percentile(spread_terminal, 2.5) * 100.0), 3),
+                round(float(np.percentile(spread_terminal, 97.5) * 100.0), 3),
+            ],
+            "prob_negative_horizon_pct": round(float(np.mean(spread_terminal < 0.0) * 100.0), 3),
+            "prob_negative_any_time_pct": round(
+                float(np.mean(np.any(spread_paths[:, 1:] < 0.0, axis=1)) * 100.0),
+                3,
+            ),
+            "correlation": {
+                "eth_return": round(float(spread_corr_meta["corr_eth_return"]), 4),
+                "eth_vol": round(float(spread_corr_meta["corr_eth_vol"]), 4),
+                "method": spread_corr_meta["method"],
+                "observations": int(spread_corr_meta["observations"]),
+            },
+            "shock_vol_annual": round(float(spread_corr_meta["shock_vol_annual"]), 4),
+        }
 
         # === Phase 6: Carry + MTM P&L (rate/utilization + market depeg) ===
         # HF remains oracle-native below; market depeg is P&L-only here.
@@ -882,6 +1283,99 @@ class Dashboard:
             steth_eth_terminal=terminal_execution_depeg,
         )
 
+        replay_v_stables_usd = replay_diag_projected["v_stables_usd"]
+        replay_v_weth = replay_diag_projected["v_weth"]
+        replay_cost_bps = replay_diag_projected["cost_bps"]
+        replay_bad_debt_usd = replay_diag_projected["bad_debt_usd"]
+        replay_liq_counts = replay_diag_projected["liquidation_counts"]
+
+        bad_debt_usd_paths = np.sum(replay_bad_debt_usd, axis=1)
+        initial_eth_usd = float(np.mean(eth_usd_paths[:, 0]))
+        bad_debt_weth_paths = bad_debt_usd_paths / max(initial_eth_usd, np.finfo(float).eps)
+        bad_debt_stats = {
+            "usd": {
+                k: round(v, 6) for k, v in self._summary_stats(bad_debt_usd_paths).items()
+            },
+            "weth_equivalent": {
+                k: round(v, 6) for k, v in self._summary_stats(bad_debt_weth_paths).items()
+            },
+        }
+
+        stable_volume_paths = np.sum(replay_v_stables_usd, axis=1)
+        weighted_cost_paths = np.divide(
+            np.sum(replay_cost_bps * replay_v_stables_usd, axis=1),
+            np.maximum(stable_volume_paths, np.finfo(float).eps),
+        )
+        realized_haircut_paths = np.divide(
+            np.sum(
+                replay_diag_projected["realized_execution_haircut"] * replay_v_stables_usd,
+                axis=1,
+            ),
+            np.maximum(stable_volume_paths, np.finfo(float).eps),
+        )
+        cost_bps_summary = {
+            **{k: round(v, 6) for k, v in self._summary_stats(weighted_cost_paths).items()},
+            "max_step_bps": round(float(np.max(replay_cost_bps)), 6),
+            "realized_haircut_pct_mean": round(float(np.mean(realized_haircut_paths) * 100.0), 6),
+        }
+
+        liquidation_diagnostics = {
+            "debt_at_risk_eth_peak": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(
+                    np.max(replay_diag_projected["debt_at_risk_eth"], axis=1)
+                ).items()
+            },
+            "debt_liquidated_eth_total": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(
+                    np.sum(replay_diag_projected["debt_liquidated_eth"], axis=1)
+                ).items()
+            },
+            "collateral_seized_weth_total": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(
+                    np.sum(replay_diag_projected["collateral_seized_eth"], axis=1)
+                ).items()
+            },
+            "liquidation_count_total": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(np.sum(replay_liq_counts, axis=1)).items()
+            },
+            "repaid_usdc_usd_total": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(
+                    np.sum(replay_diag_projected["repaid_usdc_usd"], axis=1)
+                ).items()
+            },
+            "repaid_usdt_usd_total": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(
+                    np.sum(replay_diag_projected["repaid_usdt_usd"], axis=1)
+                ).items()
+            },
+        }
+
+        time_series_diagnostics = {
+            "v_stables_usd": self._time_series_percentiles(replay_v_stables_usd),
+            "v_weth": self._time_series_percentiles(replay_v_weth),
+            "cost_bps": self._time_series_percentiles(replay_cost_bps),
+            "debt_at_risk_eth": self._time_series_percentiles(
+                replay_diag_projected["debt_at_risk_eth"]
+            ),
+            "debt_liquidated_eth": self._time_series_percentiles(
+                replay_diag_projected["debt_liquidated_eth"]
+            ),
+            "collateral_seized_eth": self._time_series_percentiles(
+                replay_diag_projected["collateral_seized_eth"]
+            ),
+            "liquidation_counts": self._time_series_percentiles(replay_liq_counts),
+            "utilization": self._time_series_percentiles(util_paths),
+            "borrow_rate_pct": self._time_series_percentiles(borrow_rate_paths * 100.0),
+            "spread_pct": self._time_series_percentiles(spread_paths * 100.0),
+            "yield_component_pct": self._time_series_percentiles(yield_component_paths * 100.0),
+        }
+
         # === Position summary ===
         current_borrow = float(self.rate_model.borrow_rate(self.market.current_weth_utilization))
         snap = self.position.snapshot(current_borrow)
@@ -979,6 +1473,18 @@ class Dashboard:
                 "cascade_replay_path_count": replay_path_count,
                 "cascade_replay_account_coverage": replay_account_coverage,
                 "cascade_replay_diagnostics": replay_diagnostics_summary,
+                "weth_execution_model": {
+                    "adv_weth": self.adv_weth,
+                    "k_bps": self.k_bps,
+                    "min_bps": self.min_bps,
+                    "max_bps": self.max_bps,
+                },
+                "spread_model": {
+                    "shock_vol_annual": self.spread_params.shock_vol_annual,
+                    "mean_reversion_speed": self.spread_params.mean_reversion_speed,
+                    "corr_eth_return_default": self.spread_params.corr_eth_return_default,
+                    "corr_eth_vol_default": self.spread_params.corr_eth_vol_default,
+                },
                 "governance_shock_prob_annual": self.gov_shock_prob_annual,
                 "slashing_intensity_annual": self.slashing_intensity_annual,
                 "depeg_calibration": self.depeg_calibration,
@@ -1059,6 +1565,11 @@ class Dashboard:
                 for r in stress_results
             ],
             unwind_costs=unwind_pct_costs,
+            bad_debt_stats=bad_debt_stats,
+            cost_bps_summary=cost_bps_summary,
+            liquidation_diagnostics=liquidation_diagnostics,
+            spread_forecast=spread_forecast_payload,
+            time_series_diagnostics=time_series_diagnostics,
             simulation_config={
                 'n_simulations': n_paths,
                 'horizon_days': n_steps,
@@ -1076,6 +1587,12 @@ class Dashboard:
                 'cascade_replay_path_count': replay_path_count,
                 'cascade_replay_projection': replay_projection,
                 'cascade_replay_account_coverage': replay_account_coverage,
+                'adv_weth': self.adv_weth,
+                'k_bps': self.k_bps,
+                'min_bps': self.min_bps,
+                'max_bps': self.max_bps,
+                'spread_shock_vol_annual': self.spread_params.shock_vol_annual,
+                'spread_mean_reversion_speed': self.spread_params.mean_reversion_speed,
                 'governance_shock_prob_annual': self.gov_shock_prob_annual,
                 'governance_ir_spread': self.gov_ir_spread,
                 'governance_lt_haircut': self.gov_lt_haircut,

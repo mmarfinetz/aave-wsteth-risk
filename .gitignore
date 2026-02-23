@@ -1,4 +1,12 @@
 .env
+.env.*
+!.env.example
+AGENTS.md
+.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
 __pycache__/
 *.pyc
 data/cache/

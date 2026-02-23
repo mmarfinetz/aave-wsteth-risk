@@ -150,6 +150,30 @@ def main():
         default=5000,
         help="Max accounts kept in account-level replay by debt rank (default: 5000)",
     )
+    parser.add_argument(
+        "--adv-weth",
+        type=float,
+        default=2_000_000.0,
+        help="WETH ADV for quadratic execution-cost model, in WETH/day (default: 2,000,000)",
+    )
+    parser.add_argument(
+        "--k-bps",
+        type=float,
+        default=50.0,
+        help="Quadratic execution-cost coefficient in bps (default: 50)",
+    )
+    parser.add_argument(
+        "--min-bps",
+        type=float,
+        default=0.0,
+        help="Minimum execution cost in bps after clamping (default: 0)",
+    )
+    parser.add_argument(
+        "--max-bps",
+        type=float,
+        default=500.0,
+        help="Maximum execution cost in bps after clamping (default: 500)",
+    )
 
     args = parser.parse_args()
 
@@ -202,6 +226,10 @@ def main():
     params.update(account_cascade_params)
     params["account_replay_max_paths"] = int(args.account_replay_max_paths)
     params["account_replay_max_accounts"] = int(args.account_replay_max_accounts)
+    params["adv_weth"] = float(args.adv_weth)
+    params["k_bps"] = float(args.k_bps)
+    params["min_bps"] = float(args.min_bps)
+    params["max_bps"] = float(args.max_bps)
     if args.use_account_level_cascade:
         if params.get("cascade_source") == "account_replay":
             metadata = params.get("cascade_cohort_metadata")
@@ -216,6 +244,12 @@ def main():
                 "  [DATA] Replay acceleration caps: "
                 f"paths={args.account_replay_max_paths}, "
                 f"accounts={args.account_replay_max_accounts}"
+            )
+            print(
+                "  [DATA] WETH execution model: "
+                f"ADV={args.adv_weth:,.0f} WETH/day, "
+                f"k={args.k_bps:.2f} bps, "
+                f"clamp=[{args.min_bps:.2f}, {args.max_bps:.2f}] bps"
             )
         else:
             print(
@@ -290,6 +324,26 @@ def main():
     print(f"  Liquidation Prob:      {rm['prob_liquidation_pct']:.2f}%")
     print()
 
+    if output.bad_debt_stats:
+        bd = output.bad_debt_stats.get("usd", {})
+        print("BAD DEBT (path totals, USD)")
+        print("-" * 40)
+        print(
+            "  mean={mean:.2f}  p50={p50:.2f}  p95={p95:.2f}  "
+            "p99={p99:.2f}  max={max:.2f}".format(**bd)
+        )
+        print()
+
+    if output.cost_bps_summary:
+        cb = output.cost_bps_summary
+        print("EXECUTION COST (bps)")
+        print("-" * 40)
+        print(
+            "  mean={mean:.2f}  p50={p50:.2f}  p95={p95:.2f}  "
+            "p99={p99:.2f}  max={max:.2f}  step-max={max_step_bps:.2f}".format(**cb)
+        )
+        print()
+
     rd = output.risk_decomposition
     print("RISK DECOMPOSITION")
     print("-" * 40)
@@ -308,6 +362,23 @@ def main():
         vals = fan[pct]
         print(f"  p{pct:>2}: {vals[0]:.2f}% -> {vals[-1]:.2f}%"
               f"  (min={min(vals):.2f}%, max={max(vals):.2f}%)")
+    print()
+
+    sf = output.spread_forecast
+    print("SPREAD FORECAST (yield - WETH borrow)")
+    print("-" * 40)
+    print(
+        f"  68% CI:              [{sf['ci_68_pct'][0]:.2f}%, {sf['ci_68_pct'][1]:.2f}%]"
+    )
+    print(
+        f"  95% CI:              [{sf['ci_95_pct'][0]:.2f}%, {sf['ci_95_pct'][1]:.2f}%]"
+    )
+    print(
+        f"  P(spread<0 @ T):     {sf['prob_negative_horizon_pct']:.2f}%"
+    )
+    print(
+        f"  P(spread<0 anytime): {sf['prob_negative_any_time_pct']:.2f}%"
+    )
     print()
 
     ua = output.utilization_analytics

@@ -98,7 +98,9 @@ def test_full_pipeline_output_schema():
     for key in ["timestamp", "data_sources", "position_summary", "current_apy",
                 "apy_forecast_24h", "risk_metrics", "risk_decomposition",
                 "rate_forecast", "utilization_analytics", "stress_tests",
-                "unwind_costs", "simulation_config"]:
+                "unwind_costs", "bad_debt_stats", "cost_bps_summary",
+                "liquidation_diagnostics", "spread_forecast",
+                "time_series_diagnostics", "simulation_config"]:
         assert getattr(output, key) is not None, f"Missing top-level key: {key}"
 
     # Key numeric fields are finite
@@ -111,6 +113,8 @@ def test_full_pipeline_output_schema():
     assert isinstance(parsed, dict)
     assert "risk_metrics" in parsed
     assert "unwind_costs" in parsed
+    assert "bad_debt_stats" in parsed
+    assert "spread_forecast" in parsed
 
 
 def test_utilization_analytics_fields_present_and_finite():
@@ -139,6 +143,28 @@ def test_utilization_analytics_fields_present_and_finite():
     assert np.isfinite(ua["corr_util_change_vs_eth_return"])
 
 
+def test_time_series_diagnostics_include_liquidation_series():
+    config = SimulationConfig(n_simulations=16, horizon_days=3, seed=42)
+    dashboard = Dashboard(config=config, params={})
+    output = dashboard.run(seed=42)
+    ts = output.time_series_diagnostics
+
+    required = [
+        "debt_at_risk_eth",
+        "debt_liquidated_eth",
+        "collateral_seized_eth",
+        "liquidation_counts",
+    ]
+    n_cols = config.horizon_days + 1
+    for key in required:
+        assert key in ts
+        series = ts[key]
+        for pct in ["mean", "p5", "p50", "p95"]:
+            assert pct in series
+            assert len(series[pct]) == n_cols
+            assert np.all(np.isfinite(series[pct]))
+
+
 def test_cascade_cli_overrides_propagate_to_output():
     """CLI-provided cascade params should appear in output.simulation_config."""
     params = {"cascade_avg_ltv": 0.75, "cascade_avg_lt": 0.825}
@@ -147,3 +173,14 @@ def test_cascade_cli_overrides_propagate_to_output():
     sim_cfg = output.simulation_config
     assert sim_cfg["cascade_avg_ltv"] == pytest.approx(0.75)
     assert sim_cfg["cascade_avg_lt"] == pytest.approx(0.825)
+
+
+def test_execution_cost_knobs_propagate_to_output():
+    params = {"adv_weth": 123_456.0, "k_bps": 75.0, "min_bps": 1.0, "max_bps": 250.0}
+    dashboard = Dashboard(config=_small_config(), params=params)
+    output = dashboard.run(seed=12)
+    sim_cfg = output.simulation_config
+    assert sim_cfg["adv_weth"] == pytest.approx(123_456.0)
+    assert sim_cfg["k_bps"] == pytest.approx(75.0)
+    assert sim_cfg["min_bps"] == pytest.approx(1.0)
+    assert sim_cfg["max_bps"] == pytest.approx(250.0)

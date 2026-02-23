@@ -127,6 +127,32 @@ class UtilizationParams:
 
 
 @dataclass(frozen=True)
+class WETHExecutionParams:
+    """Execution-cost assumptions for WETH liquidation flow."""
+
+    adv_weth: float = 2_000_000.0
+    # Conservative baseline daily WETH ADV proxy (CEX + DEX arb bandwidth)
+    k_bps: float = 50.0
+    # Quadratic impact coefficient in basis points
+    min_bps: float = 0.0
+    max_bps: float = 500.0
+
+
+@dataclass(frozen=True)
+class SpreadModelParams:
+    """Stochastic spread model controls."""
+
+    shock_vol_annual: float = 0.10
+    # Annualized spread-shock sigma (Normal innovations)
+    mean_reversion_speed: float = 8.0
+    # Reversion toward carry-implied spread baseline
+    corr_eth_return_default: float = -0.35
+    # Conservative default: spread widens less / tightens under ETH upside
+    corr_eth_vol_default: float = -0.20
+    # Conservative default: higher vol tends to compress spread
+
+
+@dataclass(frozen=True)
 class SimulationConfig:
     """Default simulation configuration."""
     n_simulations: int = 10_000
@@ -547,6 +573,8 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
             "wsteth": wsteth,
             "market": market,
             "curve_pool": curve_pool,
+            "weth_execution": WETHExecutionParams(),
+            "spread_model": SpreadModelParams(),
             "weth_total_supply": fetched.weth_total_supply,
             "weth_total_borrows": fetched.weth_total_borrows,
             "aave_oracle_address": fetched.aave_oracle_address,
@@ -581,4 +609,6 @@ CURVE_POOL = CurvePoolParams()
 VOLATILITY = VolatilityParams()
 DEPEG = DepegParams()
 UTILIZATION = UtilizationParams()
+WETH_EXECUTION = WETHExecutionParams()
+SPREAD_MODEL = SpreadModelParams()
 SIM_CONFIG = SimulationConfig()

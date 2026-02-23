@@ -181,7 +181,7 @@ def test_account_replay_acceleration_caps_paths_and_accounts(monkeypatch):
 
     captured = {}
 
-    def fake_replay(eth_price_paths, accounts, base_deposits, base_borrows):
+    def fake_replay(eth_price_paths, accounts, base_deposits, base_borrows, **kwargs):
         captured["n_paths"] = eth_price_paths.shape[0]
         captured["n_accounts"] = len(accounts)
         return _zero_replay_result(
