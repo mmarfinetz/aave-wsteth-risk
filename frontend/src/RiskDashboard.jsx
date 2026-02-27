@@ -768,8 +768,8 @@ function RiskDecompositionDonut() {
 
   return (
     <Panel title="Risk Decomposition — VaR₉₅" icon={Layers} accentColor="#f0b429">
-      <div className="flex items-center gap-6">
-        <div className="relative" style={{ width: 180, height: 180 }}>
+      <div className="flex flex-col gap-5 2xl:flex-row 2xl:items-center">
+        <div className="relative mx-auto 2xl:mx-0 flex-shrink-0" style={{ width: 180, height: 180 }}>
           <ResponsiveContainer width="100%" height="100%">
             <PieChart>
               <Pie
@@ -804,19 +804,19 @@ function RiskDecompositionDonut() {
             <span className="font-mono text-[10px] text-txt-muted">ETH</span>
           </div>
         </div>
-        <div className="flex-1 space-y-2">
+        <div className="min-w-0 flex-1 space-y-2">
           {segments.map((s, i) => (
-            <div key={i} className="flex items-center gap-3">
+            <div key={i} className="flex items-center gap-2 min-w-0">
               <StatusDot color={s.color} />
-              <span className="font-sans text-xs text-txt-secondary w-24">{s.name}</span>
-              <div className="flex-1 h-1.5 bg-[rgba(255,255,255,0.04)] rounded-full overflow-hidden">
+              <span className="font-sans text-xs text-txt-secondary w-24 min-w-0 truncate">{s.name}</span>
+              <div className="flex-1 h-1.5 min-w-0 bg-[rgba(255,255,255,0.04)] rounded-full overflow-hidden">
                 <div
                   className="h-full rounded-full transition-all"
                   style={{ width: `${s.pct}%`, background: s.color, opacity: 0.7 }}
                 />
               </div>
-              <span className="font-mono text-xs text-txt-primary w-14 text-right">{fmtPct(s.pct, 1)}</span>
-              <span className="font-mono text-[10px] text-txt-muted w-20 text-right">{fmtEth(s.eth)}</span>
+              <span className="font-mono text-xs text-txt-primary w-14 text-right flex-shrink-0">{fmtPct(s.pct, 1)}</span>
+              <span className="font-mono text-[10px] text-txt-muted w-20 text-right truncate flex-shrink-0">{fmtEth(s.eth)}</span>
             </div>
           ))}
           <div className="mt-2 pt-2 border-t border-[rgba(255,255,255,0.04)]">
@@ -848,11 +848,15 @@ function RiskMetricsGrid() {
 
   return (
     <Panel title="Risk Metrics" icon={AlertTriangle} accentColor="#ef4444">
-      <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2">
         {metrics.map((m, i) => (
-          <div key={i} className="flex items-center justify-between py-1.5 border-b border-[rgba(255,255,255,0.03)]">
-            <span className="font-mono text-[10px] tracking-[0.05em] uppercase text-txt-secondary">{m.label}</span>
-            <span className="font-mono text-sm font-medium" style={{ color: m.color }}>{m.value}</span>
+          <div key={i} className="min-w-0 py-1.5 border-b border-[rgba(255,255,255,0.03)]">
+            <span className="block font-mono text-[10px] tracking-[0.05em] uppercase text-txt-secondary">
+              {m.label}
+            </span>
+            <span className="block font-mono text-sm font-medium leading-tight mt-1 whitespace-nowrap" style={{ color: m.color }}>
+              {m.value}
+            </span>
           </div>
         ))}
       </div>
@@ -869,15 +873,15 @@ function RiskMetricsGrid() {
         <div className="font-mono text-[10px] tracking-[0.08em] uppercase text-txt-secondary mb-2">
           DECOMPOSITION DETAIL
         </div>
-        <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-[10px] font-mono">
-          <div className="flex justify-between"><span className="text-txt-muted">Carry CVaR₉₅</span><span className="text-txt-primary">{fmtEth(rd.carry_cvar_95_eth)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Unwind CVaR₉₅</span><span className="text-txt-primary">{fmtEth(rd.unwind_cost_cvar_95_eth)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Unwind VaR₉₅|exit</span><span className="text-txt-primary">{fmtEth(rd.unwind_cost_var_95_cond_exit_eth)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Slashing VaR₉₉</span><span className="text-txt-primary">{fmtEth(rd.slashing_tail_loss_99_eth)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Gov CVaR₉₅</span><span className="text-txt-primary">{fmtEth(rd.governance_cvar_95_eth)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Depeg risk</span><span className="text-txt-primary">{fmtPct(rd.depeg_risk_pct, 1)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Cascade risk</span><span className="text-txt-primary">{fmtPct(rd.cascade_risk_pct, 1)}</span></div>
-          <div className="flex justify-between"><span className="text-txt-muted">Liquidity risk</span><span className="text-txt-primary">{fmtPct(rd.liquidity_risk_pct, 1)}</span></div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-[10px] font-mono">
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Carry CVaR₉₅</span><span className="text-txt-primary whitespace-nowrap">{fmtEth(rd.carry_cvar_95_eth)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Unwind CVaR₉₅</span><span className="text-txt-primary whitespace-nowrap">{fmtEth(rd.unwind_cost_cvar_95_eth)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Unwind VaR₉₅|exit</span><span className="text-txt-primary whitespace-nowrap">{fmtEth(rd.unwind_cost_var_95_cond_exit_eth)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Slashing VaR₉₉</span><span className="text-txt-primary whitespace-nowrap">{fmtEth(rd.slashing_tail_loss_99_eth)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Gov CVaR₉₅</span><span className="text-txt-primary whitespace-nowrap">{fmtEth(rd.governance_cvar_95_eth)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Depeg risk</span><span className="text-txt-primary whitespace-nowrap">{fmtPct(rd.depeg_risk_pct, 1)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Cascade risk</span><span className="text-txt-primary whitespace-nowrap">{fmtPct(rd.cascade_risk_pct, 1)}</span></div>
+          <div className="flex items-center justify-between gap-2 min-w-0"><span className="text-txt-muted">Liquidity risk</span><span className="text-txt-primary whitespace-nowrap">{fmtPct(rd.liquidity_risk_pct, 1)}</span></div>
         </div>
       </div>
     </Panel>
@@ -2034,7 +2038,7 @@ export default function RiskDashboard() {
               <BorrowRateFanChart />
 
               {/* Section C: Risk Analytics */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <div className="grid grid-cols-1 2xl:grid-cols-2 gap-5">
                 <RiskDecompositionDonut />
                 <RiskMetricsGrid />
               </div>
