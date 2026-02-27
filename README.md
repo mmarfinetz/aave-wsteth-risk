@@ -120,9 +120,16 @@ python run_dashboard.py --use-subgraph-cohort
 # Enable account-level liquidation replay (requires AAVE_SUBGRAPH_URL in .env)
 python run_dashboard.py --use-account-level-cascade
 
+# Enable hybrid Monte Carlo + ABM cascade (ABM surrogate projection)
+python run_dashboard.py --abm-enabled --abm-mode surrogate
+
+# Enable ABM full mode (no path projection)
+python run_dashboard.py --abm-enabled --abm-mode full
+
 # Full-featured run
 python run_dashboard.py --capital 50 --loops 7 --simulations 20000 --horizon 30 \
-  --fetch --use-subgraph-cohort --use-account-level-cascade
+  --fetch --use-subgraph-cohort --use-account-level-cascade \
+  --abm-enabled --abm-mode surrogate
 ```
 
 ## Environment variables
@@ -154,6 +161,15 @@ The dashboard works out of the box with no environment variables set. It uses fr
 | `--use-account-level-cascade` | off | Enable account-level liquidation replay (falls back to aggregate proxy) |
 | `--account-replay-max-paths` | `512` | Replay acceleration: max ETH paths used in account-level replay before interpolation |
 | `--account-replay-max-accounts` | `5000` | Replay acceleration: max accounts kept in account-level replay (debt-ranked) |
+| `--abm-enabled` | off | Enable inner ABM cascade layer |
+| `--abm-mode` | `off` | ABM mode (`off`, `surrogate`, `full`) |
+| `--abm-max-paths` | `256` | Max paths processed by ABM before surrogate projection |
+| `--abm-max-accounts` | `5000` | Max accounts processed by ABM |
+| `--abm-projection-method` | `terminal_price_interp` | Surrogate projection method from ABM subset to full MC paths |
+| `--abm-liquidator-competition` | `0.35` | Liquidator competition intensity in ABM (`0-1`) |
+| `--abm-arb-enabled` / `--abm-arb-disabled` | on | Toggle arbitrageur response in ABM |
+| `--abm-lp-response-strength` | `0.50` | LP endogenous response strength (`0-2`) |
+| `--abm-random-seed-offset` | `10000` | Seed offset for ABM internals (deterministic with global seed) |
 
 ## Subgraph cohort analytics (optional)
 
@@ -177,18 +193,26 @@ AAVE_SUBGRAPH_URL=https://gateway.thegraph.com/api/<key>/subgraphs/id/<subgraph_
 
 Scope boundary: reserve-level pool totals and protocol state always come from on-chain sources. Subgraph data is only used for borrower/cohort calibration.
 
-## Account-level cascade replay (optional)
+## Hybrid cascade layer: account replay + ABM (optional)
 
 By default, cascade utilization impact is modeled with an aggregate proxy: a cohort-level HF approximation converts ETH shocks into liquidation fraction, then into WETH supply/borrow effects.
 
 When `--use-account-level-cascade` is enabled, the dashboard attempts a per-account liquidation replay from subgraph snapshots. For each path and timestep, it recomputes account HF, applies close-factor tiers and liquidation bonus, iterates until convergence, and maps liquidations into utilization adjustments.
 
+When `--abm-enabled` is also enabled, the Monte Carlo outer paths call an inner ABM layer that models borrower/liquidator/arbitrageur/LP endogenous behavior per timestep. The ABM emits per-path/per-step arrays (`weth_supply_reduction`, `weth_borrow_reduction`, `execution_cost_bps`, `bad_debt`, `utilization_shock`) which feed directly into utilization/rate/HF/PnL downstream stages.
+
 ```bash
 # Account-level replay
 python run_dashboard.py --use-account-level-cascade
 
+# ABM surrogate mode (subset + projection)
+python run_dashboard.py --abm-enabled --abm-mode surrogate
+
+# ABM full mode
+python run_dashboard.py --abm-enabled --abm-mode full
+
 # Combined with cohort analytics
-python run_dashboard.py --use-subgraph-cohort --use-account-level-cascade
+python run_dashboard.py --use-subgraph-cohort --use-account-level-cascade --abm-enabled
 
 # Faster replay for large cohorts / high simulation count
 python run_dashboard.py --use-account-level-cascade \
@@ -200,6 +224,9 @@ Fallback behavior:
 - Flag off (default): uses aggregate proxy (`cascade_source=aggregate_proxy`).
 - Flag on + successful fetch: uses account replay (`cascade_source=account_replay`).
 - Flag on + missing env / fetch error / empty cohort: falls back to aggregate proxy (`cascade_source=account_replay_fallback`) with `cascade_fallback_reason` in output.
+- ABM full success: `cascade_source=abm_full`.
+- ABM surrogate success: `cascade_source=abm_surrogate`.
+- ABM requested but unavailable/failed: `cascade_source=abm_fallback` with delegate source and fallback reason.
 
 Assumptions:
 
@@ -310,7 +337,7 @@ Completed in 0.48s
 ## Pipeline (dashboard.py)
 
 1. ETH price paths via GBM (`models/price_simulation.py`)
-2. Cascade utilization impact from ETH drops (`models/liquidation_cascade.py`) or optional account replay (`models/account_liquidation_replay.py`)
+2. Cascade utilization impact from ETH drops via aggregate proxy (`models/liquidation_cascade.py`), account replay (`models/account_liquidation_replay.py`), or hybrid ABM inner loop (`models/abm/`)
 3. OU utilization paths + cascade shocks (`models/utilization_model.py`)
 4. Borrow-rate paths + governance IR/LT shock paths (`models/aave_model.py`, `dashboard.py`)
 5. Oracle exchange-rate paths with CAPO cap + slashing tails (`src/oracle_dynamics/exchange_rate.py`)

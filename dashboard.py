@@ -24,7 +24,8 @@ from typing import Any
 
 from config.params import (
     DEFAULT_GAS_PRICE_GWEI, EMODE, WETH_RATES, WSTETH, MARKET, CURVE_POOL, SIM_CONFIG,
-    VOLATILITY, DEPEG, UTILIZATION, WETH_EXECUTION, SPREAD_MODEL,
+    VOLATILITY, DEPEG, UTILIZATION, WETH_EXECUTION, SPREAD_MODEL, ABM,
+    ABMConfig,
     SpreadModelParams,
     SimulationConfig, load_params,
 )
@@ -37,6 +38,8 @@ from models.account_liquidation_replay import (
     AccountState,
     ProtocolMarket,
 )
+from models.abm.engine import ABMEngine
+from models.abm.surrogate import project_abm_output
 from models.utilization_model import UtilizationModel
 from models.rate_forecast import RateForecast
 from models.position_model import LoopedPosition
@@ -152,11 +155,26 @@ class Dashboard:
                     collateral_weth=float(row.get("collateral_weth", 0.0))
                     if row.get("collateral_weth") is not None
                     else None,
+                    collateral_steth_eth=float(row.get("collateral_steth_eth", 0.0))
+                    if row.get("collateral_steth_eth") is not None
+                    else None,
+                    collateral_other_eth=float(row.get("collateral_other_eth", 0.0))
+                    if row.get("collateral_other_eth") is not None
+                    else None,
                     debt_usdc=float(row.get("debt_usdc", 0.0))
                     if row.get("debt_usdc") is not None
                     else None,
                     debt_usdt=float(row.get("debt_usdt", 0.0))
                     if row.get("debt_usdt") is not None
+                    else None,
+                    debt_eth_pool_usd=float(row.get("debt_eth_pool_usd", 0.0))
+                    if row.get("debt_eth_pool_usd") is not None
+                    else None,
+                    debt_eth_pool_eth=float(row.get("debt_eth_pool_eth", 0.0))
+                    if row.get("debt_eth_pool_eth") is not None
+                    else None,
+                    debt_other_usd=float(row.get("debt_other_usd", 0.0))
+                    if row.get("debt_other_usd") is not None
                     else None,
                 )
             except (TypeError, ValueError):
@@ -258,6 +276,50 @@ class Dashboard:
                 right=float(y_sorted[-1]),
             )
         return out
+
+    @staticmethod
+    def _require_finite_matrix(
+        arr: np.ndarray,
+        *,
+        name: str,
+        shape: tuple[int, int],
+    ) -> np.ndarray:
+        out = np.asarray(arr, dtype=float)
+        if out.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {out.shape}")
+        if not np.all(np.isfinite(out)):
+            raise ValueError(f"{name} contains NaN/inf values")
+        return out
+
+    @staticmethod
+    def _zero_cascade_diag_arrays(n_paths: int, n_cols: int) -> dict[str, np.ndarray]:
+        zeros_f = np.zeros((n_paths, n_cols), dtype=float)
+        zeros_i = np.zeros((n_paths, n_cols), dtype=int)
+        return {
+            "liquidation_counts": zeros_i.copy(),
+            "debt_at_risk_eth": zeros_f.copy(),
+            "debt_liquidated_eth": zeros_f.copy(),
+            "collateral_seized_eth": zeros_f.copy(),
+            "weth_supply_reduction": zeros_f.copy(),
+            "weth_borrow_reduction": zeros_f.copy(),
+            "repaid_usdc_usd": zeros_f.copy(),
+            "repaid_usdt_usd": zeros_f.copy(),
+            "v_stables_usd": zeros_f.copy(),
+            "v_weth": zeros_f.copy(),
+            "cost_bps": zeros_f.copy(),
+            "realized_execution_haircut": zeros_f.copy(),
+            "cumulative_price_impact_pct": zeros_f.copy(),
+            "bad_debt_usd": zeros_f.copy(),
+            "bad_debt_eth": zeros_f.copy(),
+            "bad_debt_usdc_usd": zeros_f.copy(),
+            "bad_debt_usdt_usd": zeros_f.copy(),
+            "bad_debt_eth_pool_usd": zeros_f.copy(),
+            "bad_debt_other_usd": zeros_f.copy(),
+            "borrow_rate_after_liquidation": zeros_f.copy(),
+            "borrow_rate_delta": zeros_f.copy(),
+            "utilization": zeros_f.copy(),
+            "utilization_shock": zeros_f.copy(),
+        }
 
     @staticmethod
     def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
@@ -371,6 +433,180 @@ class Dashboard:
             out[:, t] = np.std(arr[:, start:t + 1], axis=1) * np.sqrt(365.0)
         return out
 
+    @staticmethod
+    def _extract_weth_execution_params(raw_params: dict | object) -> dict[str, Any]:
+        keys = (
+            "adv_weth",
+            "k_bps",
+            "min_bps",
+            "max_bps",
+            "k_vol",
+            "kyle_k",
+            "sigma_lookback_days",
+            "sigma_base_annualized",
+        )
+        if isinstance(raw_params, dict):
+            return {k: raw_params.get(k) for k in keys}
+        return {k: getattr(raw_params, k, None) for k in keys}
+
+    def _resolve_execution_param(
+        self,
+        key: str,
+        *,
+        nested_params: dict[str, Any],
+        default_value: float,
+    ) -> tuple[float, str]:
+        # Precedence is explicit and stable for all execution knobs:
+        # flat params > nested weth_execution > hard defaults.
+        flat_value = self.params.get(key)
+        if flat_value is not None:
+            return float(flat_value), "flat_param"
+        nested_value = nested_params.get(key)
+        if nested_value is not None:
+            return float(nested_value), "nested_weth_execution"
+        return float(default_value), "default"
+
+    @staticmethod
+    def _is_valid_positive_float(value: float | None) -> bool:
+        if value is None:
+            return False
+        value_f = float(value)
+        return bool(np.isfinite(value_f) and value_f > 0.0)
+
+    @staticmethod
+    def _build_annualized_sigma_paths(
+        eth_paths: np.ndarray,
+        *,
+        dt: float,
+        lookback_days: int,
+        sigma_base_annualized: float,
+    ) -> np.ndarray:
+        paths = np.asarray(eth_paths, dtype=float)
+        if paths.ndim != 2:
+            raise ValueError("eth_paths must be 2D")
+        if not np.all(np.isfinite(paths)):
+            raise ValueError("eth_paths contains NaN/inf values")
+        if np.any(paths <= 0.0):
+            raise ValueError("eth_paths must be strictly positive for log-return sigma paths")
+
+        n_paths, n_cols = paths.shape
+        sigma_base = max(float(sigma_base_annualized), np.finfo(float).eps)
+        sigma_paths = np.full((n_paths, n_cols), sigma_base, dtype=float)
+        if n_cols <= 1:
+            return sigma_paths
+
+        returns = np.diff(np.log(paths), axis=1)
+        step_days = max(float(dt) * 365.0, np.finfo(float).eps)
+        lookback_steps = max(int(round(float(lookback_days) / step_days)), 1)
+        annualizer = np.sqrt(1.0 / max(float(dt), np.finfo(float).eps))
+
+        for col in range(1, n_cols):
+            ret_count = col
+            if ret_count < lookback_steps:
+                continue
+            start = ret_count - lookback_steps
+            sigma_col = np.std(returns[:, start:ret_count], axis=1) * annualizer
+            sigma_col = np.where(np.isfinite(sigma_col), np.maximum(sigma_col, 0.0), sigma_base)
+            sigma_paths[:, col] = sigma_col
+
+        return sigma_paths
+
+    def _simulate_steth_ratio_paths(
+        self,
+        eth_paths: np.ndarray,
+        *,
+        dt: float,
+        rng: np.random.Generator,
+        liquidation_volume_weth_paths: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        """
+        Simulate stETH/ETH ratio via OU depeg dynamics correlated to ETH returns.
+
+        d_t = 1 - R_t
+        d_{t+1} = clip(
+            d_t + kappa*(d_bar - d_t)*dt + sigma*sqrt(dt)*z_t + alpha*liq_flow_t*dt,
+            0,
+            d_max,
+        )
+        """
+        paths = np.asarray(eth_paths, dtype=float)
+        if paths.ndim != 2:
+            raise ValueError("eth_paths must be a 2D array")
+
+        n_paths, n_cols = paths.shape
+        n_steps = n_cols - 1
+        eps = np.finfo(float).eps
+
+        if n_steps <= 0:
+            init_ratio = float(np.clip(self.market.steth_eth_price, 0.5, 1.05))
+            ratio = np.full((n_paths, n_cols), init_ratio, dtype=float)
+            return ratio, {
+                "corr_target_eth_return_vs_depeg_change": float(self.steth_depeg_corr_eth_return),
+                "corr_realized_eth_return_vs_depeg_change": 0.0,
+                "initial_depeg": float(1.0 - init_ratio),
+            }
+
+        eth_ret = np.diff(np.log(np.maximum(paths, eps)), axis=1)
+        ret_std = float(np.std(eth_ret))
+        if ret_std > eps:
+            z_eth = (eth_ret - float(np.mean(eth_ret))) / ret_std
+        else:
+            z_eth = np.zeros_like(eth_ret)
+
+        corr = float(np.clip(self.steth_depeg_corr_eth_return, -0.99, 0.99))
+        residual_scale = np.sqrt(max(1.0 - corr * corr, 0.0))
+        z_ind = rng.standard_normal((n_paths, n_steps))
+        z_depeg = corr * z_eth + residual_scale * z_ind
+
+        if liquidation_volume_weth_paths is None:
+            liq_flow = np.zeros((n_paths, n_steps), dtype=float)
+        else:
+            liq_flow_raw = np.asarray(liquidation_volume_weth_paths, dtype=float)
+            if liq_flow_raw.shape[0] != n_paths:
+                raise ValueError("liquidation_volume_weth_paths must match eth_paths rows")
+            if liq_flow_raw.shape[1] == n_cols:
+                liq_flow_raw = liq_flow_raw[:, :-1]
+            if liq_flow_raw.shape != (n_paths, n_steps):
+                raise ValueError(
+                    "liquidation_volume_weth_paths must have shape "
+                    f"({n_paths}, {n_steps}) or ({n_paths}, {n_cols})"
+                )
+            liq_flow = np.maximum(liq_flow_raw, 0.0)
+
+        liq_flow_norm = np.clip(
+            liq_flow / max(float(self.adv_weth), eps),
+            0.0,
+            5.0,
+        )
+
+        depeg = np.zeros((n_paths, n_cols), dtype=float)
+        init_depeg = float(np.clip(1.0 - float(self.market.steth_eth_price), 0.0, self.steth_depeg_max))
+        depeg[:, 0] = init_depeg
+        drift_target = float(np.clip(self.steth_depeg_long_run, 0.0, self.steth_depeg_max))
+        kappa = max(float(self.steth_depeg_kappa), 0.0)
+        sigma = max(float(self.steth_depeg_sigma), 0.0)
+        liq_alpha = max(float(self.steth_depeg_liquidation_alpha), 0.0)
+
+        for step in range(n_steps):
+            depeg[:, step + 1] = np.clip(
+                depeg[:, step]
+                + kappa * (drift_target - depeg[:, step]) * dt
+                + sigma * np.sqrt(max(dt, eps)) * z_depeg[:, step]
+                + liq_alpha * liq_flow_norm[:, step] * dt,
+                0.0,
+                self.steth_depeg_max,
+            )
+
+        ratio = np.clip(1.0 - depeg, 1.0 - self.steth_depeg_max, 1.05)
+        depeg_changes = np.diff(depeg, axis=1)
+        realized_corr = self._safe_corr(eth_ret.ravel(), depeg_changes.ravel())
+
+        return ratio, {
+            "corr_target_eth_return_vs_depeg_change": corr,
+            "corr_realized_eth_return_vs_depeg_change": float(realized_corr),
+            "initial_depeg": float(init_depeg),
+        }
+
     def _estimate_spread_correlation(self) -> dict[str, Any]:
         fallback_ret = float(
             np.clip(
@@ -458,24 +694,34 @@ class Dashboard:
         exchange_rate_paths: np.ndarray,
         dt: float,
         rng: np.random.Generator,
+        exogenous_shock_paths: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         n_paths, n_cols = borrow_rate_paths.shape
         n_steps = n_cols - 1
         eps = np.finfo(float).eps
 
+        staking_apy = float(self.wsteth.staking_apy)
+        steth_supply_apy = float(self.wsteth.steth_supply_apy)
         yield_component_paths = np.full(
             (n_paths, n_cols),
-            float(self.wsteth.staking_apy + self.wsteth.steth_supply_apy),
+            staking_apy + steth_supply_apy,
             dtype=float,
         )
-        if n_steps > 0:
+        if self.spread_params.use_realized_exchange_yield and n_steps > 0:
             exchange_growth = np.diff(exchange_rate_paths, axis=1) / np.maximum(
                 exchange_rate_paths[:, :-1],
                 eps,
             )
+            realized_staking_apy = exchange_growth / max(dt, eps)
+            realized_cap = max(float(self.spread_params.realized_yield_abs_cap_annual), 0.0)
+            if realized_cap > 0.0:
+                realized_staking_apy = np.clip(
+                    realized_staking_apy,
+                    -realized_cap,
+                    realized_cap,
+                )
             yield_component_paths[:, 1:] = (
-                exchange_growth / max(dt, eps)
-                + float(self.wsteth.steth_supply_apy)
+                realized_staking_apy + steth_supply_apy
             )
 
         base_spread_paths = yield_component_paths - borrow_rate_paths
@@ -510,6 +756,14 @@ class Dashboard:
 
         shock_sigma = max(float(self.spread_params.shock_vol_annual), 0.0)
         spread_shocks = shock_sigma * np.sqrt(max(dt, eps)) * innovations
+        if exogenous_shock_paths is not None:
+            exo = np.asarray(exogenous_shock_paths, dtype=float)
+            if exo.shape != (n_paths, n_steps):
+                raise ValueError(
+                    "exogenous_shock_paths must have shape "
+                    f"({n_paths}, {n_steps}), got {exo.shape}"
+                )
+            spread_shocks = spread_shocks + exo
         kappa = max(float(self.spread_params.mean_reversion_speed), 0.0)
 
         spread_paths = np.zeros_like(base_spread_paths)
@@ -580,22 +834,160 @@ class Dashboard:
         )
         self.account_replay_max_paths = int(self.params.get("account_replay_max_paths", 512))
         self.account_replay_max_accounts = int(self.params.get("account_replay_max_accounts", 5000))
-
-        if isinstance(exec_params, dict):
-            adv_default = float(exec_params.get("adv_weth", WETH_EXECUTION.adv_weth))
-            k_default = float(exec_params.get("k_bps", WETH_EXECUTION.k_bps))
-            min_default = float(exec_params.get("min_bps", WETH_EXECUTION.min_bps))
-            max_default = float(exec_params.get("max_bps", WETH_EXECUTION.max_bps))
+        abm_payload = self.params.get("abm", ABM)
+        if isinstance(abm_payload, dict):
+            abm_enabled_default = bool(abm_payload.get("enabled", ABM.enabled))
+            abm_mode_default = str(abm_payload.get("mode", ABM.mode))
+            abm_max_paths_default = int(abm_payload.get("max_paths", ABM.max_paths))
+            abm_max_accounts_default = int(
+                abm_payload.get("max_accounts", ABM.max_accounts)
+            )
+            abm_projection_default = str(
+                abm_payload.get("projection_method", ABM.projection_method)
+            )
+            abm_liq_comp_default = float(
+                abm_payload.get("liquidator_competition", ABM.liquidator_competition)
+            )
+            abm_arb_enabled_default = bool(abm_payload.get("arb_enabled", ABM.arb_enabled))
+            abm_lp_strength_default = float(
+                abm_payload.get("lp_response_strength", ABM.lp_response_strength)
+            )
+            abm_seed_offset_default = int(
+                abm_payload.get("random_seed_offset", ABM.random_seed_offset)
+            )
         else:
-            adv_default = float(getattr(exec_params, "adv_weth", WETH_EXECUTION.adv_weth))
-            k_default = float(getattr(exec_params, "k_bps", WETH_EXECUTION.k_bps))
-            min_default = float(getattr(exec_params, "min_bps", WETH_EXECUTION.min_bps))
-            max_default = float(getattr(exec_params, "max_bps", WETH_EXECUTION.max_bps))
+            abm_enabled_default = bool(getattr(abm_payload, "enabled", ABM.enabled))
+            abm_mode_default = str(getattr(abm_payload, "mode", ABM.mode))
+            abm_max_paths_default = int(getattr(abm_payload, "max_paths", ABM.max_paths))
+            abm_max_accounts_default = int(
+                getattr(abm_payload, "max_accounts", ABM.max_accounts)
+            )
+            abm_projection_default = str(
+                getattr(abm_payload, "projection_method", ABM.projection_method)
+            )
+            abm_liq_comp_default = float(
+                getattr(
+                    abm_payload,
+                    "liquidator_competition",
+                    ABM.liquidator_competition,
+                )
+            )
+            abm_arb_enabled_default = bool(getattr(abm_payload, "arb_enabled", ABM.arb_enabled))
+            abm_lp_strength_default = float(
+                getattr(abm_payload, "lp_response_strength", ABM.lp_response_strength)
+            )
+            abm_seed_offset_default = int(
+                getattr(abm_payload, "random_seed_offset", ABM.random_seed_offset)
+            )
 
-        self.adv_weth = float(self.params.get("adv_weth", adv_default))
-        self.k_bps = float(self.params.get("k_bps", k_default))
-        self.min_bps = float(self.params.get("min_bps", min_default))
-        self.max_bps = float(self.params.get("max_bps", max_default))
+        abm_enabled = self.params.get("abm_enabled")
+        if abm_enabled is None:
+            abm_enabled = abm_enabled_default
+        abm_mode = str(self.params.get("abm_mode", abm_mode_default)).lower()
+        if abm_mode not in {"off", "surrogate", "full"}:
+            abm_mode = "off"
+        if bool(abm_enabled) and abm_mode == "off":
+            abm_mode = "surrogate"
+        if not bool(abm_enabled):
+            abm_mode = "off"
+
+        self.abm_config = ABMConfig(
+            enabled=bool(abm_enabled),
+            mode=abm_mode,
+            max_paths=max(int(self.params.get("abm_max_paths", abm_max_paths_default)), 1),
+            max_accounts=max(
+                int(self.params.get("abm_max_accounts", abm_max_accounts_default)),
+                1,
+            ),
+            projection_method=str(
+                self.params.get("abm_projection_method", abm_projection_default)
+            ),
+            liquidator_competition=float(
+                np.clip(
+                    self.params.get(
+                        "abm_liquidator_competition",
+                        abm_liq_comp_default,
+                    ),
+                    0.0,
+                    1.0,
+                )
+            ),
+            arb_enabled=bool(self.params.get("abm_arb_enabled", abm_arb_enabled_default)),
+            lp_response_strength=float(
+                np.clip(
+                    self.params.get("abm_lp_response_strength", abm_lp_strength_default),
+                    0.0,
+                    2.0,
+                )
+            ),
+            random_seed_offset=int(
+                self.params.get("abm_random_seed_offset", abm_seed_offset_default)
+            ),
+        )
+
+        nested_exec_params = self._extract_weth_execution_params(exec_params)
+        self.adv_weth, self.adv_weth_source = self._resolve_execution_param(
+            "adv_weth",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.adv_weth),
+        )
+        self.k_bps, self.k_bps_source = self._resolve_execution_param(
+            "k_bps",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.k_bps),
+        )
+        self.min_bps, self.min_bps_source = self._resolve_execution_param(
+            "min_bps",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.min_bps),
+        )
+        self.max_bps, self.max_bps_source = self._resolve_execution_param(
+            "max_bps",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.max_bps),
+        )
+        self.k_vol_configured, self.k_vol_configured_source = self._resolve_execution_param(
+            "k_vol",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.k_vol),
+        )
+        self.k_vol = max(self.k_vol_configured, 0.0)
+        self.k_vol_resolution_reason = (
+            "clamped_to_zero_from_negative_input"
+            if self.k_vol_configured < 0.0
+            else "configured_non_negative"
+        )
+        self.kyle_k_configured, self.kyle_k_configured_source = self._resolve_execution_param(
+            "kyle_k",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.kyle_k),
+        )
+        self.kyle_k = max(self.kyle_k_configured, 0.0)
+        self.kyle_k_resolution_reason = (
+            "clamped_to_zero_from_negative_input"
+            if self.kyle_k_configured < 0.0
+            else "configured_non_negative"
+        )
+        sigma_lookback_raw, self.sigma_lookback_days_source = self._resolve_execution_param(
+            "sigma_lookback_days",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.sigma_lookback_days),
+        )
+        self.sigma_lookback_days_configured = int(round(sigma_lookback_raw))
+        self.sigma_lookback_days = max(self.sigma_lookback_days_configured, 1)
+        self.sigma_lookback_resolution_reason = (
+            "clamped_to_minimum_one_day"
+            if self.sigma_lookback_days_configured < 1
+            else "configured_positive"
+        )
+        (
+            self.sigma_base_annualized_configured,
+            self.sigma_base_annualized_configured_source,
+        ) = self._resolve_execution_param(
+            "sigma_base_annualized",
+            nested_params=nested_exec_params,
+            default_value=float(WETH_EXECUTION.sigma_base_annualized),
+        )
 
         if isinstance(spread_params, dict):
             shock_vol_default = float(
@@ -617,6 +1009,18 @@ class Dashboard:
                 spread_params.get(
                     "corr_eth_vol_default",
                     SPREAD_MODEL.corr_eth_vol_default,
+                )
+            )
+            realized_yield_mode_default = bool(
+                spread_params.get(
+                    "use_realized_exchange_yield",
+                    SPREAD_MODEL.use_realized_exchange_yield,
+                )
+            )
+            realized_yield_cap_default = float(
+                spread_params.get(
+                    "realized_yield_abs_cap_annual",
+                    SPREAD_MODEL.realized_yield_abs_cap_annual,
                 )
             )
         else:
@@ -644,6 +1048,20 @@ class Dashboard:
                     SPREAD_MODEL.corr_eth_vol_default,
                 )
             )
+            realized_yield_mode_default = bool(
+                getattr(
+                    spread_params,
+                    "use_realized_exchange_yield",
+                    SPREAD_MODEL.use_realized_exchange_yield,
+                )
+            )
+            realized_yield_cap_default = float(
+                getattr(
+                    spread_params,
+                    "realized_yield_abs_cap_annual",
+                    SPREAD_MODEL.realized_yield_abs_cap_annual,
+                )
+            )
 
         self.spread_params = SpreadModelParams(
             shock_vol_annual=float(self.params.get("spread_shock_vol_annual", shock_vol_default)),
@@ -656,6 +1074,53 @@ class Dashboard:
             corr_eth_vol_default=float(
                 self.params.get("spread_corr_eth_vol_default", corr_vol_default)
             ),
+            use_realized_exchange_yield=bool(
+                self.params.get(
+                    "spread_use_realized_exchange_yield",
+                    realized_yield_mode_default,
+                )
+            ),
+            realized_yield_abs_cap_annual=float(
+                np.clip(
+                    self.params.get(
+                        "spread_realized_yield_abs_cap_annual",
+                        realized_yield_cap_default,
+                    ),
+                    0.0,
+                    10.0,
+                )
+            ),
+        )
+        self.steth_depeg_kappa = float(
+            np.clip(self.params.get("steth_depeg_kappa", 7.5), 0.0, 100.0)
+        )
+        self.steth_depeg_long_run = float(
+            np.clip(self.params.get("steth_depeg_long_run", 0.0025), 0.0, 0.5)
+        )
+        self.steth_depeg_sigma = float(
+            np.clip(self.params.get("steth_depeg_sigma", 0.05), 0.0, 2.0)
+        )
+        self.steth_depeg_max = float(
+            np.clip(self.params.get("steth_depeg_max", 0.35), 0.01, 0.95)
+        )
+        self.steth_depeg_corr_eth_return = float(
+            np.clip(self.params.get("steth_depeg_corr_eth_return", -0.45), -0.99, 0.99)
+        )
+        self.steth_depeg_liquidation_alpha = float(
+            np.clip(self.params.get("steth_depeg_liquidation_alpha", 0.25), 0.0, 10.0)
+        )
+        self.spread_depeg_sensitivity = float(
+            np.clip(self.params.get("spread_depeg_sensitivity", 0.75), 0.0, 10.0)
+        )
+        self.spread_liquidation_flow_sensitivity = float(
+            np.clip(
+                self.params.get("spread_liquidation_flow_sensitivity", 0.40),
+                0.0,
+                10.0,
+            )
+        )
+        self.spread_feedback_to_utilization = float(
+            np.clip(self.params.get("spread_feedback_to_utilization", 0.15), 0.0, 5.0)
         )
 
         cascade_ltv_value = self.params.get("cascade_avg_ltv")
@@ -713,18 +1178,9 @@ class Dashboard:
             raw_weth_total_borrows,
         )
         self.rate_model = InterestRateModel(self.weth_rates)
-        self.weth_execution_cost_model = QuadraticCEXCostModel(
-            adv_weth=max(self.adv_weth, np.finfo(float).eps),
-            k_bps=max(self.k_bps, 0.0),
-            min_bps=max(self.min_bps, 0.0),
-            max_bps=max(self.max_bps, 0.0),
-        )
         self.cascade_model = LiquidationCascade(
             rate_model=self.rate_model,
             liq_engine=LiquidationEngine(self.emode, self.wsteth, price_mode="market"),
-        )
-        self.account_cascade_model = AccountLiquidationReplayEngine(
-            execution_cost_model=self.weth_execution_cost_model
         )
 
         # Prefer price history from params unless explicitly provided
@@ -752,6 +1208,68 @@ class Dashboard:
             self.calibrated_sigma = self.vol_params.baseline_annual_vol
             print(f"  [VOL] No price history available — using fallback sigma="
                   f"{self.calibrated_sigma:.2f}")
+
+        configured_sigma_base_valid = self._is_valid_positive_float(
+            self.sigma_base_annualized_configured
+        )
+        calibrated_sigma_valid = self._is_valid_positive_float(self.calibrated_sigma)
+        baseline_sigma_default = max(
+            float(self.vol_params.baseline_annual_vol),
+            np.finfo(float).eps,
+        )
+        if configured_sigma_base_valid:
+            self.sigma_base_annualized = float(self.sigma_base_annualized_configured)
+            self.sigma_base_resolution_source = self.sigma_base_annualized_configured_source
+            self.sigma_base_resolution_reason = "configured_positive_value_used"
+        elif calibrated_sigma_valid:
+            self.sigma_base_annualized = float(self.calibrated_sigma)
+            self.sigma_base_resolution_source = "calibrated_sigma"
+            if float(self.sigma_base_annualized_configured) <= 0.0:
+                self.sigma_base_resolution_reason = (
+                    "configured_sigma_base_non_positive_fell_back_to_calibrated_sigma"
+                )
+            else:
+                self.sigma_base_resolution_reason = (
+                    "configured_sigma_base_non_finite_fell_back_to_calibrated_sigma"
+                )
+        else:
+            self.sigma_base_annualized = baseline_sigma_default
+            self.sigma_base_resolution_source = "volatility_baseline_default"
+            self.sigma_base_resolution_reason = (
+                "configured_sigma_base_invalid_and_calibrated_sigma_invalid"
+            )
+
+        calibrated_sigma_for_impact = float(self.calibrated_sigma)
+        if np.isfinite(calibrated_sigma_for_impact) and calibrated_sigma_for_impact > 0.0:
+            self.sigma_daily_for_impact = calibrated_sigma_for_impact / np.sqrt(365.0)
+            self.lambda_impact_resolution_reason = "derived_from_calibrated_sigma"
+        else:
+            self.sigma_daily_for_impact = 0.0
+            self.lambda_impact_resolution_reason = "calibrated_sigma_invalid_or_non_positive"
+        self.lambda_impact = self.kyle_k * self.sigma_daily_for_impact
+
+        self.weth_execution_cost_model = QuadraticCEXCostModel(
+            adv_weth=max(self.adv_weth, np.finfo(float).eps),
+            k_bps=max(self.k_bps, 0.0),
+            min_bps=max(self.min_bps, 0.0),
+            max_bps=max(self.max_bps, 0.0),
+            k_vol=max(self.k_vol, 0.0),
+            sigma_base_annualized=max(
+                float(self.sigma_base_annualized),
+                np.finfo(float).eps,
+            ),
+        )
+        self.account_cascade_model = AccountLiquidationReplayEngine(
+            execution_cost_model=self.weth_execution_cost_model
+        )
+        self.abm_engine = ABMEngine(
+            config=self.abm_config,
+            close_factor_threshold=0.95,
+            close_factor_normal=self.emode.close_factor_normal,
+            close_factor_full=self.emode.close_factor_full,
+            liquidation_bonus=self.emode.liquidation_bonus,
+            execution_cost_model=self.weth_execution_cost_model,
+        )
 
         self.gbm = GBMSimulator(mu=0.0, sigma=self.calibrated_sigma,
                                 config=self.config)
@@ -936,11 +1454,24 @@ class Dashboard:
             eth_paths * max(float(self.market.eth_usd_price), np.finfo(float).eps),
             np.finfo(float).eps,
         )
+        steth_without_liq_paths, steth_corr_meta = self._simulate_steth_ratio_paths(
+            eth_paths=eth_paths,
+            dt=dt,
+            rng=np.random.default_rng(rng.integers(0, 2**31)),
+            liquidation_volume_weth_paths=np.zeros((n_paths, n_steps), dtype=float),
+        )
+        sigma_annualized_paths = self._build_annualized_sigma_paths(
+            eth_paths=eth_paths,
+            dt=dt,
+            lookback_days=self.sigma_lookback_days,
+            sigma_base_annualized=self.sigma_base_annualized,
+        )
 
         # === Phase 2: Liquidation cascade effects ===
         # ETH drop → liquidations of ETH-collateral/stablecoin-borrow positions
         # → WETH supply reduction → utilization increase
         cascade_source = "aggregate_proxy"
+        cascade_delegate_source = "aggregate_proxy"
         cascade_fallback_reason = None
         cascade_account_count = 0
         replay_projection = "none"
@@ -952,10 +1483,198 @@ class Dashboard:
             "debt_coverage": 1.0,
             "collateral_coverage": 1.0,
         }
-        replay_diagnostics_summary = None
-        replay_diag = None
-        replay_diag_projected: dict[str, np.ndarray] = {}
-        if self.use_account_level_cascade and self.account_cascade_cohort:
+        replay_diagnostics_summary: dict[str, Any] = {
+            "paths_processed": 0,
+            "accounts_processed": 0,
+            "max_iterations_hit_count": 0,
+            "cumulative_price_impact_pct_terminal": {
+                "mean": 0.0,
+                "p50": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0,
+            },
+            "warnings": [],
+        }
+        abm_diagnostics_summary: dict[str, Any] | None = None
+        replay_diag_projected: dict[str, np.ndarray] = self._zero_cascade_diag_arrays(
+            n_paths,
+            n_cols,
+        )
+        protocol_liq_counts_raw = np.zeros(0, dtype=float)
+        cascade_util_adj: np.ndarray | None = None
+        cascade_step_shocks_override: np.ndarray | None = None
+
+        if self.abm_config.enabled and self.abm_config.mode != "off":
+            if not self.account_cascade_cohort:
+                cascade_source = "abm_fallback"
+                cascade_fallback_reason = (
+                    self.cascade_fallback_reason
+                    or "ABM requires account-level cascade cohort inputs"
+                )
+            else:
+                try:
+                    abm_accounts, replay_account_coverage = self._trim_accounts_by_debt(
+                        self.account_cascade_cohort,
+                        self.abm_config.max_accounts,
+                    )
+                    cascade_account_count = len(abm_accounts)
+                    if not abm_accounts:
+                        cascade_source = "abm_fallback"
+                        cascade_fallback_reason = "ABM account cohort empty after max_accounts trim"
+                    else:
+                        if self.abm_config.mode == "surrogate":
+                            replay_path_idx = self._select_replay_path_indices(
+                                eth_paths,
+                                self.abm_config.max_paths,
+                            )
+                        else:
+                            replay_path_idx = np.arange(n_paths, dtype=int)
+
+                        replay_eth_paths = eth_paths[replay_path_idx]
+                        replay_eth_usd_paths = eth_usd_paths[replay_path_idx]
+                        replay_sigma_paths = sigma_annualized_paths[replay_path_idx]
+                        replay_path_count = int(replay_eth_paths.shape[0])
+
+                        abm_output_sample = self.abm_engine.run(
+                            eth_price_paths=replay_eth_paths,
+                            eth_usd_price_paths=replay_eth_usd_paths,
+                            sigma_annualized_paths=replay_sigma_paths,
+                            sigma_base_annualized=self.sigma_base_annualized,
+                            accounts=abm_accounts,
+                            base_deposits=self.weth_total_supply,
+                            base_borrows=self.weth_total_borrows,
+                        )
+
+                        if (
+                            self.abm_config.mode == "surrogate"
+                            and replay_path_count < n_paths
+                        ):
+                            abm_output = project_abm_output(
+                                full_eth_paths=eth_paths,
+                                sample_eth_paths=replay_eth_paths,
+                                sample_output=abm_output_sample,
+                                method=self.abm_config.projection_method,
+                            )
+                            replay_projection = self.abm_config.projection_method
+                            cascade_source = "abm_surrogate"
+                            cascade_delegate_source = "abm_surrogate"
+                        else:
+                            abm_output = abm_output_sample
+                            replay_projection = "none"
+                            cascade_source = "abm_full"
+                            cascade_delegate_source = "abm_full"
+
+                        expected_shape = (n_paths, n_cols)
+                        cascade_util_adj = self._require_finite_matrix(
+                            abm_output.utilization_adjustment,
+                            name="abm_utilization_adjustment",
+                            shape=expected_shape,
+                        )
+                        util_shock_full = self._require_finite_matrix(
+                            abm_output.utilization_shock,
+                            name="abm_utilization_shock",
+                            shape=expected_shape,
+                        )
+                        cascade_step_shocks_override = util_shock_full[:, 1:]
+
+                        base_util = self.weth_total_borrows / max(
+                            self.weth_total_supply,
+                            np.finfo(float).eps,
+                        )
+                        replay_diag_projected = {
+                            "liquidation_counts": np.rint(
+                                np.asarray(
+                                    abm_output.diagnostics.liquidator_actions,
+                                    dtype=float,
+                                )
+                            ).astype(int)
+                            if abm_output.diagnostics.liquidator_actions is not None
+                            else np.zeros((n_paths, n_cols), dtype=int),
+                            "debt_at_risk_eth": np.zeros((n_paths, n_cols), dtype=float),
+                            "debt_liquidated_eth": np.asarray(
+                                abm_output.liquidation_volume_weth,
+                                dtype=float,
+                            ),
+                            "collateral_seized_eth": np.asarray(
+                                abm_output.weth_supply_reduction,
+                                dtype=float,
+                            ),
+                            "weth_supply_reduction": np.asarray(
+                                abm_output.weth_supply_reduction,
+                                dtype=float,
+                            ),
+                            "weth_borrow_reduction": np.asarray(
+                                abm_output.weth_borrow_reduction,
+                                dtype=float,
+                            ),
+                            "repaid_usdc_usd": np.zeros((n_paths, n_cols), dtype=float),
+                            "repaid_usdt_usd": np.zeros((n_paths, n_cols), dtype=float),
+                            "v_stables_usd": np.asarray(
+                                abm_output.liquidation_volume_usd,
+                                dtype=float,
+                            ),
+                            "v_weth": np.asarray(
+                                abm_output.liquidation_volume_weth,
+                                dtype=float,
+                            ),
+                            "cost_bps": np.asarray(
+                                abm_output.execution_cost_bps,
+                                dtype=float,
+                            ),
+                            "realized_execution_haircut": np.clip(
+                                np.asarray(abm_output.execution_cost_bps, dtype=float) / 10_000.0,
+                                0.0,
+                                1.0,
+                            ),
+                            "cumulative_price_impact_pct": np.zeros((n_paths, n_cols), dtype=float),
+                            "bad_debt_usd": np.asarray(
+                                abm_output.bad_debt_usd,
+                                dtype=float,
+                            ),
+                            "bad_debt_eth": np.asarray(
+                                abm_output.bad_debt_eth,
+                                dtype=float,
+                            ),
+                            "bad_debt_usdc_usd": np.zeros((n_paths, n_cols), dtype=float),
+                            "bad_debt_usdt_usd": np.zeros((n_paths, n_cols), dtype=float),
+                            "bad_debt_eth_pool_usd": np.zeros((n_paths, n_cols), dtype=float),
+                            "bad_debt_other_usd": np.zeros((n_paths, n_cols), dtype=float),
+                            "borrow_rate_after_liquidation": np.zeros((n_paths, n_cols), dtype=float),
+                            "borrow_rate_delta": np.zeros((n_paths, n_cols), dtype=float),
+                            "utilization": np.clip(
+                                base_util + np.asarray(abm_output.utilization_adjustment, dtype=float),
+                                0.0,
+                                0.99,
+                            ),
+                            "utilization_shock": np.asarray(
+                                abm_output.utilization_shock,
+                                dtype=float,
+                            ),
+                        }
+                        replay_diagnostics_summary = ABMEngine.diagnostics_summary(
+                            abm_output.diagnostics
+                        )
+                        if abm_output.diagnostics.liquidator_actions is not None:
+                            protocol_liq_counts_raw = np.sum(
+                                np.asarray(abm_output.diagnostics.liquidator_actions, dtype=float),
+                                axis=1,
+                            )
+                        abm_diagnostics_summary = {
+                            **replay_diagnostics_summary,
+                            "mode": cascade_source,
+                        }
+                except Exception as exc:
+                    cascade_source = "abm_fallback"
+                    cascade_fallback_reason = f"ABM failure: {exc}"
+                    abm_diagnostics_summary = {
+                        "paths_processed": 0,
+                        "accounts_processed": 0,
+                        "warnings": [str(exc)],
+                        "mode": "abm_fallback",
+                    }
+
+        if cascade_util_adj is None and self.use_account_level_cascade and self.account_cascade_cohort:
             replay_accounts, replay_account_coverage = self._trim_accounts_by_debt(
                 self.account_cascade_cohort,
                 self.account_replay_max_accounts,
@@ -966,6 +1685,8 @@ class Dashboard:
             )
             replay_eth_paths = eth_paths[replay_path_idx]
             replay_eth_usd_paths = eth_usd_paths[replay_path_idx]
+            replay_steth_paths = steth_without_liq_paths[replay_path_idx]
+            replay_sigma_paths = sigma_annualized_paths[replay_path_idx]
             replay_path_count = int(replay_eth_paths.shape[0])
 
             replay_result = self.account_cascade_model.simulate(
@@ -974,6 +1695,10 @@ class Dashboard:
                 base_deposits=self.weth_total_supply,
                 base_borrows=self.weth_total_borrows,
                 eth_usd_price_paths=replay_eth_usd_paths,
+                steth_eth_price_paths=replay_steth_paths,
+                sigma_annualized_paths=replay_sigma_paths,
+                sigma_base_annualized=self.sigma_base_annualized,
+                lambda_impact=self.lambda_impact,
                 execution_cost_model=self.weth_execution_cost_model,
                 protocol_market=ProtocolMarket(
                     weth_total_deposits=self.weth_total_supply,
@@ -983,6 +1708,8 @@ class Dashboard:
                 borrow_rate_fn=self.rate_model.borrow_rate,
             )
             replay_adj = replay_result.adjustment_array
+            fallback_delegate_source = "account_replay"
+            fallback_delegate_reason = None
             if replay_adj.shape == eth_paths.shape:
                 cascade_util_adj = replay_adj
                 replay_projection = "none"
@@ -1005,19 +1732,33 @@ class Dashboard:
                     avg_ltv=self.cascade_avg_ltv,
                     avg_lt=self.cascade_avg_lt,
                 )
-                cascade_source = "account_replay_fallback"
-                cascade_fallback_reason = (
+                fallback_delegate_source = "account_replay_fallback"
+                fallback_delegate_reason = (
                     "Account replay adjustment shape mismatch; "
                     f"got {replay_adj.shape}, expected {(n_paths, n_cols)} or "
                     f"({replay_eth_paths.shape[0]}, {n_cols})"
                 )
                 replay_projection = "fallback_aggregate"
 
-            if cascade_source != "account_replay_fallback":
-                cascade_source = "account_replay"
+            if cascade_source == "abm_fallback":
+                cascade_delegate_source = fallback_delegate_source
+                if fallback_delegate_reason:
+                    cascade_fallback_reason = (
+                        f"{cascade_fallback_reason}; delegate={fallback_delegate_reason}"
+                        if cascade_fallback_reason
+                        else fallback_delegate_reason
+                    )
+            else:
+                cascade_source = fallback_delegate_source
+                cascade_delegate_source = fallback_delegate_source
+                cascade_fallback_reason = fallback_delegate_reason
 
             replay_diag = replay_result.diagnostics
             replay_diag.replay_projection = replay_projection
+            protocol_liq_counts_raw = np.sum(
+                np.asarray(replay_diag.liquidation_counts, dtype=float),
+                axis=1,
+            )
 
             def _project_diag(arr: np.ndarray | None) -> np.ndarray:
                 if arr is None:
@@ -1046,18 +1787,34 @@ class Dashboard:
                 "v_weth": _project_diag(replay_diag.v_weth),
                 "cost_bps": _project_diag(replay_diag.cost_bps),
                 "realized_execution_haircut": _project_diag(replay_diag.realized_execution_haircut),
+                "cumulative_price_impact_pct": _project_diag(replay_diag.cumulative_price_impact_pct),
                 "bad_debt_usd": _project_diag(replay_diag.bad_debt_usd),
                 "bad_debt_eth": _project_diag(replay_diag.bad_debt_eth),
+                "bad_debt_usdc_usd": _project_diag(replay_diag.bad_debt_usdc_usd),
+                "bad_debt_usdt_usd": _project_diag(replay_diag.bad_debt_usdt_usd),
+                "bad_debt_eth_pool_usd": _project_diag(replay_diag.bad_debt_eth_pool_usd),
+                "bad_debt_other_usd": _project_diag(replay_diag.bad_debt_other_usd),
+                "borrow_rate_after_liquidation": _project_diag(
+                    replay_diag.borrow_rate_after_liquidation
+                ),
+                "borrow_rate_delta": _project_diag(replay_diag.borrow_rate_delta),
                 "utilization": _project_diag(replay_diag.utilization),
+                "utilization_shock": np.zeros((n_paths, n_cols), dtype=float),
             }
             replay_diagnostics_summary = {
                 "paths_processed": int(replay_diag.paths_processed),
                 "accounts_processed": int(replay_diag.accounts_processed),
                 "max_iterations_hit_count": int(replay_diag.max_iterations_hit_count),
+                "cumulative_price_impact_pct_terminal": {
+                    k: round(v, 6)
+                    for k, v in self._summary_stats(
+                        _project_diag(replay_diag.cumulative_price_impact_pct)[:, -1]
+                    ).items()
+                },
                 "warnings": list(replay_diag.warnings),
             }
             cascade_account_count = len(replay_accounts)
-        else:
+        elif cascade_util_adj is None:
             cascade_util_adj = self.cascade_model.estimate_utilization_impact(
                 eth_paths,
                 base_deposits=self.weth_total_supply,
@@ -1066,46 +1823,80 @@ class Dashboard:
                 avg_ltv=self.cascade_avg_ltv,
                 avg_lt=self.cascade_avg_lt,
             )
+            fallback_delegate_source = "aggregate_proxy"
+            fallback_delegate_reason = None
             if self.use_account_level_cascade:
-                cascade_source = "account_replay_fallback"
-                cascade_fallback_reason = (
+                fallback_delegate_source = "account_replay_fallback"
+                fallback_delegate_reason = (
                     self.cascade_fallback_reason
                     or "Account-level cascade cohort unavailable"
                 )
-        if not replay_diag_projected:
-            replay_diag_projected = {
-                "liquidation_counts": np.zeros((n_paths, n_cols), dtype=int),
-                "debt_at_risk_eth": np.zeros((n_paths, n_cols), dtype=float),
-                "debt_liquidated_eth": np.zeros((n_paths, n_cols), dtype=float),
-                "collateral_seized_eth": np.zeros((n_paths, n_cols), dtype=float),
-                "weth_supply_reduction": np.zeros((n_paths, n_cols), dtype=float),
-                "weth_borrow_reduction": np.zeros((n_paths, n_cols), dtype=float),
-                "repaid_usdc_usd": np.zeros((n_paths, n_cols), dtype=float),
-                "repaid_usdt_usd": np.zeros((n_paths, n_cols), dtype=float),
-                "v_stables_usd": np.zeros((n_paths, n_cols), dtype=float),
-                "v_weth": np.zeros((n_paths, n_cols), dtype=float),
-                "cost_bps": np.zeros((n_paths, n_cols), dtype=float),
-                "realized_execution_haircut": np.zeros((n_paths, n_cols), dtype=float),
-                "bad_debt_usd": np.zeros((n_paths, n_cols), dtype=float),
-                "bad_debt_eth": np.zeros((n_paths, n_cols), dtype=float),
-                "utilization": np.zeros((n_paths, n_cols), dtype=float),
-            }
+            if cascade_source == "abm_fallback":
+                cascade_delegate_source = fallback_delegate_source
+                if fallback_delegate_reason:
+                    cascade_fallback_reason = (
+                        f"{cascade_fallback_reason}; delegate={fallback_delegate_reason}"
+                        if cascade_fallback_reason
+                        else fallback_delegate_reason
+                    )
+            else:
+                cascade_source = fallback_delegate_source
+                cascade_delegate_source = fallback_delegate_source
+                cascade_fallback_reason = fallback_delegate_reason
 
-        # === Phase 3: Utilization paths (latent OU + cascade shocks) ===
-        util_rng = np.random.default_rng(rng.integers(0, 2**31))
-        cascade_step_shocks = np.diff(cascade_util_adj, axis=1)
-        util_paths = self.util_model.simulate(
+        if cascade_util_adj is None:
+            raise RuntimeError("Cascade utilization adjustment unresolved")
+        cascade_util_adj = self._require_finite_matrix(
+            cascade_util_adj,
+            name="cascade_util_adj",
+            shape=(n_paths, n_cols),
+        )
+
+        # === Phase 3: Utilization paths (latent OU + cascade + spread feedback) ===
+        if cascade_step_shocks_override is not None:
+            cascade_step_shocks = self._require_finite_matrix(
+                cascade_step_shocks_override,
+                name="cascade_step_shocks",
+                shape=(n_paths, n_steps),
+            )
+        else:
+            cascade_step_shocks = self._require_finite_matrix(
+                np.diff(cascade_util_adj, axis=1),
+                name="cascade_step_shocks",
+                shape=(n_paths, n_steps),
+            )
+
+        util_seed = int(rng.integers(0, 2**31))
+        util_paths_without_liq = self.util_model.simulate(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            u0=self.market.current_weth_utilization,
+            cascade_shock_paths=np.zeros((n_paths, n_steps), dtype=float),
+            rng=np.random.default_rng(util_seed),
+        )
+        util_paths_without_liq = np.clip(
+            util_paths_without_liq,
+            self.util_params.clip_min,
+            self.util_params.clip_max,
+        )
+        util_paths_pre_spread = self.util_model.simulate(
             n_paths=n_paths,
             n_steps=n_steps,
             dt=dt,
             u0=self.market.current_weth_utilization,
             cascade_shock_paths=cascade_step_shocks,
-            rng=util_rng,
+            rng=np.random.default_rng(util_seed),
         )
-        util_paths = np.clip(util_paths, self.util_params.clip_min, self.util_params.clip_max)
+        util_paths_pre_spread = np.clip(
+            util_paths_pre_spread,
+            self.util_params.clip_min,
+            self.util_params.clip_max,
+        )
 
-        # === Phase 4: Borrow rate paths + governance IR shocks ===
-        base_borrow_rate_paths = self.rate_model.borrow_rate(util_paths)
+        # === Phase 4: Borrow rate paths + governance IR shocks (pre-feedback pass) ===
+        base_borrow_rate_paths_without_liq_pre = self.rate_model.borrow_rate(util_paths_without_liq)
+        base_borrow_rate_paths_pre_spread = self.rate_model.borrow_rate(util_paths_pre_spread)
         gov_rng = np.random.default_rng(rng.integers(0, 2**31))
         (
             governance_rate_spread_paths,
@@ -1118,12 +1909,104 @@ class Dashboard:
             dt=dt,
             rng=gov_rng,
         )
-        borrow_rate_paths = np.clip(base_borrow_rate_paths + governance_rate_spread_paths, 0.0, None)
+        borrow_rate_paths_without_liq_pre = np.clip(
+            base_borrow_rate_paths_without_liq_pre + governance_rate_spread_paths,
+            0.0,
+            None,
+        )
+        borrow_rate_paths_pre_spread = np.clip(
+            base_borrow_rate_paths_pre_spread + governance_rate_spread_paths,
+            0.0,
+            None,
+        )
+
+        # Correlated stETH/ETH depeg process (no-liquidation and with-liquidation variants).
+        steth_with_liq_paths, steth_with_liq_corr_meta = self._simulate_steth_ratio_paths(
+            eth_paths=eth_paths,
+            dt=dt,
+            rng=np.random.default_rng(rng.integers(0, 2**31)),
+            liquidation_volume_weth_paths=replay_diag_projected["v_weth"],
+        )
+        steth_depeg_without_liq = np.clip(1.0 - steth_without_liq_paths, 0.0, None)
+        steth_depeg_with_liq = np.clip(1.0 - steth_with_liq_paths, 0.0, None)
+        depeg_widen_without_liq = np.maximum(np.diff(steth_depeg_without_liq, axis=1), 0.0)
+        depeg_widen_with_liq = np.maximum(np.diff(steth_depeg_with_liq, axis=1), 0.0)
+        liq_flow_norm = np.clip(
+            replay_diag_projected["v_weth"][:, :-1] / max(float(self.adv_weth), np.finfo(float).eps),
+            0.0,
+            5.0,
+        )
+
+        spread_exogenous_without_liq = -self.spread_depeg_sensitivity * depeg_widen_without_liq
+        spread_exogenous_with_liq = (
+            -self.spread_depeg_sensitivity * depeg_widen_with_liq
+            - self.spread_liquidation_flow_sensitivity * liq_flow_norm * dt
+        )
+
+        # Pre-feedback spread delta feeds back into utilization shocks.
+        spread_seed_pre = int(rng.integers(0, 2**31))
+        spread_without_liq_pre, _yield_without_liq_pre, _meta_without_liq_pre = self._simulate_spread_paths(
+            borrow_rate_paths=borrow_rate_paths_without_liq_pre,
+            eth_paths=eth_paths,
+            exchange_rate_paths=self.position._oracle_exchange_rate_paths(
+                n_paths=n_paths,
+                n_cols=n_cols,
+                dt=dt,
+            ),
+            dt=dt,
+            rng=np.random.default_rng(spread_seed_pre),
+            exogenous_shock_paths=spread_exogenous_without_liq,
+        )
+        spread_with_liq_pre, _yield_with_liq_pre, _meta_with_liq_pre = self._simulate_spread_paths(
+            borrow_rate_paths=borrow_rate_paths_pre_spread,
+            eth_paths=eth_paths,
+            exchange_rate_paths=self.position._oracle_exchange_rate_paths(
+                n_paths=n_paths,
+                n_cols=n_cols,
+                dt=dt,
+            ),
+            dt=dt,
+            rng=np.random.default_rng(spread_seed_pre),
+            exogenous_shock_paths=spread_exogenous_with_liq,
+        )
+        spread_feedback_delta = spread_with_liq_pre - spread_without_liq_pre
+        spread_feedback_shocks = np.clip(
+            -self.spread_feedback_to_utilization * spread_feedback_delta[:, 1:],
+            -0.05,
+            0.05,
+        )
+        combined_step_shocks = cascade_step_shocks + spread_feedback_shocks
+        replay_diag_projected["utilization_shock"][:, 1:] = combined_step_shocks
+
+        util_paths = self.util_model.simulate(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            u0=self.market.current_weth_utilization,
+            cascade_shock_paths=combined_step_shocks,
+            rng=np.random.default_rng(util_seed),
+        )
+        util_paths = np.clip(util_paths, self.util_params.clip_min, self.util_params.clip_max)
+
+        base_borrow_rate_paths_no_liq = self.rate_model.borrow_rate(util_paths_without_liq)
+        base_borrow_rate_paths = self.rate_model.borrow_rate(util_paths)
+        borrow_rate_paths_without_liq = np.clip(
+            base_borrow_rate_paths_no_liq + governance_rate_spread_paths,
+            0.0,
+            None,
+        )
+        borrow_rate_paths = np.clip(
+            base_borrow_rate_paths + governance_rate_spread_paths,
+            0.0,
+            None,
+        )
+        borrow_rate_liq_delta = borrow_rate_paths - borrow_rate_paths_without_liq
+
         utilization_analytics = self._summarize_utilization_dynamics(
             util_paths=util_paths,
             eth_paths=eth_paths,
             borrow_rate_paths=borrow_rate_paths,
-            cascade_step_shocks=cascade_step_shocks,
+            cascade_step_shocks=combined_step_shocks,
         )
 
         # Market depeg paths drive MTM P&L only (not HF/liquidation trigger logic).
@@ -1152,15 +2035,29 @@ class Dashboard:
         )
 
         # === Phase 5b: Spread dynamics (yield component - borrow rate) ===
-        spread_rng = np.random.default_rng(rng.integers(0, 2**31))
+        spread_seed = int(rng.integers(0, 2**31))
+        spread_paths_without_liq, yield_component_paths_without_liq, spread_corr_meta_without = (
+            self._simulate_spread_paths(
+                borrow_rate_paths=borrow_rate_paths_without_liq,
+                eth_paths=eth_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                dt=dt,
+                rng=np.random.default_rng(spread_seed),
+                exogenous_shock_paths=spread_exogenous_without_liq,
+            )
+        )
         spread_paths, yield_component_paths, spread_corr_meta = self._simulate_spread_paths(
             borrow_rate_paths=borrow_rate_paths,
             eth_paths=eth_paths,
             exchange_rate_paths=exchange_rate_paths,
             dt=dt,
-            rng=spread_rng,
+            rng=np.random.default_rng(spread_seed),
+            exogenous_shock_paths=spread_exogenous_with_liq,
         )
+
         spread_terminal = spread_paths[:, -1]
+        spread_terminal_without_liq = spread_paths_without_liq[:, -1]
+        spread_terminal_delta_bps = (spread_terminal - spread_terminal_without_liq) * 10_000.0
         spread_forecast_payload = {
             "horizon_days": n_steps,
             "ci_68_pct": [
@@ -1182,12 +2079,73 @@ class Dashboard:
                 "method": spread_corr_meta["method"],
                 "observations": int(spread_corr_meta["observations"]),
             },
+            "without_liquidation": {
+                "ci_95_pct": [
+                    round(float(np.percentile(spread_terminal_without_liq, 2.5) * 100.0), 3),
+                    round(float(np.percentile(spread_terminal_without_liq, 97.5) * 100.0), 3),
+                ],
+                "prob_negative_horizon_pct": round(
+                    float(np.mean(spread_terminal_without_liq < 0.0) * 100.0),
+                    3,
+                ),
+                "correlation": {
+                    "eth_return": round(float(spread_corr_meta_without["corr_eth_return"]), 4),
+                    "eth_vol": round(float(spread_corr_meta_without["corr_eth_vol"]), 4),
+                    "method": spread_corr_meta_without["method"],
+                    "observations": int(spread_corr_meta_without["observations"]),
+                },
+            },
+            "with_liquidation": {
+                "ci_95_pct": [
+                    round(float(np.percentile(spread_terminal, 2.5) * 100.0), 3),
+                    round(float(np.percentile(spread_terminal, 97.5) * 100.0), 3),
+                ],
+                "prob_negative_horizon_pct": round(
+                    float(np.mean(spread_terminal < 0.0) * 100.0),
+                    3,
+                ),
+                "correlation": {
+                    "eth_return": round(float(spread_corr_meta["corr_eth_return"]), 4),
+                    "eth_vol": round(float(spread_corr_meta["corr_eth_vol"]), 4),
+                    "method": spread_corr_meta["method"],
+                    "observations": int(spread_corr_meta["observations"]),
+                },
+            },
+            "liquidation_impact_terminal_bps": {
+                k: round(v, 6) for k, v in self._summary_stats(spread_terminal_delta_bps).items()
+            },
+            "steth_depeg_terminal_pct_without_liquidation": round(
+                float(np.mean((1.0 - steth_without_liq_paths[:, -1]) * 100.0)),
+                6,
+            ),
+            "steth_depeg_terminal_pct_with_liquidation": round(
+                float(np.mean((1.0 - steth_with_liq_paths[:, -1]) * 100.0)),
+                6,
+            ),
+            "steth_eth_return_depeg_change_correlation": {
+                "target_without_liquidation": round(
+                    float(steth_corr_meta["corr_target_eth_return_vs_depeg_change"]),
+                    6,
+                ),
+                "realized_without_liquidation": round(
+                    float(steth_corr_meta["corr_realized_eth_return_vs_depeg_change"]),
+                    6,
+                ),
+                "target_with_liquidation": round(
+                    float(steth_with_liq_corr_meta["corr_target_eth_return_vs_depeg_change"]),
+                    6,
+                ),
+                "realized_with_liquidation": round(
+                    float(steth_with_liq_corr_meta["corr_realized_eth_return_vs_depeg_change"]),
+                    6,
+                ),
+            },
             "shock_vol_annual": round(float(spread_corr_meta["shock_vol_annual"]), 4),
         }
 
         # === Phase 6: Carry + MTM P&L (rate/utilization + market depeg) ===
         # HF remains oracle-native below; market depeg is P&L-only here.
-        steth_market_paths = legacy_depeg_paths
+        steth_market_paths = steth_with_liq_paths
         carry_baseline_paths = self.position.pnl_paths(
             base_borrow_rate_paths,
             steth_market_paths,
@@ -1287,9 +2245,17 @@ class Dashboard:
         replay_v_weth = replay_diag_projected["v_weth"]
         replay_cost_bps = replay_diag_projected["cost_bps"]
         replay_bad_debt_usd = replay_diag_projected["bad_debt_usd"]
+        replay_bad_debt_usdc_usd = replay_diag_projected["bad_debt_usdc_usd"]
+        replay_bad_debt_usdt_usd = replay_diag_projected["bad_debt_usdt_usd"]
+        replay_bad_debt_eth_pool_usd = replay_diag_projected["bad_debt_eth_pool_usd"]
+        replay_bad_debt_other_usd = replay_diag_projected["bad_debt_other_usd"]
         replay_liq_counts = replay_diag_projected["liquidation_counts"]
 
         bad_debt_usd_paths = np.sum(replay_bad_debt_usd, axis=1)
+        bad_debt_usdc_paths = np.sum(replay_bad_debt_usdc_usd, axis=1)
+        bad_debt_usdt_paths = np.sum(replay_bad_debt_usdt_usd, axis=1)
+        bad_debt_eth_pool_paths = np.sum(replay_bad_debt_eth_pool_usd, axis=1)
+        bad_debt_other_paths = np.sum(replay_bad_debt_other_usd, axis=1)
         initial_eth_usd = float(np.mean(eth_usd_paths[:, 0]))
         bad_debt_weth_paths = bad_debt_usd_paths / max(initial_eth_usd, np.finfo(float).eps)
         bad_debt_stats = {
@@ -1298,6 +2264,24 @@ class Dashboard:
             },
             "weth_equivalent": {
                 k: round(v, 6) for k, v in self._summary_stats(bad_debt_weth_paths).items()
+            },
+            "usd_by_pool": {
+                "eth_pool": {
+                    k: round(v, 6)
+                    for k, v in self._summary_stats(bad_debt_eth_pool_paths).items()
+                },
+                "usdc_pool": {
+                    k: round(v, 6)
+                    for k, v in self._summary_stats(bad_debt_usdc_paths).items()
+                },
+                "usdt_pool": {
+                    k: round(v, 6)
+                    for k, v in self._summary_stats(bad_debt_usdt_paths).items()
+                },
+                "other_pool": {
+                    k: round(v, 6)
+                    for k, v in self._summary_stats(bad_debt_other_paths).items()
+                },
             },
         }
 
@@ -1318,6 +2302,16 @@ class Dashboard:
             "max_step_bps": round(float(np.max(replay_cost_bps)), 6),
             "realized_haircut_pct_mean": round(float(np.mean(realized_haircut_paths) * 100.0), 6),
         }
+        borrow_rate_terminal_impact_bps = borrow_rate_liq_delta[:, -1] * 10_000.0
+        borrow_rate_cumulative_impact_bps_day = (
+            np.sum(borrow_rate_liq_delta[:, :-1], axis=1) * dt * 10_000.0
+        )
+        spread_terminal_impact_bps = (spread_paths[:, -1] - spread_paths_without_liq[:, -1]) * 10_000.0
+        spread_cumulative_impact_bps_day = (
+            np.sum(spread_paths[:, :-1] - spread_paths_without_liq[:, :-1], axis=1)
+            * dt
+            * 10_000.0
+        )
 
         liquidation_diagnostics = {
             "debt_at_risk_eth_peak": {
@@ -1354,12 +2348,40 @@ class Dashboard:
                     np.sum(replay_diag_projected["repaid_usdt_usd"], axis=1)
                 ).items()
             },
+            "borrow_rate_terminal_impact_bps": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(borrow_rate_terminal_impact_bps).items()
+            },
+            "borrow_rate_cumulative_impact_bps_day": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(borrow_rate_cumulative_impact_bps_day).items()
+            },
+            "spread_terminal_impact_bps": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(spread_terminal_impact_bps).items()
+            },
+            "spread_cumulative_impact_bps_day": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(spread_cumulative_impact_bps_day).items()
+            },
+            "cumulative_price_impact_pct_terminal": {
+                k: round(v, 6)
+                for k, v in self._summary_stats(
+                    replay_diag_projected["cumulative_price_impact_pct"][:, -1]
+                ).items()
+            },
         }
 
         time_series_diagnostics = {
             "v_stables_usd": self._time_series_percentiles(replay_v_stables_usd),
             "v_weth": self._time_series_percentiles(replay_v_weth),
             "cost_bps": self._time_series_percentiles(replay_cost_bps),
+            "realized_execution_haircut": self._time_series_percentiles(
+                replay_diag_projected["realized_execution_haircut"]
+            ),
+            "cumulative_price_impact_pct": self._time_series_percentiles(
+                replay_diag_projected["cumulative_price_impact_pct"]
+            ),
             "debt_at_risk_eth": self._time_series_percentiles(
                 replay_diag_projected["debt_at_risk_eth"]
             ),
@@ -1370,10 +2392,57 @@ class Dashboard:
                 replay_diag_projected["collateral_seized_eth"]
             ),
             "liquidation_counts": self._time_series_percentiles(replay_liq_counts),
+            "utilization_shock": self._time_series_percentiles(
+                replay_diag_projected["utilization_shock"]
+            ),
+            "utilization_delta": self._time_series_percentiles(
+                replay_diag_projected["utilization_shock"]
+            ),
+            "spread_feedback_shock": self._time_series_percentiles(
+                np.pad(
+                    spread_feedback_shocks,
+                    ((0, 0), (1, 0)),
+                    mode="constant",
+                    constant_values=0.0,
+                )
+            ),
             "utilization": self._time_series_percentiles(util_paths),
             "borrow_rate_pct": self._time_series_percentiles(borrow_rate_paths * 100.0),
+            "borrow_rate_without_liquidation_pct": self._time_series_percentiles(
+                borrow_rate_paths_without_liq * 100.0
+            ),
+            "borrow_rate_with_liquidation_pct": self._time_series_percentiles(
+                borrow_rate_paths * 100.0
+            ),
+            "borrow_rate_liquidation_delta_bps": self._time_series_percentiles(
+                borrow_rate_liq_delta * 10_000.0
+            ),
             "spread_pct": self._time_series_percentiles(spread_paths * 100.0),
+            "spread_without_liquidation_pct": self._time_series_percentiles(
+                spread_paths_without_liq * 100.0
+            ),
+            "spread_with_liquidation_pct": self._time_series_percentiles(
+                spread_paths * 100.0
+            ),
+            "spread_liquidation_delta_bps": self._time_series_percentiles(
+                (spread_paths - spread_paths_without_liq) * 10_000.0
+            ),
             "yield_component_pct": self._time_series_percentiles(yield_component_paths * 100.0),
+            "yield_component_without_liquidation_pct": self._time_series_percentiles(
+                yield_component_paths_without_liq * 100.0
+            ),
+            "steth_eth_without_liquidation": self._time_series_percentiles(
+                steth_without_liq_paths
+            ),
+            "steth_eth_with_liquidation": self._time_series_percentiles(
+                steth_with_liq_paths
+            ),
+            "steth_depeg_without_liquidation_pct": self._time_series_percentiles(
+                (1.0 - steth_without_liq_paths) * 100.0
+            ),
+            "steth_depeg_with_liquidation_pct": self._time_series_percentiles(
+                (1.0 - steth_with_liq_paths) * 100.0
+            ),
         }
 
         # === Position summary ===
@@ -1419,6 +2488,27 @@ class Dashboard:
             if liquidation_days.size > 0
             else None
         )
+        position_prob_liquidation = float(np.clip(risk_output.prob_liquidation, 0.0, 1.0))
+        if protocol_liq_counts_raw.size > 0:
+            protocol_liq_counts_total = np.asarray(protocol_liq_counts_raw, dtype=float)
+        else:
+            protocol_liq_counts_total = np.sum(replay_liq_counts, axis=1)
+        protocol_liq_signal_available = bool(
+            replay_diagnostics_summary.get("paths_processed", 0) > 0
+            and replay_diagnostics_summary.get("accounts_processed", 0) > 0
+            and protocol_liq_counts_total.size > 0
+        )
+        protocol_prob_liquidation = (
+            float(np.mean(protocol_liq_counts_total > 0))
+            if protocol_liq_signal_available
+            else 0.0
+        )
+        if protocol_liq_signal_available:
+            reported_prob_liquidation = protocol_prob_liquidation
+            reported_prob_source = "protocol_account_replay"
+        else:
+            reported_prob_liquidation = position_prob_liquidation
+            reported_prob_source = "position_hf"
 
         horizon_label = f"{n_steps}d"
         risk_metrics_payload = {
@@ -1430,7 +2520,11 @@ class Dashboard:
             "cvar_99_eth": round(risk_output.cvar_99, 4),
             "max_drawdown_mean_eth": round(risk_output.max_drawdown_mean, 4),
             "max_drawdown_95_eth": round(risk_output.max_drawdown_95, 4),
-            "prob_liquidation_pct": round(risk_output.prob_liquidation * 100, 2),
+            "prob_liquidation_pct": round(reported_prob_liquidation * 100, 2),
+            "prob_liquidation_source": reported_prob_source,
+            "prob_position_liquidation_pct": round(position_prob_liquidation * 100, 2),
+            "prob_protocol_liquidation_pct": round(protocol_prob_liquidation * 100, 2),
+            "protocol_liquidation_signal_available": protocol_liq_signal_available,
             "prob_exit_pct": round(decomposition.exit_probability * 100, 2),
             "health_factor_current": round(snap.health_factor, 4),
             "liquidation_risk": "rate/carry driven (oracle exchange-rate path + debt accrual)",
@@ -1455,6 +2549,25 @@ class Dashboard:
         if self.defaults_used:
             params_source = f"{params_source} (defaults used)"
 
+        abm_diag_payload = abm_diagnostics_summary or {
+            "paths_processed": 0,
+            "accounts_processed": 0,
+            "max_iterations_hit_count": 0,
+            "warnings": [],
+            "mode": "off",
+            "projection_method": "none",
+            "projection_coverage": {"mode": "none"},
+            "convergence_rate": 1.0,
+            "agent_action_counts": {
+                "borrower_deleverage": 0,
+                "liquidator_liquidations": 0,
+                "arbitrage_rebalances": 0,
+                "lp_rebalances": 0,
+            },
+            "liquidation_volume_weth_total": 0.0,
+            "liquidation_volume_usd_total": 0.0,
+        }
+
         return DashboardOutput(
             timestamp=datetime.now(timezone.utc).isoformat(),
             data_sources={
@@ -1468,22 +2581,68 @@ class Dashboard:
                 "cohort_fetch_error": self.cohort_fetch_error,
                 "cohort_borrower_count": self.cohort_analytics.get("borrower_count"),
                 "cascade_source": cascade_source,
+                "cascade_delegate_source": cascade_delegate_source,
                 "cascade_fallback_reason": cascade_fallback_reason,
                 "cascade_replay_projection": replay_projection,
                 "cascade_replay_path_count": replay_path_count,
                 "cascade_replay_account_coverage": replay_account_coverage,
                 "cascade_replay_diagnostics": replay_diagnostics_summary,
+                "cascade_abm_enabled": self.abm_config.enabled,
+                "cascade_abm_mode": self.abm_config.mode,
+                "cascade_abm_diagnostics": abm_diag_payload,
                 "weth_execution_model": {
                     "adv_weth": self.adv_weth,
                     "k_bps": self.k_bps,
                     "min_bps": self.min_bps,
                     "max_bps": self.max_bps,
+                    "k_vol_configured": self.k_vol_configured,
+                    "k_vol_configured_source": self.k_vol_configured_source,
+                    "k_vol_resolved": self.k_vol,
+                    "k_vol_resolution_reason": self.k_vol_resolution_reason,
+                    "kyle_k_configured": self.kyle_k_configured,
+                    "kyle_k_configured_source": self.kyle_k_configured_source,
+                    "kyle_k_resolved": self.kyle_k,
+                    "kyle_k_resolution_reason": self.kyle_k_resolution_reason,
+                    "sigma_lookback_days_configured": self.sigma_lookback_days_configured,
+                    "sigma_lookback_days_configured_source": self.sigma_lookback_days_source,
+                    "sigma_lookback_days_resolved": self.sigma_lookback_days,
+                    "sigma_lookback_resolution_reason": self.sigma_lookback_resolution_reason,
+                    "sigma_base_annualized_configured": self.sigma_base_annualized_configured,
+                    "sigma_base_annualized_configured_source": (
+                        self.sigma_base_annualized_configured_source
+                    ),
+                    "sigma_base_annualized_resolved": self.sigma_base_annualized,
+                    "sigma_base_resolution_source": self.sigma_base_resolution_source,
+                    "sigma_base_resolution_reason": self.sigma_base_resolution_reason,
+                    "sigma_daily_for_impact": self.sigma_daily_for_impact,
+                    "lambda_impact": self.lambda_impact,
+                    "lambda_impact_resolution_reason": self.lambda_impact_resolution_reason,
+                    "volatility_multiplier_non_decreasing": True,
                 },
                 "spread_model": {
                     "shock_vol_annual": self.spread_params.shock_vol_annual,
                     "mean_reversion_speed": self.spread_params.mean_reversion_speed,
                     "corr_eth_return_default": self.spread_params.corr_eth_return_default,
                     "corr_eth_vol_default": self.spread_params.corr_eth_vol_default,
+                    "use_realized_exchange_yield": self.spread_params.use_realized_exchange_yield,
+                    "realized_yield_abs_cap_annual": self.spread_params.realized_yield_abs_cap_annual,
+                    "spread_depeg_sensitivity": self.spread_depeg_sensitivity,
+                    "spread_liquidation_flow_sensitivity": self.spread_liquidation_flow_sensitivity,
+                    "spread_feedback_to_utilization": self.spread_feedback_to_utilization,
+                },
+                "steth_depeg_model": {
+                    "kappa": self.steth_depeg_kappa,
+                    "long_run_depeg": self.steth_depeg_long_run,
+                    "sigma": self.steth_depeg_sigma,
+                    "max_depeg": self.steth_depeg_max,
+                    "corr_eth_return": self.steth_depeg_corr_eth_return,
+                    "liquidation_alpha": self.steth_depeg_liquidation_alpha,
+                    "realized_corr_without_liquidation": steth_corr_meta[
+                        "corr_realized_eth_return_vs_depeg_change"
+                    ],
+                    "realized_corr_with_liquidation": steth_with_liq_corr_meta[
+                        "corr_realized_eth_return_vs_depeg_change"
+                    ],
                 },
                 "governance_shock_prob_annual": self.gov_shock_prob_annual,
                 "slashing_intensity_annual": self.slashing_intensity_annual,
@@ -1491,6 +2650,14 @@ class Dashboard:
                 "tail_risk_calibration": self.tail_risk_calibration,
                 "depeg_driver_role": "execution_layer_plus_mtm",
                 "legacy_depeg_terminal_mean": round(float(np.mean(legacy_depeg_paths[:, -1])), 6),
+                "steth_terminal_mean_without_liquidation": round(
+                    float(np.mean(steth_without_liq_paths[:, -1])),
+                    6,
+                ),
+                "steth_terminal_mean_with_liquidation": round(
+                    float(np.mean(steth_with_liq_paths[:, -1])),
+                    6,
+                ),
             },
             position_summary={
                 'capital_eth': snap.capital_eth,
@@ -1581,18 +2748,63 @@ class Dashboard:
                 'cohort_source': self.cohort_source,
                 'cohort_borrower_count': self.cohort_analytics.get("borrower_count"),
                 'cascade_source': cascade_source,
+                'cascade_delegate_source': cascade_delegate_source,
                 'cascade_account_count': cascade_account_count,
                 'account_replay_max_paths': self.account_replay_max_paths,
                 'account_replay_max_accounts': self.account_replay_max_accounts,
                 'cascade_replay_path_count': replay_path_count,
                 'cascade_replay_projection': replay_projection,
                 'cascade_replay_account_coverage': replay_account_coverage,
+                'abm_enabled': self.abm_config.enabled,
+                'abm_mode': self.abm_config.mode,
+                'abm_max_paths': self.abm_config.max_paths,
+                'abm_max_accounts': self.abm_config.max_accounts,
+                'abm_projection_method': self.abm_config.projection_method,
+                'abm_liquidator_competition': self.abm_config.liquidator_competition,
+                'abm_arb_enabled': self.abm_config.arb_enabled,
+                'abm_lp_response_strength': self.abm_config.lp_response_strength,
+                'abm_random_seed_offset': self.abm_config.random_seed_offset,
+                'cascade_abm_diagnostics': abm_diag_payload,
                 'adv_weth': self.adv_weth,
                 'k_bps': self.k_bps,
                 'min_bps': self.min_bps,
                 'max_bps': self.max_bps,
+                'k_vol_configured': self.k_vol_configured,
+                'k_vol_configured_source': self.k_vol_configured_source,
+                'k_vol': self.k_vol,
+                'k_vol_resolution_reason': self.k_vol_resolution_reason,
+                'kyle_k_configured': self.kyle_k_configured,
+                'kyle_k_configured_source': self.kyle_k_configured_source,
+                'kyle_k': self.kyle_k,
+                'kyle_k_resolution_reason': self.kyle_k_resolution_reason,
+                'sigma_lookback_days_configured': self.sigma_lookback_days_configured,
+                'sigma_lookback_days_configured_source': self.sigma_lookback_days_source,
+                'sigma_lookback_days': self.sigma_lookback_days,
+                'sigma_lookback_resolution_reason': self.sigma_lookback_resolution_reason,
+                'sigma_base_annualized_configured': self.sigma_base_annualized_configured,
+                'sigma_base_annualized_configured_source': (
+                    self.sigma_base_annualized_configured_source
+                ),
+                'sigma_base_annualized': self.sigma_base_annualized,
+                'sigma_base_resolution_source': self.sigma_base_resolution_source,
+                'sigma_base_resolution_reason': self.sigma_base_resolution_reason,
+                'sigma_daily_for_impact': self.sigma_daily_for_impact,
+                'lambda_impact': self.lambda_impact,
+                'lambda_impact_resolution_reason': self.lambda_impact_resolution_reason,
+                'volatility_multiplier_non_decreasing': True,
                 'spread_shock_vol_annual': self.spread_params.shock_vol_annual,
                 'spread_mean_reversion_speed': self.spread_params.mean_reversion_speed,
+                'spread_use_realized_exchange_yield': self.spread_params.use_realized_exchange_yield,
+                'spread_realized_yield_abs_cap_annual': self.spread_params.realized_yield_abs_cap_annual,
+                'spread_depeg_sensitivity': self.spread_depeg_sensitivity,
+                'spread_liquidation_flow_sensitivity': self.spread_liquidation_flow_sensitivity,
+                'spread_feedback_to_utilization': self.spread_feedback_to_utilization,
+                'steth_depeg_kappa': self.steth_depeg_kappa,
+                'steth_depeg_long_run': self.steth_depeg_long_run,
+                'steth_depeg_sigma': self.steth_depeg_sigma,
+                'steth_depeg_max': self.steth_depeg_max,
+                'steth_depeg_corr_eth_return': self.steth_depeg_corr_eth_return,
+                'steth_depeg_liquidation_alpha': self.steth_depeg_liquidation_alpha,
                 'governance_shock_prob_annual': self.gov_shock_prob_annual,
                 'governance_ir_spread': self.gov_ir_spread,
                 'governance_lt_haircut': self.gov_lt_haircut,

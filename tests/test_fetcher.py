@@ -4,6 +4,7 @@ import pytest
 
 from data.fetcher import (
     CURVE_STETH_POOL,
+    ERC20_TRANSFER_TOPIC,
     FetchedData,
     STRICT_AAVE_REQUIRED_PARAMS,
     SEL_CURVE_A,
@@ -18,6 +19,7 @@ from data.fetcher import (
     SEL_GET_VARIABLE_RATE_SLOPE2_BY_ASSET,
     SEL_OPTIMAL_USAGE_RATIO_BY_ASSET,
     SEL_TOTAL_SUPPLY,
+    WETH_ADDRESS,
     _eth_call,
     _fetch_aave_onchain_pool_params,
     _fetch_curve_pool_onchain,
@@ -30,6 +32,7 @@ from data.fetcher import (
     fetch_all,
     fetch_steth_eth_price_history,
     fetch_steth_supply_apy,
+    fetch_weth_adv_onchain,
     fetch_weth_borrow_apy_history,
 )
 
@@ -266,6 +269,81 @@ class TestFetcherDefiLlama:
         assert data.weth_total_borrows == pytest.approx(77.0, rel=1e-12)
 
 
+class TestOnchainWethAdv:
+    def test_fetch_weth_adv_onchain_computes_trailing_average(self, monkeypatch):
+        data = FetchedData()
+
+        monkeypatch.setattr("data.fetcher._rpc_block_number", lambda timeout=15: 20)
+
+        # Expected windows with lookback_days=2, blocks_per_day=4, chunk_blocks=2:
+        # day0: [17,20] => chunks [17,18], [19,20] => 10 + 20 WETH
+        # day1: [13,16] => chunks [13,14], [15,16] => 30 + 40 WETH
+        # ADV = (30 + 70) / 2 = 50 WETH/day.
+        chunk_volume = {
+            (17, 18): 10.0,
+            (19, 20): 20.0,
+            (13, 14): 30.0,
+            (15, 16): 40.0,
+        }
+
+        def fake_get_logs(address, from_block, to_block, topics=None, timeout=20):
+            assert address == WETH_ADDRESS
+            assert topics == [ERC20_TRANSFER_TOPIC]
+            value = chunk_volume.get((from_block, to_block), 0.0)
+            return [{"data": hex(int(value * 1e18))}]
+
+        monkeypatch.setattr("data.fetcher._rpc_get_logs", fake_get_logs)
+
+        ok = fetch_weth_adv_onchain(
+            data,
+            lookback_days=2,
+            blocks_per_day=4,
+            chunk_blocks=2,
+            min_chunk_blocks=1,
+        )
+        assert ok
+        assert data.adv_weth == pytest.approx(50.0, rel=1e-12)
+        assert any(
+            isinstance(entry, dict)
+            and entry.get("name") == "adv_weth"
+            and "eth_getLogs" in str(entry.get("source", ""))
+            for entry in data.params_log
+        )
+
+    def test_fetch_weth_adv_onchain_scales_partial_window_when_chunk_fails(self, monkeypatch):
+        data = FetchedData()
+        monkeypatch.setattr("data.fetcher._rpc_block_number", lambda timeout=15: 20)
+
+        def fake_get_logs(_address, from_block, to_block, topics=None, timeout=20):
+            if (from_block, to_block) == (17, 20):
+                return None  # force chunk split
+            if (from_block, to_block) == (17, 18):
+                return [{"data": hex(int(30 * 1e18))}]
+            if (from_block, to_block) == (19, 20):
+                return None  # unresolved remainder
+            return []
+
+        monkeypatch.setattr("data.fetcher._rpc_get_logs", fake_get_logs)
+
+        ok = fetch_weth_adv_onchain(
+            data,
+            lookback_days=1,
+            blocks_per_day=4,
+            chunk_blocks=4,
+            min_chunk_blocks=2,
+            min_coverage_ratio=0.25,
+        )
+        assert ok
+        # 2/4 blocks covered, scaled by 4/2 => 60 WETH/day
+        assert data.adv_weth == pytest.approx(60.0, rel=1e-12)
+        assert any(
+            isinstance(entry, dict)
+            and entry.get("name") == "adv_weth"
+            and "partial-window scaled" in str(entry.get("source", ""))
+            for entry in data.params_log
+        )
+
+
 class TestFetcherRefreshLogic:
     def test_needs_refresh_when_pool_params_not_in_provenance_log(self):
         data = FetchedData()
@@ -326,9 +404,88 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_weth_borrow_apy_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_supply_apy", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_curve_pool_params", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_weth_adv_onchain", lambda _d: False)
 
         with pytest.raises(RuntimeError, match="Strict Aave fetch failed"):
             fetch_all(use_cache=True, force_refresh=False, strict_aave=True)
+
+    def test_fetch_all_uses_cached_onchain_adv_fallback(self, monkeypatch):
+        cached = FetchedData()
+        cached.adv_weth = 1_234_567.0
+        cached.last_updated = "2026-02-20T00:00:00+00:00"
+        cached.params_log = [
+            {
+                "name": "adv_weth",
+                "value": cached.adv_weth,
+                "source": "On-chain WETH Transfer logs via eth_getLogs (7d trailing average)",
+                "fetched_at": "2026-02-20T00:00:00+00:00",
+            }
+        ]
+
+        monkeypatch.setattr("data.fetcher._load_cache", lambda: cached)
+        monkeypatch.setattr("data.fetcher._is_stale", lambda _d: True)
+        monkeypatch.setattr("data.fetcher.fetch_eth_price_history", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_steth_eth_price_history", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_aave_weth_params", lambda _d: True)
+        monkeypatch.setattr("data.fetcher.fetch_weth_adv_onchain", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_eth_gas_price", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_wsteth_exchange_rate", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_steth_eth_price", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_weth_borrow_apy_history", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_steth_supply_apy", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_curve_pool_params", lambda _d: False)
+        monkeypatch.setattr("data.fetcher._save_cache", lambda _d: None)
+
+        fetched = fetch_all(use_cache=True, force_refresh=True, strict_aave=False)
+        assert fetched.adv_weth == pytest.approx(1_234_567.0, rel=1e-12)
+        assert any(
+            isinstance(entry, dict)
+            and entry.get("name") == "adv_weth"
+            and "cache fallback" in str(entry.get("source", ""))
+            for entry in fetched.params_log
+        )
+
+    def test_fetch_all_reuses_recent_cached_onchain_adv_without_live_fetch(
+        self,
+        monkeypatch,
+    ):
+        cached = FetchedData()
+        cached.adv_weth = 1_111_111.0
+        cached.last_updated = "2099-01-01T00:00:00+00:00"
+        cached.params_log = [
+            {
+                "name": "adv_weth",
+                "value": cached.adv_weth,
+                "source": "On-chain WETH Transfer logs via eth_getLogs (7d trailing average)",
+                "fetched_at": "2099-01-01T00:00:00+00:00",
+            }
+        ]
+
+        monkeypatch.setattr("data.fetcher._load_cache", lambda: cached)
+        monkeypatch.setattr("data.fetcher._is_stale", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_eth_price_history", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_steth_eth_price_history", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_aave_weth_params", lambda _d: True)
+        monkeypatch.setattr(
+            "data.fetcher.fetch_weth_adv_onchain",
+            lambda _d: (_ for _ in ()).throw(AssertionError("live ADV fetch should be skipped")),
+        )
+        monkeypatch.setattr("data.fetcher.fetch_eth_gas_price", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_wsteth_exchange_rate", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_steth_eth_price", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_weth_borrow_apy_history", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_steth_supply_apy", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_curve_pool_params", lambda _d: False)
+        monkeypatch.setattr("data.fetcher._save_cache", lambda _d: None)
+
+        fetched = fetch_all(use_cache=True, force_refresh=False, strict_aave=False)
+        assert fetched.adv_weth == pytest.approx(1_111_111.0, rel=1e-12)
+        assert any(
+            isinstance(entry, dict)
+            and entry.get("name") == "adv_weth"
+            and "cache reuse" in str(entry.get("source", ""))
+            for entry in fetched.params_log
+        )
 
 
 class TestStethSupplyApySourcePriority:

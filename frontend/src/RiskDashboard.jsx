@@ -51,6 +51,7 @@ const DEMO_DATA = {
     cohort_fetch_error: null,
     cohort_borrower_count: 29027,
     cascade_source: "account_replay",
+    cascade_delegate_source: "account_replay",
     cascade_fallback_reason: null,
     cascade_replay_projection: "terminal_price_interp",
     cascade_replay_path_count: 512,
@@ -66,6 +67,26 @@ const DEMO_DATA = {
       accounts_processed: 5000,
       max_iterations_hit_count: 3,
       warnings: [],
+    },
+    cascade_abm_enabled: false,
+    cascade_abm_mode: "off",
+    cascade_abm_diagnostics: {
+      paths_processed: 0,
+      accounts_processed: 0,
+      max_iterations_hit_count: 0,
+      warnings: [],
+      mode: "off",
+      projection_method: "none",
+      projection_coverage: { mode: "none" },
+      convergence_rate: 1.0,
+      agent_action_counts: {
+        borrower_deleverage: 0,
+        liquidator_liquidations: 0,
+        arbitrage_rebalances: 0,
+        lp_rebalances: 0,
+      },
+      liquidation_volume_weth_total: 0.0,
+      liquidation_volume_usd_total: 0.0,
     },
     governance_shock_prob_annual: 0.18,
     slashing_intensity_annual: 0.015,
@@ -201,6 +222,7 @@ const DEMO_DATA = {
     cohort_source: "aave_subgraph",
     cohort_borrower_count: 29027,
     cascade_source: "account_replay",
+    cascade_delegate_source: "account_replay",
     cascade_account_count: 5000,
     account_replay_max_paths: 512,
     account_replay_max_accounts: 5000,
@@ -212,6 +234,33 @@ const DEMO_DATA = {
       account_trimmed: true,
       debt_coverage: 0.94,
       collateral_coverage: 0.91,
+    },
+    abm_enabled: false,
+    abm_mode: "off",
+    abm_max_paths: 256,
+    abm_max_accounts: 5000,
+    abm_projection_method: "terminal_price_interp",
+    abm_liquidator_competition: 0.35,
+    abm_arb_enabled: true,
+    abm_lp_response_strength: 0.50,
+    abm_random_seed_offset: 10000,
+    cascade_abm_diagnostics: {
+      paths_processed: 0,
+      accounts_processed: 0,
+      max_iterations_hit_count: 0,
+      warnings: [],
+      mode: "off",
+      projection_method: "none",
+      projection_coverage: { mode: "none" },
+      convergence_rate: 1.0,
+      agent_action_counts: {
+        borrower_deleverage: 0,
+        liquidator_liquidations: 0,
+        arbitrage_rebalances: 0,
+        lp_rebalances: 0,
+      },
+      liquidation_volume_weth_total: 0.0,
+      liquidation_volume_usd_total: 0.0,
     },
     governance_shock_prob_annual: 0.18,
     governance_ir_spread: 0.04,
@@ -234,18 +283,33 @@ const API_URL = "/api/dashboard";
  * Fetch simulation results from the API backend.
  * Returns { data, error } — data is the parsed JSON or null.
  */
-async function fetchDashboardData(signal) {
-  const resp = await fetch(API_URL, { signal });
-  if (resp.status === 202) {
-    /* Simulation still running — caller should retry */
-    const body = await resp.json();
-    throw new Error(body.message || "Simulation in progress, retrying...");
+async function fetchDashboardData() {
+  const controller = new AbortController();
+  const timeoutMs = 45000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(API_URL, { signal: controller.signal });
+    if (resp.status === 202) {
+      /* Simulation still running — caller should retry */
+      const body = await resp.json();
+      throw new Error(body.message || "Simulation in progress, retrying...");
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.error || `API returned ${resp.status}`);
+    }
+    return resp.json();
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(
+        "Simulation request timed out after 45s. The backend may still be computing."
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!resp.ok) {
-    const body = await resp.json().catch(() => ({}));
-    throw new Error(body.error || `API returned ${resp.status}`);
-  }
-  return resp.json();
 }
 
 
@@ -1195,15 +1259,19 @@ function UnwindCostPanel() {
 
       <GoldRule />
 
-      {/* Cascade replay summary */}
+      {/* Cascade engine summary */}
       <div className="mt-4">
         <div className="font-mono text-[10px] tracking-[0.08em] uppercase text-txt-secondary mb-2">
-          CASCADE REPLAY ENGINE
+          CASCADE ENGINE
         </div>
         <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
           <div className="flex justify-between">
             <span className="text-txt-muted">Source</span>
             <span className="text-txt-primary">{ds.cascade_source}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-txt-muted">Delegate</span>
+            <span className="text-txt-primary">{ds.cascade_delegate_source || ds.cascade_source}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-txt-muted">Projection</span>
@@ -1215,15 +1283,19 @@ function UnwindCostPanel() {
           </div>
           <div className="flex justify-between">
             <span className="text-txt-muted">Accounts</span>
-            <span className="text-txt-primary">{fmtNum(ds.cascade_replay_account_coverage.account_count_used, 0)}</span>
+            <span className="text-txt-primary">{fmtNum(ds.cascade_replay_account_coverage?.account_count_used ?? 0, 0)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-txt-muted">Debt coverage</span>
-            <span className="text-txt-primary">{fmtPct(ds.cascade_replay_account_coverage.debt_coverage * 100)}</span>
+            <span className="text-txt-primary">{fmtPct((ds.cascade_replay_account_coverage?.debt_coverage ?? 0) * 100)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-txt-muted">Collateral cov.</span>
-            <span className="text-txt-primary">{fmtPct(ds.cascade_replay_account_coverage.collateral_coverage * 100)}</span>
+            <span className="text-txt-primary">{fmtPct((ds.cascade_replay_account_coverage?.collateral_coverage ?? 0) * 100)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-txt-muted">ABM mode</span>
+            <span className="text-txt-primary">{ds.cascade_abm_mode || "off"}</span>
           </div>
         </div>
         {/* Depeg driver */}
@@ -1244,6 +1316,35 @@ function DataProvenancePanel() {
   const DATA = useData();
   const ds = DATA.data_sources;
   const sc = DATA.simulation_config;
+  const replayCoverage = sc.cascade_replay_account_coverage || {
+    account_count_input: 0,
+    account_count_used: 0,
+    account_trimmed: false,
+    debt_coverage: 0,
+    collateral_coverage: 0,
+  };
+  const replayDiag = ds.cascade_replay_diagnostics || {
+    paths_processed: 0,
+    accounts_processed: 0,
+    max_iterations_hit_count: 0,
+    warnings: [],
+  };
+  const abmDiag = ds.cascade_abm_diagnostics || {
+    paths_processed: 0,
+    accounts_processed: 0,
+    max_iterations_hit_count: 0,
+    warnings: [],
+    agent_action_counts: {
+      borrower_deleverage: 0,
+      liquidator_liquidations: 0,
+      arbitrage_rebalances: 0,
+      lp_rebalances: 0,
+    },
+    projection_coverage: { mode: "none", path_coverage: 0 },
+  };
+  const activeCascadeDiag = String(ds.cascade_source || "").startsWith("abm")
+    ? abmDiag
+    : replayDiag;
 
   return (
     <Panel title="Data Provenance & Configuration" icon={Database} accentColor="#6b7280">
@@ -1261,11 +1362,20 @@ function DataProvenancePanel() {
             ["Cohort source", sc.cohort_source],
             ["Borrower count", fmtNum(sc.cohort_borrower_count, 0)],
             ["Cascade source", sc.cascade_source],
+            ["Cascade delegate", sc.cascade_delegate_source || sc.cascade_source],
             ["Cascade accounts", fmtNum(sc.cascade_account_count, 0)],
             ["Replay max paths", sc.account_replay_max_paths],
             ["Replay max accounts", fmtNum(sc.account_replay_max_accounts, 0)],
             ["Replay path count", sc.cascade_replay_path_count],
             ["Replay projection", sc.cascade_replay_projection],
+            ["ABM enabled", sc.abm_enabled ? "yes" : "no"],
+            ["ABM mode", sc.abm_mode || "off"],
+            ["ABM max paths", sc.abm_max_paths ?? "—"],
+            ["ABM max accounts", fmtNum(sc.abm_max_accounts ?? 0, 0)],
+            ["ABM projection", sc.abm_projection_method || "—"],
+            ["ABM liq competition", fmtNum(sc.abm_liquidator_competition ?? 0, 2)],
+            ["ABM arb enabled", sc.abm_arb_enabled ? "yes" : "no"],
+            ["ABM LP response", fmtNum(sc.abm_lp_response_strength ?? 0, 2)],
             ["Gov shock prob (ann)", fmtPct(sc.governance_shock_prob_annual * 100)],
             ["Gov IR spread", fmtPct(sc.governance_ir_spread * 100)],
             ["Gov LT haircut", fmtPct(sc.governance_lt_haircut * 100)],
@@ -1282,13 +1392,13 @@ function DataProvenancePanel() {
         <div className="mt-3 pt-2 border-t border-[rgba(255,255,255,0.04)]">
           <div className="font-mono text-[10px] text-txt-muted mb-1">Replay Account Coverage:</div>
           <div className="grid grid-cols-2 gap-1 text-[10px] font-mono">
-            <div>Input: <span className="text-txt-primary">{fmtNum(sc.cascade_replay_account_coverage.account_count_input, 0)}</span></div>
-            <div>Used: <span className="text-txt-primary">{fmtNum(sc.cascade_replay_account_coverage.account_count_used, 0)}</span></div>
-            <div>Trimmed: <span className={sc.cascade_replay_account_coverage.account_trimmed ? "text-[#f97316]" : "text-[#2dd4bf]"}>
-              {sc.cascade_replay_account_coverage.account_trimmed ? "yes" : "no"}
+            <div>Input: <span className="text-txt-primary">{fmtNum(replayCoverage.account_count_input, 0)}</span></div>
+            <div>Used: <span className="text-txt-primary">{fmtNum(replayCoverage.account_count_used, 0)}</span></div>
+            <div>Trimmed: <span className={replayCoverage.account_trimmed ? "text-[#f97316]" : "text-[#2dd4bf]"}>
+              {replayCoverage.account_trimmed ? "yes" : "no"}
             </span></div>
-            <div>Debt cov: <span className="text-txt-primary">{fmtPct(sc.cascade_replay_account_coverage.debt_coverage * 100)}</span></div>
-            <div>Coll cov: <span className="text-txt-primary">{fmtPct(sc.cascade_replay_account_coverage.collateral_coverage * 100)}</span></div>
+            <div>Debt cov: <span className="text-txt-primary">{fmtPct(replayCoverage.debt_coverage * 100)}</span></div>
+            <div>Coll cov: <span className="text-txt-primary">{fmtPct(replayCoverage.collateral_coverage * 100)}</span></div>
           </div>
         </div>
       </CollapsibleSection>
@@ -1352,12 +1462,21 @@ function DataProvenancePanel() {
           </div>
           {/* Cascade diagnostics */}
           <div>
-            <div className="text-txt-muted mb-0.5">Cascade Replay Diagnostics:</div>
+            <div className="text-txt-muted mb-0.5">Cascade Engine Diagnostics:</div>
             <div className="pl-3 space-y-0.5">
-              <div>Paths processed: <span className="text-txt-primary">{ds.cascade_replay_diagnostics.paths_processed}</span></div>
-              <div>Accounts processed: <span className="text-txt-primary">{fmtNum(ds.cascade_replay_diagnostics.accounts_processed, 0)}</span></div>
-              <div>Max iterations hit: <span className="text-txt-primary">{ds.cascade_replay_diagnostics.max_iterations_hit_count}</span></div>
-              <div>Warnings: <span className="text-[#2dd4bf]">{ds.cascade_replay_diagnostics.warnings.length === 0 ? "none" : ds.cascade_replay_diagnostics.warnings.join(", ")}</span></div>
+              <div>Paths processed: <span className="text-txt-primary">{activeCascadeDiag.paths_processed}</span></div>
+              <div>Accounts processed: <span className="text-txt-primary">{fmtNum(activeCascadeDiag.accounts_processed, 0)}</span></div>
+              <div>Max iterations hit: <span className="text-txt-primary">{activeCascadeDiag.max_iterations_hit_count ?? 0}</span></div>
+              <div>Warnings: <span className="text-[#2dd4bf]">{(activeCascadeDiag.warnings || []).length === 0 ? "none" : activeCascadeDiag.warnings.join(", ")}</span></div>
+              {String(ds.cascade_source || "").startsWith("abm") ? (
+                <>
+                  <div>Convergence: <span className="text-txt-primary">{fmtPct((activeCascadeDiag.convergence_rate || 0) * 100)}</span></div>
+                  <div>Liq actions: <span className="text-txt-primary">{fmtNum(activeCascadeDiag.agent_action_counts?.liquidator_liquidations || 0, 0)}</span></div>
+                  <div>Borrower actions: <span className="text-txt-primary">{fmtNum(activeCascadeDiag.agent_action_counts?.borrower_deleverage || 0, 0)}</span></div>
+                  <div>Arb actions: <span className="text-txt-primary">{fmtNum(activeCascadeDiag.agent_action_counts?.arbitrage_rebalances || 0, 0)}</span></div>
+                  <div>LP actions: <span className="text-txt-primary">{fmtNum(activeCascadeDiag.agent_action_counts?.lp_rebalances || 0, 0)}</span></div>
+                </>
+              ) : null}
             </div>
           </div>
         </div>
@@ -1423,6 +1542,12 @@ function MethodologySection() {
   const V = ({ children }) => (
     <span className="font-mono text-txt-primary italic">{children}</span>
   );
+  const hybridEnabled =
+    Boolean(DATA.simulation_config.abm_enabled) ||
+    String(DATA.simulation_config.cascade_source || "").startsWith("abm");
+  const cascadeStepDetail = hybridEnabled
+    ? `${DATA.simulation_config.abm_mode || "surrogate"} mode, ${fmtNum(DATA.simulation_config.cascade_replay_path_count, 0)} paths × ${fmtNum(DATA.simulation_config.cascade_account_count, 0)} accounts`
+    : "512 paths × 5,000 accounts, terminal_price_interp";
 
   return (
     <Panel title="Methodology & Formulas" icon={Info} accentColor="#f0b429">
@@ -1521,7 +1646,9 @@ function MethodologySection() {
                 <div>θ(t) = θ<sub>base</sub> + β<sub>vol</sub> × σ<sub>ETH</sub> + β<sub>price</sub> × ΔS/S</div>
               </div>
             }
-            note="Mean-reverting utilization with cascade shocks from cross-asset liquidation activity."
+            note={hybridEnabled
+              ? "Mean-reverting utilization with inner ABM endogenous shocks projected into outer Monte Carlo paths."
+              : "Mean-reverting utilization with cascade shocks from cross-asset liquidation activity."}
           />
 
           {/* Formula 9: Cascade Channel */}
@@ -1595,7 +1722,7 @@ function MethodologySection() {
             ["5", "Build position", "10-loop geometric series, leverage = 7.856×"],
             ["6", "Simulate ETH price paths", "GBM, 10,000 paths × 30d, dt=0.00274"],
             ["7", "Simulate utilization paths", "OU process + cascade shocks"],
-            ["8", "Replay liquidation cascades", "512 paths × 5,000 accounts, terminal_price_interp"],
+            ["8", hybridEnabled ? "Run inner ABM cascade" : "Replay liquidation cascades", cascadeStepDetail],
             ["9", "Compute borrow rates", "Two-slope model from simulated utilization"],
             ["10", "Compute exchange rate paths", "CAPO-capped staking yield + slashing"],
             ["11", "Compute P&L & risk metrics", "VaR, CVaR, max DD, HF trajectories"],
@@ -1854,7 +1981,7 @@ export default function RiskDashboard() {
   }, [loadFromApi]);
 
   /* Loading state */
-  if (loading) {
+  if (loading && !data) {
     return <LoadingScreen message={retryMsg} isRetrying={!!retryMsg} />;
   }
 
@@ -1873,6 +2000,15 @@ export default function RiskDashboard() {
   return (
     <DataContext.Provider value={data}>
       <div className="min-h-screen" style={{ background: "#0a0b0d" }}>
+        {loading && data && (
+          <div className="px-6 py-2 bg-[rgba(240,180,41,0.08)] border-b border-[rgba(240,180,41,0.2)]">
+            <div className="max-w-[1600px] mx-auto font-mono text-[11px] text-[#f0b429] flex items-center gap-2">
+              <Loader2 size={12} className="animate-spin" />
+              <span>{retryMsg || "Running simulation in background..."}</span>
+            </div>
+          </div>
+        )}
+
         {/* Section A: Masthead (with data source badge injected) */}
         <Masthead
           dataSourceSlot={

@@ -1,5 +1,5 @@
 """
-Optional account-level cohort fetcher for WETH-collateral liquidation replay.
+Optional account-level cohort fetcher for cross-asset collateral replay.
 
 Uses the Messari standardized Aave V3 subgraph schema (positions with
 side: BORROWER/COLLATERAL).
@@ -27,10 +27,22 @@ from models.account_liquidation_replay import AccountState, CohortMetadata
 
 
 DEFAULT_ETH_LIQ_THRESHOLD = 0.80
+ENTRY_HF_EXCLUSION_THRESHOLD = 1.0
+ENTRY_HF_MARGINAL_THRESHOLD = 1.05
 
 
 def _is_weth_symbol(symbol: Any) -> bool:
     return str(symbol or "").strip().upper() == "WETH"
+
+
+def _is_steth_like_symbol(symbol: Any) -> bool:
+    text = str(symbol or "").strip().upper()
+    return text in {"STETH", "WSTETH"}
+
+
+def _is_eth_pool_borrow_symbol(symbol: Any) -> bool:
+    text = str(symbol or "").strip().upper()
+    return text in {"WETH", "ETH"}
 
 
 def _stable_bucket(symbol: Any) -> str | None:
@@ -100,21 +112,33 @@ def _build_weth_collateral_accounts(
                 "debt_eth": 0.0,
                 "debt_usdc": 0.0,
                 "debt_usdt": 0.0,
+                "debt_eth_pool_usd": 0.0,
+                "debt_eth_pool_eth": 0.0,
+                "debt_other_usd": 0.0,
                 "weth_collateral_eth": 0.0,
+                "steth_collateral_eth": 0.0,
+                "other_collateral_eth": 0.0,
                 "weighted_lt_numer": 0.0,
             },
         )
         state["debt_eth"] += debt_eth
         market = pos.get("market") or {}
         token = market.get("inputToken") or {}
+        symbol = token.get("symbol")
         stable_bucket = _stable_bucket(token.get("symbol"))
         debt_usd = _position_value_in_usd(pos)
         if stable_bucket == "usdc" and debt_usd > 0.0:
             state["debt_usdc"] += debt_usd
         elif stable_bucket == "usdt" and debt_usd > 0.0:
             state["debt_usdt"] += debt_usd
+        elif _is_eth_pool_borrow_symbol(symbol):
+            state["debt_eth_pool_eth"] += debt_eth
+            if debt_usd > 0.0:
+                state["debt_eth_pool_usd"] += debt_usd
+        elif debt_usd > 0.0:
+            state["debt_other_usd"] += debt_usd
 
-    # Accumulate WETH-collateral from COLLATERAL positions.
+    # Accumulate collateral from COLLATERAL positions.
     for pos in collateral_positions:
         account = pos.get("account") or {}
         user_id = str(account.get("id") or "").strip().lower()
@@ -134,8 +158,6 @@ def _build_weth_collateral_accounts(
         market = pos.get("market") or {}
         token = market.get("inputToken") or {}
         symbol = token.get("symbol")
-        if not _is_weth_symbol(symbol):
-            continue
 
         collateral_eth = _position_value_in_eth(pos, eth_price_usd)
         if collateral_eth <= 0.0:
@@ -147,14 +169,25 @@ def _build_weth_collateral_accounts(
         )
 
         state = per_user[user_id]
-        state["weth_collateral_eth"] += collateral_eth
+        if _is_weth_symbol(symbol):
+            state["weth_collateral_eth"] += collateral_eth
+        elif _is_steth_like_symbol(symbol):
+            state["steth_collateral_eth"] += collateral_eth
+        else:
+            state["other_collateral_eth"] += collateral_eth
         state["weighted_lt_numer"] += collateral_eth * liq_threshold
 
     accounts: list[AccountState] = []
     fallback_stable_count = 0
+    candidate_count = 0
+    entry_hf_marginal_count = 0
+    entry_hf_underwater_excluded = 0
     for user_id, state in per_user.items():
         debt_eth = float(state["debt_eth"])
-        collateral_eth = float(state["weth_collateral_eth"])
+        collateral_weth = float(state["weth_collateral_eth"])
+        collateral_steth = float(state["steth_collateral_eth"])
+        collateral_other = float(state["other_collateral_eth"])
+        collateral_eth = collateral_weth + collateral_steth + collateral_other
         if debt_eth <= 0.0:
             continue
         if collateral_eth <= 0.0:
@@ -162,20 +195,37 @@ def _build_weth_collateral_accounts(
 
         debt_usdc = float(state["debt_usdc"])
         debt_usdt = float(state["debt_usdt"])
-        if debt_usdc <= 0.0 and debt_usdt <= 0.0:
+        debt_eth_pool_usd = float(state["debt_eth_pool_usd"])
+        debt_eth_pool_eth = float(state["debt_eth_pool_eth"])
+        debt_other_usd = float(state["debt_other_usd"])
+        assigned_explicit = debt_usdc + debt_usdt + debt_eth_pool_usd + debt_other_usd
+        if assigned_explicit <= 0.0:
             debt_usdc = debt_eth * eth_price_usd
             fallback_stable_count += 1
 
         avg_lt = state["weighted_lt_numer"] / max(collateral_eth, np.finfo(float).eps)
+        entry_hf = collateral_eth * avg_lt / max(debt_eth, np.finfo(float).eps)
+        candidate_count += 1
+        if entry_hf <= ENTRY_HF_MARGINAL_THRESHOLD:
+            entry_hf_marginal_count += 1
+        if entry_hf <= ENTRY_HF_EXCLUSION_THRESHOLD:
+            entry_hf_underwater_excluded += 1
+            continue
+
         accounts.append(
             AccountState(
                 account_id=user_id,
                 collateral_eth=collateral_eth,
                 debt_eth=debt_eth,
                 avg_lt=float(np.clip(avg_lt, 0.0, 1.0)),
-                collateral_weth=collateral_eth,
+                collateral_weth=collateral_weth,
+                collateral_steth_eth=collateral_steth,
+                collateral_other_eth=collateral_other,
                 debt_usdc=debt_usdc,
                 debt_usdt=debt_usdt,
+                debt_eth_pool_usd=debt_eth_pool_usd,
+                debt_eth_pool_eth=debt_eth_pool_eth,
+                debt_other_usd=debt_other_usd,
             )
         )
 
@@ -184,8 +234,19 @@ def _build_weth_collateral_accounts(
             "USDC/USDT debt breakdown missing for "
             f"{fallback_stable_count} accounts; used legacy debt fallback"
         )
+    if entry_hf_underwater_excluded > 0:
+        warnings.append(
+            "Excluded "
+            f"{entry_hf_underwater_excluded} accounts with entry HF<={ENTRY_HF_EXCLUSION_THRESHOLD:.2f}"
+        )
+    if candidate_count > 0 and entry_hf_marginal_count > 0:
+        warnings.append(
+            "Entry HF<=1.05 cohort share: "
+            f"{entry_hf_marginal_count}/{candidate_count} "
+            f"({100.0 * entry_hf_marginal_count / candidate_count:.2f}%)"
+        )
     if not accounts:
-        warnings.append("No WETH-collateral accounts with positive debt found")
+        warnings.append("No collateralized accounts with positive debt found")
     return accounts, warnings
 
 
@@ -198,8 +259,8 @@ def fetch_account_cohort(
     Fetch account cohort for account-level liquidation replay.
 
     Filtering assumptions:
-    - Cohort is restricted to users with positive debt and WETH-collateral exposure.
-    - Only collateral positions with inputToken symbol exactly "WETH" are included.
+    - Cohort is restricted to users with positive debt and positive collateral.
+    - Collateral includes all enabled collateral positions.
     - Debt is aggregated across all borrowed reserves and converted to ETH using
       inputTokenPriceUSD from the subgraph.
     """

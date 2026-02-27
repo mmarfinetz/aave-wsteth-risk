@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from config.params import SimulationConfig, load_params
+from config.params import ABMConfig, SimulationConfig, WETHExecutionParams, load_params
 from data.account_cohort_fetcher import fetch_account_cohort_from_env
 from data.subgraph_fetcher import fetch_subgraph_cohort_analytics_from_env
 from dashboard import Dashboard
@@ -86,7 +86,7 @@ def resolve_account_level_cascade_params(use_account_level_cascade: bool) -> dic
 
     if not accounts:
         warnings = ", ".join(metadata.warnings) if metadata.warnings else ""
-        reason = "No eligible ETH-collateral accounts returned"
+        reason = "No eligible collateralized accounts returned"
         if warnings:
             reason = f"{reason}; {warnings}"
         return {
@@ -151,10 +151,73 @@ def main():
         help="Max accounts kept in account-level replay by debt rank (default: 5000)",
     )
     parser.add_argument(
+        "--abm-enabled",
+        action="store_true",
+        help="Enable inner agent-based cascade simulation layer",
+    )
+    parser.add_argument(
+        "--abm-mode",
+        choices=["off", "surrogate", "full"],
+        default="off",
+        help="ABM mode: off|surrogate|full (default: off)",
+    )
+    parser.add_argument(
+        "--abm-max-paths",
+        type=int,
+        default=256,
+        help="Max paths processed by ABM before projection (default: 256)",
+    )
+    parser.add_argument(
+        "--abm-max-accounts",
+        type=int,
+        default=5000,
+        help="Max accounts processed by ABM (default: 5000)",
+    )
+    parser.add_argument(
+        "--abm-projection-method",
+        choices=["terminal_price_interp", "path_factor_interp"],
+        default="terminal_price_interp",
+        help="Projection method for ABM surrogate mode (default: terminal_price_interp)",
+    )
+    parser.add_argument(
+        "--abm-liquidator-competition",
+        type=float,
+        default=0.35,
+        help="Liquidator competition intensity in ABM [0,1] (default: 0.35)",
+    )
+    parser.add_argument(
+        "--abm-arb-enabled",
+        dest="abm_arb_enabled",
+        action="store_true",
+        help="Enable arbitrageur agent response in ABM",
+    )
+    parser.add_argument(
+        "--abm-arb-disabled",
+        dest="abm_arb_enabled",
+        action="store_false",
+        help="Disable arbitrageur agent response in ABM",
+    )
+    parser.set_defaults(abm_arb_enabled=True)
+    parser.add_argument(
+        "--abm-lp-response-strength",
+        type=float,
+        default=0.50,
+        help="LP response strength in ABM [0,2] (default: 0.50)",
+    )
+    parser.add_argument(
+        "--abm-random-seed-offset",
+        type=int,
+        default=10_000,
+        help="ABM RNG seed offset added to simulation seed (default: 10000)",
+    )
+    parser.add_argument(
         "--adv-weth",
         type=float,
-        default=2_000_000.0,
-        help="WETH ADV for quadratic execution-cost model, in WETH/day (default: 2,000,000)",
+        default=None,
+        help=(
+            "WETH ADV override for execution-cost model, in WETH/day "
+            "(default: fetched on-chain ADV when available)"
+        ),
     )
     parser.add_argument(
         "--k-bps",
@@ -173,6 +236,33 @@ def main():
         type=float,
         default=500.0,
         help="Maximum execution cost in bps after clamping (default: 500)",
+    )
+    parser.add_argument(
+        "--k-vol",
+        type=float,
+        default=None,
+        help=(
+            "Volatility-uplift coefficient for liquidation execution costs; "
+            "if omitted, uses nested/default precedence"
+        ),
+    )
+    parser.add_argument(
+        "--sigma-lookback-days",
+        type=int,
+        default=None,
+        help=(
+            "Lookback window in days for rolling annualized sigma paths; "
+            "if omitted, uses nested/default precedence"
+        ),
+    )
+    parser.add_argument(
+        "--sigma-base-annualized",
+        type=float,
+        default=None,
+        help=(
+            "Baseline annualized sigma for volatility multiplier; "
+            "if omitted, uses nested/default precedence"
+        ),
     )
 
     args = parser.parse_args()
@@ -220,17 +310,50 @@ def main():
             if params.get("cohort_fetch_error"):
                 print(f"  [WARN] Subgraph reason: {params['cohort_fetch_error']}")
 
+    abm_mode = args.abm_mode
+    if args.abm_enabled and abm_mode == "off":
+        abm_mode = "surrogate"
+    abm_enabled = abm_mode != "off"
+    needs_account_cascade_inputs = args.use_account_level_cascade or abm_enabled
+
     account_cascade_params = resolve_account_level_cascade_params(
-        args.use_account_level_cascade
+        needs_account_cascade_inputs
     )
     params.update(account_cascade_params)
     params["account_replay_max_paths"] = int(args.account_replay_max_paths)
     params["account_replay_max_accounts"] = int(args.account_replay_max_accounts)
-    params["adv_weth"] = float(args.adv_weth)
+    params["abm"] = ABMConfig(
+        enabled=abm_enabled,
+        mode=abm_mode,
+        max_paths=int(args.abm_max_paths),
+        max_accounts=int(args.abm_max_accounts),
+        projection_method=str(args.abm_projection_method),
+        liquidator_competition=float(args.abm_liquidator_competition),
+        arb_enabled=bool(args.abm_arb_enabled),
+        lp_response_strength=float(args.abm_lp_response_strength),
+        random_seed_offset=int(args.abm_random_seed_offset),
+    )
+    params["abm_enabled"] = abm_enabled
+    params["abm_mode"] = abm_mode
+    params["abm_max_paths"] = int(args.abm_max_paths)
+    params["abm_max_accounts"] = int(args.abm_max_accounts)
+    params["abm_projection_method"] = str(args.abm_projection_method)
+    params["abm_liquidator_competition"] = float(args.abm_liquidator_competition)
+    params["abm_arb_enabled"] = bool(args.abm_arb_enabled)
+    params["abm_lp_response_strength"] = float(args.abm_lp_response_strength)
+    params["abm_random_seed_offset"] = int(args.abm_random_seed_offset)
+    if args.adv_weth is not None:
+        params["adv_weth"] = float(args.adv_weth)
     params["k_bps"] = float(args.k_bps)
     params["min_bps"] = float(args.min_bps)
     params["max_bps"] = float(args.max_bps)
-    if args.use_account_level_cascade:
+    if args.k_vol is not None:
+        params["k_vol"] = float(args.k_vol)
+    if args.sigma_lookback_days is not None:
+        params["sigma_lookback_days"] = int(args.sigma_lookback_days)
+    if args.sigma_base_annualized is not None:
+        params["sigma_base_annualized"] = float(args.sigma_base_annualized)
+    if needs_account_cascade_inputs:
         if params.get("cascade_source") == "account_replay":
             metadata = params.get("cascade_cohort_metadata")
             account_count = getattr(metadata, "account_count", None)
@@ -240,6 +363,10 @@ def main():
                 "  [DATA] Loaded account-level cascade cohort: "
                 f"accounts={account_count}"
             )
+            if metadata is not None:
+                metadata_warnings = list(getattr(metadata, "warnings", []) or [])
+                for warning in metadata_warnings:
+                    print(f"  [WARN] Cohort: {warning}")
             print(
                 "  [DATA] Replay acceleration caps: "
                 f"paths={args.account_replay_max_paths}, "
@@ -247,9 +374,14 @@ def main():
             )
             print(
                 "  [DATA] WETH execution model: "
-                f"ADV={args.adv_weth:,.0f} WETH/day, "
+                f"ADV={float(params.get('adv_weth', getattr(params.get('weth_execution'), 'adv_weth', WETHExecutionParams.adv_weth))):,.0f} WETH/day, "
                 f"k={args.k_bps:.2f} bps, "
-                f"clamp=[{args.min_bps:.2f}, {args.max_bps:.2f}] bps"
+                f"clamp=[{args.min_bps:.2f}, {args.max_bps:.2f}] bps, "
+                f"k_vol={'default' if args.k_vol is None else f'{args.k_vol:.4f}'}, "
+                "sigma_lookback_days="
+                f"{'default' if args.sigma_lookback_days is None else args.sigma_lookback_days}, "
+                "sigma_base_annualized="
+                f"{'default' if args.sigma_base_annualized is None else f'{args.sigma_base_annualized:.4f}'}"
             )
         else:
             print(
@@ -261,6 +393,17 @@ def main():
                     "  [WARN] Account-level reason: "
                     f"{params['cascade_fallback_reason']}"
                 )
+    if abm_enabled:
+        print(
+            "  [DATA] ABM enabled: "
+            f"mode={abm_mode}, max_paths={args.abm_max_paths}, "
+            f"max_accounts={args.abm_max_accounts}, "
+            f"projection={args.abm_projection_method}, "
+            f"liq_comp={args.abm_liquidator_competition:.2f}, "
+            f"arb={'on' if args.abm_arb_enabled else 'off'}, "
+            f"lp_strength={args.abm_lp_response_strength:.2f}, "
+            f"seed_offset={args.abm_random_seed_offset}"
+        )
 
     if args.cascade_avg_ltv != 0.70:
         params["cascade_avg_ltv"] = args.cascade_avg_ltv
@@ -321,7 +464,21 @@ def main():
     print(f"  CVaR 99%:              {rm['cvar_99_eth']:.4f} ETH")
     print(f"  Max Drawdown (mean):   {rm['max_drawdown_mean_eth']:.4f} ETH")
     print(f"  Max Drawdown (95th):   {rm['max_drawdown_95_eth']:.4f} ETH")
-    print(f"  Liquidation Prob:      {rm['prob_liquidation_pct']:.2f}%")
+    liq_source = rm.get("prob_liquidation_source", "position_hf")
+    if liq_source == "protocol_account_replay":
+        liq_label = "cohort replay"
+    else:
+        liq_label = "position HF<1"
+    print(f"  Liquidation Prob:      {rm['prob_liquidation_pct']:.2f}% ({liq_label})")
+    if rm.get("protocol_liquidation_signal_available", False):
+        print(
+            "  Position HF<1 Prob:    "
+            f"{rm.get('prob_position_liquidation_pct', rm['prob_liquidation_pct']):.2f}%"
+        )
+        print(
+            "  Cohort Liq Prob:       "
+            f"{rm.get('prob_protocol_liquidation_pct', rm['prob_liquidation_pct']):.2f}%"
+        )
     print()
 
     if output.bad_debt_stats:

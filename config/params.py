@@ -6,6 +6,7 @@ Uses data/fetcher.py for live data with cache fallback.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 
 import numpy as np
 
@@ -136,6 +137,14 @@ class WETHExecutionParams:
     # Quadratic impact coefficient in basis points
     min_bps: float = 0.0
     max_bps: float = 500.0
+    k_vol: float = 1.0
+    # Volatility-uplift coefficient for liquidation execution costs
+    kyle_k: float = 3.2
+    # Kyle (1985) depth coefficient used to derive permanent impact lambda from sigma
+    sigma_lookback_days: int = 7
+    # Rolling-sigma lookback used for per-step volatility paths
+    sigma_base_annualized: float = 0.60
+    # Baseline annualized sigma used in volatility multiplier normalization
 
 
 @dataclass(frozen=True)
@@ -150,6 +159,25 @@ class SpreadModelParams:
     # Conservative default: spread widens less / tightens under ETH upside
     corr_eth_vol_default: float = -0.20
     # Conservative default: higher vol tends to compress spread
+    use_realized_exchange_yield: bool = False
+    # If True, use realized d(exchange_rate)/dt as staking-yield proxy in spread paths
+    realized_yield_abs_cap_annual: float = 0.50
+    # Symmetric annualized cap applied when realized exchange-yield mode is enabled
+
+
+@dataclass(frozen=True)
+class ABMConfig:
+    """Agent-based cascade simulation controls."""
+
+    enabled: bool = False
+    mode: str = "off"  # off | surrogate | full
+    max_paths: int = 256
+    max_accounts: int = 5_000
+    projection_method: str = "terminal_price_interp"
+    liquidator_competition: float = 0.35
+    arb_enabled: bool = True
+    lp_response_strength: float = 0.50
+    random_seed_offset: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -514,12 +542,60 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
     Returns dict with all parameter dataclass instances plus metadata.
     """
     try:
-        from data.fetcher import fetch_all, fetch_historical_stress_data
-        fetched = fetch_all(
-            use_cache=True,
-            force_refresh=force_refresh,
-            strict_aave=strict_aave,
+        from data.fetcher import (
+            _is_stale,
+            _load_cache,
+            fetch_all,
+            fetch_historical_stress_data,
         )
+
+        fetched = None
+        sandbox_network_disabled = str(
+            os.getenv("CODEX_SANDBOX_NETWORK_DISABLED", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        # Sandbox sessions may block all external network access. In that case,
+        # prefer real cached protocol data over repeated failed live fetches.
+        if sandbox_network_disabled:
+            if force_refresh:
+                print(
+                    "  [WARN] Sandbox blocks external network access; "
+                    "ignoring force refresh."
+                )
+            cached = _load_cache()
+            if cached is not None:
+                freshness = "fresh" if not _is_stale(cached) else "stale"
+                cached.data_source = (
+                    f"cache ({freshness} — sandbox network disabled)"
+                )
+                fetched = cached
+                print("  [INFO] Sandbox network disabled — using cached data")
+            else:
+                raise RuntimeError(
+                    "External network access is disabled by sandbox and no "
+                    "cached protocol data is available."
+                )
+
+        if fetched is None:
+            try:
+                fetched = fetch_all(
+                    use_cache=True,
+                    force_refresh=force_refresh,
+                    strict_aave=strict_aave,
+                )
+            except RuntimeError as exc:
+                if strict_aave and "Strict Aave fetch failed" in str(exc):
+                    print(
+                        "  [WARN] Strict live Aave fetch failed — retrying "
+                        "with cache-enabled fallback."
+                    )
+                    fetched = fetch_all(
+                        use_cache=True,
+                        force_refresh=False,
+                        strict_aave=False,
+                    )
+                else:
+                    raise
 
         historical_stress_data = []
         try:
@@ -566,6 +642,27 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
             steth_eth_price_history=getattr(fetched, "steth_eth_price_history", []),
             historical_stress_data=historical_stress_data,
         )
+        adv_has_provenance = any(
+            isinstance(entry, dict) and entry.get("name") == "adv_weth"
+            for entry in getattr(fetched, "params_log", [])
+        )
+        default_adv_weth = float(WETHExecutionParams.adv_weth)
+        fetched_adv_weth = _clean_series(
+            [getattr(fetched, "adv_weth", default_adv_weth)],
+            min_points=1,
+        )
+        if (
+            fetched_adv_weth.size == 0
+            or fetched_adv_weth[0] <= 0.0
+            or not adv_has_provenance
+        ):
+            print(
+                "  [WARN] Missing/invalid on-chain WETH ADV provenance — using "
+                f"default ADV={default_adv_weth:,.0f} WETH/day"
+            )
+            resolved_adv_weth = default_adv_weth
+        else:
+            resolved_adv_weth = float(fetched_adv_weth[0])
 
         return {
             "emode": emode,
@@ -573,8 +670,9 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
             "wsteth": wsteth,
             "market": market,
             "curve_pool": curve_pool,
-            "weth_execution": WETHExecutionParams(),
+            "weth_execution": WETHExecutionParams(adv_weth=resolved_adv_weth),
             "spread_model": SpreadModelParams(),
+            "abm": ABMConfig(),
             "weth_total_supply": fetched.weth_total_supply,
             "weth_total_borrows": fetched.weth_total_borrows,
             "aave_oracle_address": fetched.aave_oracle_address,
@@ -611,4 +709,5 @@ DEPEG = DepegParams()
 UTILIZATION = UtilizationParams()
 WETH_EXECUTION = WETHExecutionParams()
 SPREAD_MODEL = SpreadModelParams()
+ABM = ABMConfig()
 SIM_CONFIG = SimulationConfig()

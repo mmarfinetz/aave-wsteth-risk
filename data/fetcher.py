@@ -32,6 +32,7 @@ CACHE_FILE = CACHE_DIR / "params_cache.json"
 
 # Stale threshold: 24 hours
 STALE_THRESHOLD_SECONDS = 86400
+ADV_CACHE_REUSE_SECONDS = 6 * 3600
 _LAST_HTTP_ERROR_CODE: int | None = None
 
 # Aave V3 Ethereum mainnet addresses
@@ -41,6 +42,11 @@ AAVE_V3_ADDRESSES_PROVIDER = "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e"
 WETH_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 WSTETH_ADDRESS = "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
 ETH_CORRELATED_EMODE_CATEGORY = 1
+ERC20_TRANSFER_TOPIC = (
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4d"
+    "f523b3ef"
+)
+ESTIMATED_BLOCKS_PER_DAY = 7_200
 
 # Curve stETH/ETH pool
 CURVE_STETH_POOL = "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022"
@@ -117,6 +123,7 @@ class FetchedData:
     current_weth_utilization: float = 0.78
     weth_total_supply: float = 3_200_000.0
     weth_total_borrows: float = 2_496_000.0
+    adv_weth: float = 2_000_000.0
     eth_collateral_fraction: float = 0.30
 
     # wstETH
@@ -481,6 +488,16 @@ def _get_rpc_url() -> str | None:
     return os.getenv("ETH_RPC_URL") or None
 
 
+def _rpc_endpoints() -> list[str]:
+    """Return RPC endpoint preference order."""
+    endpoints = []
+    user_rpc = _get_rpc_url()
+    if user_rpc:
+        endpoints.append(user_rpc)
+    endpoints.extend(DEFAULT_RPC_ENDPOINTS)
+    return endpoints
+
+
 def _rpc_json_request(endpoint: str, payload: dict,
                       timeout: int = 10) -> dict | None:
     """Send a JSON-RPC POST request. Returns parsed JSON on success, else None."""
@@ -515,13 +532,7 @@ def _rpc_eth_call(to_address: str, call_data: str,
         "method": "eth_call",
         "params": [{"to": to_address, "data": call_data}, "latest"],
     }
-    endpoints = []
-    user_rpc = _get_rpc_url()
-    if user_rpc:
-        endpoints.append(user_rpc)
-    endpoints.extend(DEFAULT_RPC_ENDPOINTS)
-
-    for endpoint in endpoints:
+    for endpoint in _rpc_endpoints():
         result = _rpc_json_request(endpoint, payload, timeout=timeout)
         if result and isinstance(result.get("result"), str):
             value = result["result"]
@@ -542,18 +553,63 @@ def _rpc_gas_price(timeout: int = 10) -> str | None:
         "method": "eth_gasPrice",
         "params": [],
     }
-    endpoints = []
-    user_rpc = _get_rpc_url()
-    if user_rpc:
-        endpoints.append(user_rpc)
-    endpoints.extend(DEFAULT_RPC_ENDPOINTS)
-
-    for endpoint in endpoints:
+    for endpoint in _rpc_endpoints():
         result = _rpc_json_request(endpoint, payload, timeout=timeout)
         if result and isinstance(result.get("result"), str):
             value = result["result"]
             if value.startswith("0x"):
                 return value
+    return None
+
+
+def _rpc_block_number(timeout: int = 10) -> int | None:
+    """Fetch latest Ethereum block number from RPC endpoints."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_blockNumber",
+        "params": [],
+    }
+    for endpoint in _rpc_endpoints():
+        result = _rpc_json_request(endpoint, payload, timeout=timeout)
+        if result and isinstance(result.get("result"), str):
+            raw = result["result"]
+            if isinstance(raw, str) and raw.startswith("0x"):
+                try:
+                    return int(raw, 16)
+                except ValueError:
+                    continue
+    return None
+
+
+def _rpc_get_logs(
+    address: str,
+    from_block: int,
+    to_block: int,
+    *,
+    topics: list[str] | None = None,
+    timeout: int = 20,
+) -> list[dict] | None:
+    """Fetch Ethereum logs over a block range via eth_getLogs."""
+    params: dict[str, Any] = {
+        "address": address,
+        "fromBlock": hex(max(int(from_block), 0)),
+        "toBlock": hex(max(int(to_block), 0)),
+    }
+    if topics:
+        params["topics"] = topics
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getLogs",
+        "params": [params],
+    }
+    for endpoint in _rpc_endpoints():
+        result = _rpc_json_request(endpoint, payload, timeout=timeout)
+        logs = result.get("result") if isinstance(result, dict) else None
+        if isinstance(logs, list):
+            return logs
     return None
 
 
@@ -1117,6 +1173,102 @@ def fetch_wsteth_exchange_rate(data: FetchedData) -> bool:
     return False
 
 
+def fetch_weth_adv_onchain(
+    data: FetchedData,
+    *,
+    lookback_days: int = 7,
+    blocks_per_day: int = ESTIMATED_BLOCKS_PER_DAY,
+    chunk_blocks: int = ESTIMATED_BLOCKS_PER_DAY,
+    min_chunk_blocks: int = 64,
+    min_coverage_ratio: float = 0.25,
+) -> bool:
+    """
+    Estimate WETH ADV from on-chain ERC-20 Transfer logs.
+
+    ADV is computed as trailing mean daily transfer volume across lookback days.
+    """
+    latest_block = _rpc_block_number(timeout=15)
+    if latest_block is None or latest_block <= 0:
+        return False
+
+    lookback_days = max(int(lookback_days), 1)
+    blocks_per_day = max(int(blocks_per_day), 1)
+    chunk_blocks = max(int(chunk_blocks), 1)
+    daily_volumes: list[float] = []
+    partial_days = 0
+
+    for day_idx in range(lookback_days):
+        day_to = max(latest_block - day_idx * blocks_per_day, 0)
+        day_from = max(day_to - blocks_per_day + 1, 0)
+
+        day_volume_weth = 0.0
+        covered_blocks = 0
+        cursor = day_from
+        active_chunk = max(chunk_blocks, min_chunk_blocks)
+        while cursor <= day_to:
+            chunk_to = min(cursor + active_chunk - 1, day_to)
+            logs = _rpc_get_logs(
+                WETH_ADDRESS,
+                cursor,
+                chunk_to,
+                topics=[ERC20_TRANSFER_TOPIC],
+                timeout=20,
+            )
+            if logs is None:
+                if active_chunk > min_chunk_blocks:
+                    active_chunk = max(active_chunk // 2, min_chunk_blocks)
+                    continue
+                # Give up on this sub-range if even the smallest chunk fails.
+                break
+
+            for entry in logs:
+                if not isinstance(entry, dict):
+                    continue
+                raw_value = entry.get("data")
+                if not isinstance(raw_value, str) or not raw_value.startswith("0x"):
+                    continue
+                try:
+                    day_volume_weth += int(raw_value, 16) / 1e18
+                except ValueError:
+                    continue
+
+            covered_blocks += (chunk_to - cursor + 1)
+            cursor = chunk_to + 1
+
+        if covered_blocks <= 0:
+            continue
+
+        coverage_ratio = covered_blocks / max(blocks_per_day, 1)
+        if coverage_ratio < max(float(min_coverage_ratio), 0.0):
+            continue
+
+        if covered_blocks < blocks_per_day:
+            day_volume_weth *= (blocks_per_day / covered_blocks)
+            partial_days += 1
+        daily_volumes.append(day_volume_weth)
+
+    if not daily_volumes:
+        return False
+
+    adv_estimate = float(np.mean(np.asarray(daily_volumes, dtype=float)))
+    if not np.isfinite(adv_estimate) or adv_estimate <= 0.0:
+        return False
+
+    data.adv_weth = round(adv_estimate, 2)
+    source = (
+        "On-chain WETH Transfer logs via eth_getLogs "
+        f"({len(daily_volumes)}d trailing average"
+        f"{', partial-window scaled' if partial_days > 0 else ''})"
+    )
+    data.log_param("adv_weth", data.adv_weth, source)
+    if len(daily_volumes) < lookback_days:
+        print(
+            "  [WARN] WETH ADV computed from partial on-chain log windows; "
+            f"used {len(daily_volumes)}/{lookback_days} days."
+        )
+    return True
+
+
 def fetch_steth_eth_price(data: FetchedData) -> bool:
     """
     Fetch stETH/ETH market price from CoinGecko.
@@ -1425,6 +1577,7 @@ def _save_cache(data: FetchedData) -> None:
         "current_weth_utilization": data.current_weth_utilization,
         "weth_total_supply": data.weth_total_supply,
         "weth_total_borrows": data.weth_total_borrows,
+        "adv_weth": data.adv_weth,
         "eth_collateral_fraction": data.eth_collateral_fraction,
         "wsteth_steth_rate": data.wsteth_steth_rate,
         "staking_apy": data.staking_apy,
@@ -1522,6 +1675,41 @@ def _is_stale(data: FetchedData) -> bool:
         return True
 
 
+def _cached_recent_onchain_adv(
+    cached: FetchedData | None,
+    *,
+    max_age_seconds: int = ADV_CACHE_REUSE_SECONDS,
+) -> float | None:
+    """Return recently cached on-chain ADV if available and provenance-backed."""
+    if cached is None:
+        return None
+
+    cached_adv = _positive_float(getattr(cached, "adv_weth", None))
+    if cached_adv is None:
+        return None
+
+    has_onchain_adv_provenance = any(
+        isinstance(entry, dict)
+        and entry.get("name") == "adv_weth"
+        and (
+            "on-chain" in str(entry.get("source", "")).lower()
+            or "eth_getlogs" in str(entry.get("source", "")).lower()
+        )
+        for entry in getattr(cached, "params_log", [])
+    )
+    if not has_onchain_adv_provenance:
+        return None
+
+    try:
+        updated = datetime.fromisoformat(str(getattr(cached, "last_updated", "")))
+        age = (datetime.now(timezone.utc) - updated).total_seconds()
+        if age <= max(int(max_age_seconds), 0):
+            return float(cached_adv)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 def fetch_all(
     use_cache: bool = True,
     force_refresh: bool = False,
@@ -1575,6 +1763,7 @@ def fetch_all(
         ("ETH price history", fetch_eth_price_history),
         ("stETH/ETH price history", fetch_steth_eth_price_history),
         ("Aave WETH params", fetch_aave_weth_params),
+        ("WETH ADV (on-chain)", fetch_weth_adv_onchain),
         ("ETH gas price", fetch_eth_gas_price),
         ("wstETH exchange rate", fetch_wsteth_exchange_rate),
         ("stETH/ETH market price", fetch_steth_eth_price),
@@ -1585,7 +1774,56 @@ def fetch_all(
 
     for name, fetcher in sources:
         try:
-            success = fetcher(data)
+            if (
+                name == "WETH ADV (on-chain)"
+                and not force_refresh
+                and cached is not None
+            ):
+                recent_adv = _cached_recent_onchain_adv(cached)
+                if recent_adv is not None:
+                    data.adv_weth = round(float(recent_adv), 2)
+                    data.log_param(
+                        "adv_weth",
+                        data.adv_weth,
+                        (
+                            "cache reuse — recent on-chain WETH ADV "
+                            f"({cached.last_updated})"
+                        ),
+                    )
+                    print(
+                        "  [INFO] Reusing recent cached on-chain WETH ADV "
+                        f"({data.adv_weth:,.0f} WETH/day)"
+                    )
+                    success = True
+                else:
+                    success = fetcher(data)
+            else:
+                success = fetcher(data)
+            if (
+                not success
+                and name == "WETH ADV (on-chain)"
+                and cached is not None
+            ):
+                cached_adv = _positive_float(getattr(cached, "adv_weth", None))
+                cached_has_adv_provenance = any(
+                    isinstance(entry, dict) and entry.get("name") == "adv_weth"
+                    for entry in getattr(cached, "params_log", [])
+                )
+                if cached_adv is not None and cached_has_adv_provenance:
+                    data.adv_weth = round(float(cached_adv), 2)
+                    data.log_param(
+                        "adv_weth",
+                        data.adv_weth,
+                        (
+                            "cache fallback — prior on-chain WETH ADV "
+                            f"({cached.last_updated})"
+                        ),
+                    )
+                    print(
+                        "  [INFO] Using cached on-chain WETH ADV fallback "
+                        f"({data.adv_weth:,.0f} WETH/day)"
+                    )
+                    success = True
             if success:
                 print(f"  [OK] Fetched {name}")
                 fetch_succeeded = True
