@@ -7,6 +7,7 @@ from data.subgraph_fetcher import (
     _is_gateway_url_without_embedded_key,
     compute_cohort_analytics,
     fetch_subgraph_cohort_analytics,
+    fetch_subgraph_position_snapshot,
     fetch_subgraph_cohort_analytics_from_env,
 )
 
@@ -116,6 +117,22 @@ def test_fetch_subgraph_cohort_analytics_uses_fetched_rows(monkeypatch):
     assert analytics["borrower_count"] == 3
     assert analytics["avg_ltv_weighted"] > 0.0
     assert "cohort_liquidation_exposure" in analytics
+
+
+def test_fetch_subgraph_position_snapshot_returns_reusable_rows(monkeypatch):
+    monkeypatch.setattr(
+        "data.subgraph_fetcher._paginate_positions",
+        lambda subgraph_url, query, **kwargs: (
+            _sample_borrow_positions() if "BORROWER" in query
+            else _sample_collateral_positions()
+        ),
+    )
+
+    snapshot = fetch_subgraph_position_snapshot("https://example.invalid/subgraph")
+
+    assert len(snapshot.borrow_positions) == 4
+    assert len(snapshot.collateral_positions) == 4
+    assert snapshot.eth_price_usd == pytest.approx(ETH_PRICE_USD)
 
 
 def test_fetch_subgraph_from_env_requires_url(monkeypatch):

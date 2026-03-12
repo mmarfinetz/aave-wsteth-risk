@@ -142,7 +142,7 @@ class GBMSimulator:
             Column 0 is s0.
         """
         n_paths = n_paths or self.config.n_simulations
-        n_steps = n_steps or self.config.horizon_days
+        n_steps = n_steps or self.config.grid.n_steps
         dt = dt or self.config.dt
         sigma = sigma if sigma is not None else self.sigma
         if sigma is None:

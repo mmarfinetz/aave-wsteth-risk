@@ -92,7 +92,9 @@ class TestUtilizationModel:
         from models.price_simulation import GBMSimulator
         from config.params import SimulationConfig
 
-        config = SimulationConfig(n_simulations=500, horizon_days=30, seed=42)
+        config = SimulationConfig.legacy_profile(
+            n_simulations=500, horizon_days=30, seed=42
+        )
         gbm = GBMSimulator(mu=0.0, sigma=0.60, config=config)
         eth_paths = gbm.simulate(s0=2500.0, n_paths=500, n_steps=30)
 

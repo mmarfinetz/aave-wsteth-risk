@@ -2,10 +2,12 @@
 CLI entry point for the wstETH/ETH Looping Strategy Risk Dashboard.
 
 Usage:
-    python run_dashboard.py --capital 10 --loops 10 --simulations 10000 --horizon 30
+    python run_dashboard.py --capital 10 --loops 10 --simulations 10000
 """
 
 import argparse
+import json
+import os
 import time
 from pathlib import Path
 
@@ -14,96 +16,31 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from config.params import ABMConfig, SimulationConfig, WETHExecutionParams, load_params
-from data.account_cohort_fetcher import fetch_account_cohort_from_env
-from data.subgraph_fetcher import fetch_subgraph_cohort_analytics_from_env
 from dashboard import Dashboard
+from data.account_cohort_fetcher import fetch_account_cohort_from_env
+from dashboard_service import (
+    DEFAULT_CASCADE_AVG_LT,
+    DEFAULT_CASCADE_AVG_LTV,
+    load_subgraph_runtime_bundle,
+    resolve_account_level_cascade_params as _resolve_account_level_cascade_params,
+)
 
 
-def resolve_subgraph_cohort_params(use_subgraph_cohort: bool) -> dict:
-    """
-    Resolve optional borrower/cohort analytics from Aave subgraph.
-
-    Returns params payload to merge into dashboard inputs.
-    """
-    if not use_subgraph_cohort:
-        return {"cohort_source": "onchain_default"}
-
-    try:
-        analytics = fetch_subgraph_cohort_analytics_from_env()
-        if not isinstance(analytics, dict):
-            raise RuntimeError("Subgraph analytics payload is not a dict")
-    except Exception as exc:
-        return {
-            "cohort_source": "onchain_default_subgraph_fallback",
-            "cohort_fetch_error": str(exc),
-        }
-
-    resolved = {
-        "cohort_source": "aave_subgraph",
-        "cohort_analytics": analytics,
-    }
-
-    avg_ltv = analytics.get("avg_ltv_weighted")
-    avg_lt = analytics.get("avg_lt_weighted")
-    try:
-        if avg_ltv is not None:
-            resolved["cascade_avg_ltv"] = float(avg_ltv)
-    except (TypeError, ValueError):
-        pass
-    try:
-        if avg_lt is not None:
-            resolved["cascade_avg_lt"] = float(avg_lt)
-    except (TypeError, ValueError):
-        pass
-    return resolved
-
-
-def resolve_account_level_cascade_params(use_account_level_cascade: bool) -> dict:
-    """
-    Resolve optional account-level replay inputs from Aave subgraph.
-
-    Returns params payload to merge into dashboard inputs.
-    """
-    if not use_account_level_cascade:
-        return {
-            "use_account_level_cascade": False,
-            "cascade_source": "aggregate_proxy",
-            "cascade_fallback_reason": None,
-            "cascade_account_cohort": [],
-            "cascade_cohort_metadata": None,
-        }
-
-    try:
-        accounts, metadata = fetch_account_cohort_from_env()
-    except Exception as exc:
-        return {
-            "use_account_level_cascade": True,
-            "cascade_source": "account_replay_fallback",
-            "cascade_fallback_reason": str(exc),
-            "cascade_account_cohort": [],
-            "cascade_cohort_metadata": None,
-        }
-
-    if not accounts:
-        warnings = ", ".join(metadata.warnings) if metadata.warnings else ""
-        reason = "No eligible collateralized accounts returned"
-        if warnings:
-            reason = f"{reason}; {warnings}"
-        return {
-            "use_account_level_cascade": True,
-            "cascade_source": "account_replay_fallback",
-            "cascade_fallback_reason": reason,
-            "cascade_account_cohort": [],
-            "cascade_cohort_metadata": metadata,
-        }
-
-    return {
-        "use_account_level_cascade": True,
-        "cascade_source": "account_replay",
-        "cascade_fallback_reason": None,
-        "cascade_account_cohort": accounts,
-        "cascade_cohort_metadata": metadata,
-    }
+def resolve_account_level_cascade_params(
+    use_account_level_cascade: bool,
+    bucket_mapping: dict | None = None,
+    *,
+    preloaded_accounts=None,
+    preloaded_metadata=None,
+) -> dict:
+    """Compatibility wrapper for tests and callers patching the CLI module."""
+    return _resolve_account_level_cascade_params(
+        use_account_level_cascade,
+        bucket_mapping=bucket_mapping,
+        preloaded_accounts=preloaded_accounts,
+        preloaded_metadata=preloaded_metadata,
+        fetch_account_cohort=fetch_account_cohort_from_env,
+    )
 
 
 def main():
@@ -116,23 +53,137 @@ def main():
                         help="Number of leverage loops (default: 10)")
     parser.add_argument("--simulations", type=int, default=10_000,
                         help="Number of Monte Carlo paths (default: 10000)")
-    parser.add_argument("--horizon", type=int, default=30,
-                        help="Simulation horizon in days (default: 30)")
+    parser.add_argument(
+        "--profile",
+        choices=["operational", "legacy"],
+        default="operational",
+        help=(
+            "Simulation profile preset: operational (1d, 10m steps) "
+            "or legacy (30d, daily step)"
+        ),
+    )
+    parser.add_argument(
+        "--horizon",
+        type=float,
+        default=None,
+        help=(
+            "Simulation horizon in days. Defaults from --profile "
+            "(operational=1.0, legacy=30.0)"
+        ),
+    )
+    parser.add_argument(
+        "--timestep-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Simulation timestep in minutes (highest precedence when set). "
+            "Defaults from --profile when neither timestep flag is set."
+        ),
+    )
+    parser.add_argument(
+        "--timestep-days",
+        type=float,
+        default=None,
+        help=(
+            "Simulation timestep in days (used when --timestep-minutes is unset)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-large-step-grid",
+        action="store_true",
+        help=(
+            "Override hard cap on maximum grid steps. Use only when intentionally "
+            "running high-resolution scenarios."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     parser.add_argument("--json", action="store_true",
                         help="Output raw JSON instead of formatted text")
     parser.add_argument("--fetch", action="store_true",
                         help="Force refresh data from APIs")
+    parser.add_argument(
+        "--staking-apy-method",
+        choices=["latest", "trailing_7d_avg"],
+        default=None,
+        help=(
+            "Staking APY sourcing methodology. If omitted, short horizons "
+            "default to trailing_7d_avg."
+        ),
+    )
+    parser.add_argument(
+        "--staking-apy-lookback-days",
+        type=int,
+        default=7,
+        help="Lookback window for trailing staking APY method (default: 7)",
+    )
+    parser.add_argument(
+        "--exchange-rate-mode",
+        choices=["simple", "capo_slashing"],
+        default=None,
+        help=(
+            "Exchange-rate model mode. If omitted, operational profile uses "
+            "simple and legacy uses capo_slashing."
+        ),
+    )
+    parser.add_argument(
+        "--spread-fixed-staking-yield-mode",
+        action="store_true",
+        help="Use fixed staking-yield carry component in spread dynamics.",
+    )
+    parser.add_argument(
+        "--spread-fixed-staking-yield-apy",
+        type=float,
+        default=None,
+        help="Fixed staking APY used when --spread-fixed-staking-yield-mode is enabled.",
+    )
+    parser.add_argument(
+        "--unwind-cost-model",
+        choices=["curve", "live_0x"],
+        default="curve",
+        help="Unwind cost model: reduced-form curve or live 0x quote mode (default: curve)",
+    )
+    parser.add_argument(
+        "--zerox-slippage-bps",
+        type=int,
+        default=50,
+        help="0x slippage tolerance in bps when --unwind-cost-model=live_0x (default: 50)",
+    )
+    parser.add_argument(
+        "--zerox-chain-id",
+        type=int,
+        default=1,
+        help="0x chain id when --unwind-cost-model=live_0x (default: 1)",
+    )
+    parser.add_argument(
+        "--zerox-base-url",
+        type=str,
+        default="https://api.0x.org",
+        help="0x API base URL when --unwind-cost-model=live_0x",
+    )
+    parser.add_argument(
+        "--zerox-taker",
+        type=str,
+        default=None,
+        help="Taker address for 0x /quote (else ZEROX_TAKER_ADDRESS env var)",
+    )
+    parser.add_argument(
+        "--zerox-use-min-buy-amount",
+        dest="zerox_use_min_buy_amount",
+        action="store_true",
+        help="Use minBuyAmount instead of buyAmount in live 0x unwind mode",
+    )
+    parser.add_argument(
+        "--zerox-use-buy-amount",
+        dest="zerox_use_min_buy_amount",
+        action="store_false",
+        help="Use buyAmount in live 0x unwind mode (default behavior)",
+    )
+    parser.set_defaults(zerox_use_min_buy_amount=False)
     parser.add_argument("--cascade-avg-ltv", type=float, default=0.70,
                         help="Average LTV of ETH-collateral cascade cohort (default: 0.70)")
     parser.add_argument("--cascade-avg-lt", type=float, default=0.80,
                         help="Average liquidation threshold of cascade cohort (default: 0.80)")
-    parser.add_argument(
-        "--use-subgraph-cohort",
-        action="store_true",
-        help="Enable optional borrower/cohort analytics from AAVE_SUBGRAPH_URL",
-    )
     parser.add_argument(
         "--use-account-level-cascade",
         action="store_true",
@@ -149,6 +200,24 @@ def main():
         type=int,
         default=5000,
         help="Max accounts kept in account-level replay by debt rank (default: 5000)",
+    )
+    parser.add_argument(
+        "--account-bucket-mapping-json",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON object overriding account replay bucket mapping "
+            "(collateral/debt symbol rules)."
+        ),
+    )
+    parser.add_argument(
+        "--collateral-bucket-assumptions-json",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON object for collateral bucket assumptions "
+            "(weth/steth_like/other each with beta/haircut)."
+        ),
     )
     parser.add_argument(
         "--abm-enabled",
@@ -266,49 +335,62 @@ def main():
     )
 
     args = parser.parse_args()
+    overall_start = time.perf_counter()
+
+    if args.profile == "legacy":
+        profile_cfg = SimulationConfig.legacy_profile(
+            n_simulations=args.simulations,
+            seed=args.seed,
+        )
+    else:
+        profile_cfg = SimulationConfig.operational_profile(
+            n_simulations=args.simulations,
+            seed=args.seed,
+        )
+
+    horizon_days = (
+        float(args.horizon)
+        if args.horizon is not None
+        else float(profile_cfg.horizon_days)
+    )
+    timestep_minutes = (
+        float(args.timestep_minutes)
+        if args.timestep_minutes is not None
+        else profile_cfg.timestep_minutes
+    )
+    timestep_days = (
+        float(args.timestep_days)
+        if args.timestep_days is not None
+        else profile_cfg.timestep_days
+    )
+    if args.timestep_minutes is not None:
+        timestep_days = None
 
     config = SimulationConfig(
         n_simulations=args.simulations,
-        horizon_days=args.horizon,
+        horizon_days=horizon_days,
+        timestep_minutes=timestep_minutes,
+        timestep_days=timestep_days,
+        allow_step_cap_override=bool(args.allow_large_step_grid),
+        profile_name=args.profile,
         seed=args.seed,
     )
+    grid = config.grid
 
     print("=" * 70)
     print("  wstETH/ETH Looping Strategy Risk Dashboard")
     print("=" * 70)
     print(f"  Capital: {args.capital} ETH | Loops: {args.loops}"
-          f" | Simulations: {args.simulations:,} | Horizon: {args.horizon}d")
+          f" | Simulations: {args.simulations:,} | Horizon: {horizon_days:g}d")
+    print(
+        "  Profile: "
+        f"{args.profile} | Timestep: {grid.dt_days * 24.0 * 60.0:g}m "
+        f"({grid.timestep_source}) | Steps: {grid.n_steps:,}"
+    )
     print("=" * 70)
     print()
-
-    # Attempt to load live params (cache fallback unless --fetch)
-    params = {}
-    try:
-        params = load_params(force_refresh=args.fetch)
-        eth_price_history = params.get("eth_price_history")
-        if eth_price_history:
-            print(f"  [DATA] Loaded {len(eth_price_history)} ETH prices for vol calibration")
-    except Exception as e:
-        print(f"  [WARN] Could not load live params: {e}")
-
-    cohort_params = resolve_subgraph_cohort_params(args.use_subgraph_cohort)
-    params.update(cohort_params)
-    if args.use_subgraph_cohort:
-        if params.get("cohort_source") == "aave_subgraph":
-            cohort = params.get("cohort_analytics", {})
-            print(
-                "  [DATA] Loaded subgraph cohort analytics: "
-                f"borrowers={cohort.get('borrower_count', 'n/a')}, "
-                f"avg_ltv={cohort.get('avg_ltv_weighted', 'n/a')}, "
-                f"avg_lt={cohort.get('avg_lt_weighted', 'n/a')}"
-            )
-        else:
-            print(
-                "  [WARN] Subgraph cohort analytics unavailable; using "
-                "on-chain/default cascade cohort inputs"
-            )
-            if params.get("cohort_fetch_error"):
-                print(f"  [WARN] Subgraph reason: {params['cohort_fetch_error']}")
+    for warning in grid.warnings:
+        print(f"  [WARN] {warning}")
 
     abm_mode = args.abm_mode
     if args.abm_enabled and abm_mode == "off":
@@ -316,10 +398,88 @@ def main():
     abm_enabled = abm_mode != "off"
     needs_account_cascade_inputs = args.use_account_level_cascade or abm_enabled
 
+    # Attempt to load live params (cache fallback unless --fetch)
+    bucket_mapping_override = None
+    if args.account_bucket_mapping_json:
+        try:
+            parsed_mapping = json.loads(args.account_bucket_mapping_json)
+            if not isinstance(parsed_mapping, dict):
+                raise ValueError("mapping must decode to a JSON object")
+            bucket_mapping_override = parsed_mapping
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid --account-bucket-mapping-json value: {exc}"
+            ) from exc
+    collateral_assumptions_override = None
+    if args.collateral_bucket_assumptions_json:
+        try:
+            parsed_assumptions = json.loads(args.collateral_bucket_assumptions_json)
+            if not isinstance(parsed_assumptions, dict):
+                raise ValueError("assumptions must decode to a JSON object")
+            collateral_assumptions_override = parsed_assumptions
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid --collateral-bucket-assumptions-json value: {exc}"
+            ) from exc
+
+    subgraph_bundle = None
+    if needs_account_cascade_inputs:
+        subgraph_bundle = load_subgraph_runtime_bundle(
+            bucket_mapping=bucket_mapping_override,
+            force_refresh=bool(args.fetch),
+            ttl_seconds=0,
+        )
+
+    params = {}
+    try:
+        params = load_params(
+            force_refresh=args.fetch,
+            staking_apy_method=args.staking_apy_method,
+            staking_apy_lookback_days=int(args.staking_apy_lookback_days),
+            horizon_days=horizon_days,
+            cohort_analytics_override=(
+                subgraph_bundle.cohort_analytics if subgraph_bundle is not None else None
+            ),
+        )
+        eth_price_history = params.get("eth_price_history")
+        if eth_price_history:
+            print(f"  [DATA] Loaded {len(eth_price_history)} ETH prices for vol calibration")
+    except Exception as e:
+        raise RuntimeError(f"Could not load required live params: {e}") from e
+    staking_meta = params.get("staking_apy_metadata", {})
+    if isinstance(staking_meta, dict):
+        print(
+            "  [DATA] Staking APY method: "
+            f"{staking_meta.get('method', params.get('staking_apy_method', 'unknown'))} "
+            f"(samples={staking_meta.get('sample_count', 'n/a')}, "
+            f"source={staking_meta.get('source_type', 'n/a')})"
+        )
+
+    if params.get("cohort_source") == "aave_subgraph":
+        cohort = params.get("cohort_analytics", {})
+        print(
+            "  [DATA] Loaded subgraph cohort analytics: "
+            f"borrowers={cohort.get('borrower_count', 'n/a')}, "
+            f"avg_ltv={cohort.get('avg_ltv_weighted', 'n/a')}, "
+            f"avg_lt={cohort.get('avg_lt_weighted', 'n/a')}, "
+            f"eth_collateral_fraction={cohort.get('eth_collateral_fraction', 'n/a')}"
+        )
+
     account_cascade_params = resolve_account_level_cascade_params(
-        needs_account_cascade_inputs
+        needs_account_cascade_inputs,
+        bucket_mapping=bucket_mapping_override,
+        preloaded_accounts=(
+            subgraph_bundle.account_cohort if subgraph_bundle is not None else None
+        ),
+        preloaded_metadata=(
+            subgraph_bundle.account_cohort_metadata if subgraph_bundle is not None else None
+        ),
     )
     params.update(account_cascade_params)
+    if bucket_mapping_override is not None:
+        params["account_bucket_mapping"] = bucket_mapping_override
+    if collateral_assumptions_override is not None:
+        params["collateral_bucket_assumptions"] = collateral_assumptions_override
     params["account_replay_max_paths"] = int(args.account_replay_max_paths)
     params["account_replay_max_accounts"] = int(args.account_replay_max_accounts)
     params["abm"] = ABMConfig(
@@ -353,6 +513,44 @@ def main():
         params["sigma_lookback_days"] = int(args.sigma_lookback_days)
     if args.sigma_base_annualized is not None:
         params["sigma_base_annualized"] = float(args.sigma_base_annualized)
+    params["unwind_cost_model"] = str(args.unwind_cost_model)
+    exchange_rate_mode = (
+        str(args.exchange_rate_mode).strip().lower()
+        if args.exchange_rate_mode is not None
+        else ("simple" if args.profile == "operational" else "capo_slashing")
+    )
+    params["exchange_rate_mode"] = exchange_rate_mode
+    params["spread_fixed_staking_yield_mode"] = bool(args.spread_fixed_staking_yield_mode)
+    if args.spread_fixed_staking_yield_apy is not None:
+        params["spread_fixed_staking_yield_apy"] = float(args.spread_fixed_staking_yield_apy)
+    params["zerox_slippage_bps"] = int(args.zerox_slippage_bps)
+    params["zerox_chain_id"] = int(args.zerox_chain_id)
+    params["zerox_base_url"] = str(args.zerox_base_url)
+    params["zerox_use_min_buy_amount"] = bool(args.zerox_use_min_buy_amount)
+    if args.zerox_taker:
+        params["zerox_taker"] = str(args.zerox_taker)
+    if args.unwind_cost_model == "live_0x":
+        has_api_key = bool(os.getenv("ZEROX_API_KEY", "").strip())
+        has_taker = bool(
+            (args.zerox_taker or "").strip()
+            or os.getenv("ZEROX_TAKER_ADDRESS", "").strip()
+            or os.getenv("ZEROX_TAKER", "").strip()
+        )
+        print(
+            "  [DATA] Live unwind mode: 0x quotes "
+            f"(chain={args.zerox_chain_id}, slippage={args.zerox_slippage_bps} bps, "
+            f"use_min_buy={'yes' if args.zerox_use_min_buy_amount else 'no'})"
+        )
+        if not has_api_key:
+            print("  [WARN] ZEROX_API_KEY not set; dashboard will fail in live_0x mode")
+        if not has_taker:
+            print(
+                "  [WARN] 0x taker not set (--zerox-taker or ZEROX_TAKER_ADDRESS); "
+                "dashboard will fail in live_0x mode"
+            )
+    print(f"  [DATA] Exchange-rate mode: {exchange_rate_mode}")
+    if collateral_assumptions_override is not None:
+        print("  [DATA] Applied custom collateral bucket assumptions from CLI JSON")
     if needs_account_cascade_inputs:
         if params.get("cascade_source") == "account_replay":
             metadata = params.get("cascade_cohort_metadata")
@@ -405,12 +603,12 @@ def main():
             f"seed_offset={args.abm_random_seed_offset}"
         )
 
-    if args.cascade_avg_ltv != 0.70:
+    if args.cascade_avg_ltv != DEFAULT_CASCADE_AVG_LTV:
         params["cascade_avg_ltv"] = args.cascade_avg_ltv
-    if args.cascade_avg_lt != 0.80:
+    if args.cascade_avg_lt != DEFAULT_CASCADE_AVG_LT:
         params["cascade_avg_lt"] = args.cascade_avg_lt
 
-    start = time.time()
+    simulation_start = time.perf_counter()
     dashboard = Dashboard(
         capital_eth=args.capital,
         n_loops=args.loops,
@@ -418,7 +616,8 @@ def main():
         params=params,
     )
     output = dashboard.run(seed=args.seed)
-    elapsed = time.time() - start
+    simulation_elapsed = time.perf_counter() - simulation_start
+    full_elapsed = time.perf_counter() - overall_start
 
     if args.json:
         print(output.to_json())
@@ -433,26 +632,48 @@ def main():
           f" ({ps['total_collateral_wsteth']:.2f} wstETH)")
     print(f"  Total Debt:            {ps['total_debt_weth']:.2f} WETH")
     print(f"  Borrow Rate:           {ps['current_borrow_rate_pct']:.2f}%")
-    print(f"  Net APY:               {ps['net_apy_pct']:.2f}%")
+    print(f"  Current Net APY:       {ps['net_apy_pct']:.2f}%")
     print(f"  Health Factor:         {ps['health_factor']:.4f}")
     print(f"  Liquidation Risk:      {ps['liquidation_risk']}")
     print()
 
     ca = output.current_apy
-    print("CURRENT APY BREAKDOWN")
+    print("CURRENT NET APY DECOMPOSITION")
     print("-" * 40)
-    print(f"  Net APY:               {ca['net']:.2f}%")
+    print(f"  Current Net APY:       {ca['net']:.2f}%")
     print(f"  Gross Yield:           {ca['gross']:.2f}%")
+    print(f"  Staking Yield:         {ca['staking_yield']:.2f}%")
+    print(f"  stETH Supply Yield:    {ca['steth_supply_yield']:.2f}%")
     print(f"  Borrow Cost:           {ca['borrow_cost']:.2f}%")
     print(f"  stETH Supply Income:   {ca['steth_borrow_income_bps']:.1f} bps")
+    check = ca.get("decomposition_check", {})
+    if check:
+        status = "PASS" if check.get("passed") else "FAIL"
+        print(
+            f"  Identity Check:        {status} "
+            f"(residual={check.get('residual', 0.0):.3e}, tol={check.get('tolerance', 0.0):.1e})"
+        )
     print()
 
     af = output.apy_forecast_24h
-    print("APY FORECAST (next 24h)")
+    print("NET APY FORECAST")
     print("-" * 40)
+    print(f"  Label:                 {af.get('label', '+24h expected net APY')}")
+    print(
+        f"  Forecast Time:         {af.get('forecast_time_days', 0.0):.4f} days "
+        f"(step {af.get('step_index', 0)})"
+    )
     print(f"  Mean:                  {af['mean']:.2f}%")
     print(f"  68% CI:               [{af['ci_68'][0]:.2f}%, {af['ci_68'][1]:.2f}%]")
     print(f"  95% CI:               [{af['ci_95'][0]:.2f}%, {af['ci_95'][1]:.2f}%]")
+    forecast_check = af.get("decomposition_check", {})
+    if forecast_check:
+        status = "PASS" if forecast_check.get("passed") else "FAIL"
+        print(
+            f"  Identity Check:        {status} "
+            f"(residual={forecast_check.get('residual', 0.0):.3e}, "
+            f"tol={forecast_check.get('tolerance', 0.0):.1e})"
+        )
     print()
 
     rm = output.risk_metrics
@@ -464,19 +685,23 @@ def main():
     print(f"  CVaR 99%:              {rm['cvar_99_eth']:.4f} ETH")
     print(f"  Max Drawdown (mean):   {rm['max_drawdown_mean_eth']:.4f} ETH")
     print(f"  Max Drawdown (95th):   {rm['max_drawdown_95_eth']:.4f} ETH")
-    liq_source = rm.get("prob_liquidation_source", "position_hf")
-    if liq_source == "protocol_account_replay":
-        liq_label = "cohort replay"
-    else:
-        liq_label = "position HF<1"
-    print(f"  Liquidation Prob:      {rm['prob_liquidation_pct']:.2f}% ({liq_label})")
+    print(
+        "  Loop P(HF<1) by horizon:"
+        f"{rm.get('prob_position_liquidation_pct', rm['prob_liquidation_pct']):.2f}%"
+    )
+    if rm.get("prob_position_liquidation_by_24h_pct") is not None:
+        print(
+            "  Loop P(HF<1) by 24h:   "
+            f"{rm['prob_position_liquidation_by_24h_pct']:.2f}%"
+        )
+    if rm.get("prob_position_liquidation_by_7d_pct") is not None:
+        print(
+            "  Loop P(HF<1) by 7d:    "
+            f"{rm['prob_position_liquidation_by_7d_pct']:.2f}%"
+        )
     if rm.get("protocol_liquidation_signal_available", False):
         print(
-            "  Position HF<1 Prob:    "
-            f"{rm.get('prob_position_liquidation_pct', rm['prob_liquidation_pct']):.2f}%"
-        )
-        print(
-            "  Cohort Liq Prob:       "
+            "  Cohort Replay Liq Prob:"
             f"{rm.get('prob_protocol_liquidation_pct', rm['prob_liquidation_pct']):.2f}%"
         )
     print()
@@ -584,7 +809,8 @@ def main():
               f"  ({cost['avg_bps']:.1f} bps)")
     print()
 
-    print(f"Completed in {elapsed:.2f}s")
+    print(f"Simulation completed in {simulation_elapsed:.2f}s")
+    print(f"Full live request completed in {full_elapsed:.2f}s")
 
 
 if __name__ == "__main__":

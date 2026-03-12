@@ -490,3 +490,75 @@ def test_replay_endogenous_price_impact_amplifies_follow_on_liquidations():
     assert with_impact.diagnostics.cumulative_price_impact_pct is not None
     assert with_impact.diagnostics.cumulative_price_impact_pct[0, -1] > 0.0
     np.testing.assert_allclose(eth_usd_paths, 2_000.0, rtol=0.0, atol=1e-12)
+
+
+def test_replay_bucket_diagnostics_reports_coverage_and_unmapped_residue():
+    engine = AccountLiquidationReplayEngine()
+    account = AccountState(
+        account_id="0xbuckets",
+        collateral_eth=10.0,
+        debt_eth=5.0,
+        avg_lt=0.90,
+        collateral_weth=2.0,
+        collateral_steth_eth=3.0,
+        collateral_other_eth=1.0,
+        debt_usdc=1_000.0,
+        debt_usdt=500.0,
+        debt_eth_pool_usd=500.0,
+        debt_other_usd=0.0,
+    )
+
+    result = engine.simulate(
+        eth_price_paths=np.array([[1.0]], dtype=float),
+        eth_usd_price_paths=np.array([[2_000.0]], dtype=float),
+        accounts=[account],
+        base_deposits=1_000_000.0,
+        base_borrows=700_000.0,
+    )
+    diag = result.diagnostics
+    assert diag.bucket_diagnostics is not None
+
+    collateral = diag.bucket_diagnostics["coverage"]["collateral"]
+    assert collateral["total"] == pytest.approx(10.0)
+    assert collateral["buckets"]["weth"]["pct_of_total"] == pytest.approx(20.0)
+    assert collateral["buckets"]["steth_like"]["pct_of_total"] == pytest.approx(30.0)
+    assert collateral["buckets"]["other"]["pct_of_total"] == pytest.approx(10.0)
+    assert collateral["unmapped_residue"]["pct_of_total"] == pytest.approx(40.0)
+
+    debt = diag.bucket_diagnostics["coverage"]["debt"]
+    assert debt["total"] == pytest.approx(10_000.0)
+    assert debt["buckets"]["usdc"]["pct_of_total"] == pytest.approx(10.0)
+    assert debt["buckets"]["usdt"]["pct_of_total"] == pytest.approx(5.0)
+    assert debt["buckets"]["eth_pool"]["pct_of_total"] == pytest.approx(5.0)
+    assert debt["unmapped_residue"]["pct_of_total"] == pytest.approx(80.0)
+
+
+def test_replay_bucket_diagnostics_tracks_legacy_fallback_counts():
+    engine = AccountLiquidationReplayEngine()
+    account = AccountState(
+        account_id="0xfallback",
+        collateral_eth=3.0,
+        debt_eth=1.0,
+        avg_lt=0.80,
+        collateral_weth=0.0,
+        collateral_steth_eth=0.0,
+        collateral_other_eth=0.0,
+        debt_usdc=0.0,
+        debt_usdt=0.0,
+        debt_eth_pool_usd=0.0,
+        debt_other_usd=0.0,
+    )
+
+    result = engine.simulate(
+        eth_price_paths=np.array([[1.0]], dtype=float),
+        eth_usd_price_paths=np.array([[2_000.0]], dtype=float),
+        accounts=[account],
+        base_deposits=1_000_000.0,
+        base_borrows=700_000.0,
+    )
+
+    fallback = result.diagnostics.bucket_diagnostics["legacy_fallback_counts"]
+    assert fallback["stable_debt_to_usdc"] == 1
+    assert fallback["collateral_to_weth"] == 1
+    assert fallback["stable_debt_to_usdc_pct_accounts"] == pytest.approx(100.0)
+    assert fallback["collateral_to_weth_pct_accounts"] == pytest.approx(100.0)

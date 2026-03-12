@@ -12,7 +12,7 @@ from models.account_liquidation_replay import AccountState, ReplayDiagnostics, R
 
 
 def _small_config() -> SimulationConfig:
-    return SimulationConfig(n_simulations=16, horizon_days=2, seed=7)
+    return SimulationConfig.legacy_profile(n_simulations=16, horizon_days=2, seed=7)
 
 
 def test_dashboard_uses_broad_cascade_defaults_not_emode():
@@ -67,7 +67,7 @@ def test_dashboard_passes_leverage_state_paths_to_depeg_model():
 
     lev = captured.get("leverage_state_paths")
     assert lev is not None
-    assert lev.shape == (dashboard.config.n_simulations, dashboard.config.horizon_days)
+    assert lev.shape == (dashboard.config.n_simulations, dashboard.config.grid.n_steps)
 
 
 def test_dashboard_unwind_costs_use_resolved_market_gas():
@@ -90,14 +90,65 @@ def test_dashboard_unwind_costs_use_resolved_market_gas():
     assert captured["gas_price_gwei"] == pytest.approx(DEFAULT_GAS_PRICE_GWEI, rel=1e-12)
 
 
+def test_dashboard_live_0x_unwind_mode_uses_live_estimator():
+    dashboard = Dashboard(
+        config=_small_config(),
+        params={
+            "unwind_cost_model": "live_0x",
+            "market": MarketParams(gas_price_gwei=0.0),
+            "zerox_api_key": "test-key",
+            "zerox_taker": "0x1111111111111111111111111111111111111111",
+        },
+    )
+    captured = {}
+
+    dashboard.unwind_estimator.portfolio_pct_costs = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("curve unwind estimator should not be used in live_0x mode")
+    )
+
+    def capture_live(*, total_debt_weth: float, gas_price_gwei: float, portfolio_pcts=(0.10, 0.25, 0.50, 1.00)):
+        captured["total_debt_weth"] = total_debt_weth
+        captured["gas_price_gwei"] = gas_price_gwei
+        captured["portfolio_pcts"] = tuple(portfolio_pcts)
+        return {}
+
+    dashboard.live_unwind_estimator.portfolio_pct_costs = capture_live
+    dashboard.stress_engine.run_all = lambda: []
+    dashboard.run(seed=23)
+
+    assert captured["gas_price_gwei"] == pytest.approx(DEFAULT_GAS_PRICE_GWEI, rel=1e-12)
+    assert captured["total_debt_weth"] == pytest.approx(dashboard.position.total_debt_weth)
+    assert captured["portfolio_pcts"] == (0.10, 0.25, 0.50, 1.00)
+
+
+def test_dashboard_live_0x_mode_requires_api_key_and_taker():
+    with pytest.raises(ValueError, match="ZEROX_API_KEY"):
+        Dashboard(
+            config=_small_config(),
+            params={
+                "unwind_cost_model": "live_0x",
+                "zerox_taker": "0x1111111111111111111111111111111111111111",
+            },
+        )
+
+    with pytest.raises(ValueError, match="ZEROX_TAKER_ADDRESS"):
+        Dashboard(
+            config=_small_config(),
+            params={
+                "unwind_cost_model": "live_0x",
+                "zerox_api_key": "test-key",
+            },
+        )
+
+
 def test_full_pipeline_output_schema():
     """E2E smoke test: all required fields present, finite, and JSON-serializable."""
-    config = SimulationConfig(n_simulations=32, horizon_days=3, seed=99)
+    config = SimulationConfig.legacy_profile(n_simulations=32, horizon_days=3, seed=99)
     dashboard = Dashboard(config=config, params={})
     output = dashboard.run(seed=99)
 
     # Required top-level keys
-    for key in ["timestamp", "data_sources", "position_summary", "current_apy",
+    for key in ["timestamp", "schema_version", "schema_compatibility", "data_sources", "position_summary", "current_apy",
                 "apy_forecast_24h", "risk_metrics", "risk_decomposition",
                 "rate_forecast", "utilization_analytics", "stress_tests",
                 "unwind_costs", "bad_debt_stats", "cost_bps_summary",
@@ -113,6 +164,7 @@ def test_full_pipeline_output_schema():
     # JSON round-trip
     parsed = json.loads(output.to_json())
     assert isinstance(parsed, dict)
+    assert parsed["schema_version"] == "2.0.0"
     assert "risk_metrics" in parsed
     assert "unwind_costs" in parsed
     assert "bad_debt_stats" in parsed
@@ -130,8 +182,55 @@ def test_liquidation_probability_defaults_to_position_hf_when_replay_unavailable
     assert rm["prob_protocol_liquidation_pct"] == pytest.approx(0.0)
 
 
-def test_account_replay_liquidation_probability_overrides_position_hf():
-    config = SimulationConfig(n_simulations=10, horizon_days=2, seed=515)
+def test_position_liquidation_breach_curves_track_first_breach_timing():
+    hf_paths = np.array(
+        [
+            [1.02, 0.99, 0.98],
+            [1.05, 1.02, 0.99],
+            [1.04, 1.03, 1.02],
+            [0.99, 0.98, 0.97],
+        ],
+        dtype=float,
+    )
+
+    cumulative = Dashboard._cumulative_threshold_breach_probability(
+        hf_paths,
+        threshold=1.0,
+    )
+    first = Dashboard._first_threshold_breach_probability(
+        hf_paths,
+        threshold=1.0,
+    )
+
+    assert cumulative == pytest.approx([25.0, 50.0, 75.0])
+    assert first == pytest.approx([25.0, 25.0, 25.0])
+
+
+def test_dashboard_outputs_position_liquidation_term_structure():
+    dashboard = Dashboard(config=_small_config(), params={})
+    output = dashboard.run(seed=77)
+    rm = output.risk_metrics
+    ts = output.time_series_diagnostics
+
+    curve = ts["position_liquidation_cumulative_prob_pct"]
+    first = ts["position_liquidation_first_breach_prob_pct"]
+    hf = ts["health_factor"]
+    n_points = len(ts["time_grid_days"])
+
+    assert len(curve) == n_points
+    assert len(first) == n_points
+    assert len(hf["p5"]) == n_points
+    assert len(hf["p50"]) == n_points
+    assert len(hf["p95"]) == n_points
+    assert all(left <= right + 1e-12 for left, right in zip(curve, curve[1:]))
+    assert sum(first) == pytest.approx(curve[-1], abs=1e-9)
+    assert curve[-1] == pytest.approx(rm["prob_position_liquidation_pct"], abs=1e-9)
+    assert rm["prob_position_liquidation_by_24h_pct"] is not None
+    assert rm["prob_position_liquidation_by_7d_pct"] is None
+
+
+def test_account_replay_liquidation_probability_is_secondary_to_position_hf():
+    config = SimulationConfig.legacy_profile(n_simulations=10, horizon_days=2, seed=515)
     params = {
         "use_account_level_cascade": True,
         "cascade_source": "account_replay",
@@ -156,7 +255,7 @@ def test_account_replay_liquidation_probability_overrides_position_hf():
     dashboard = Dashboard(config=config, params=params)
 
     n_paths = config.n_simulations
-    n_cols = config.horizon_days + 1
+    n_cols = config.grid.n_cols
     zeros_f = np.zeros((n_paths, n_cols), dtype=float)
     zeros_i = np.zeros((n_paths, n_cols), dtype=int)
     liquidation_counts = zeros_i.copy()
@@ -187,15 +286,15 @@ def test_account_replay_liquidation_probability_overrides_position_hf():
     rm = output.risk_metrics
     expected_pct = round((n_paths // 2) / n_paths * 100.0, 2)
 
-    assert rm["prob_liquidation_source"] == "protocol_account_replay"
+    assert rm["prob_liquidation_source"] == "position_hf"
     assert rm["protocol_liquidation_signal_available"] is True
     assert rm["prob_position_liquidation_pct"] == pytest.approx(0.0)
     assert rm["prob_protocol_liquidation_pct"] == pytest.approx(expected_pct)
-    assert rm["prob_liquidation_pct"] == pytest.approx(expected_pct)
+    assert rm["prob_liquidation_pct"] == pytest.approx(rm["prob_position_liquidation_pct"])
 
 
 def test_account_replay_liquidation_probability_uses_raw_replay_paths_when_projected():
-    config = SimulationConfig(n_simulations=10, horizon_days=2, seed=516)
+    config = SimulationConfig.legacy_profile(n_simulations=10, horizon_days=2, seed=516)
     params = {
         "use_account_level_cascade": True,
         "cascade_source": "account_replay",
@@ -219,7 +318,7 @@ def test_account_replay_liquidation_probability_uses_raw_replay_paths_when_proje
     }
     dashboard = Dashboard(config=config, params=params)
 
-    n_cols = config.horizon_days + 1
+    n_cols = config.grid.n_cols
     replay_paths = 2
     zeros_f = np.zeros((replay_paths, n_cols), dtype=float)
     zeros_i = np.zeros((replay_paths, n_cols), dtype=int)
@@ -249,10 +348,87 @@ def test_account_replay_liquidation_probability_uses_raw_replay_paths_when_proje
         output = dashboard.run(seed=516)
 
     rm = output.risk_metrics
-    assert rm["prob_liquidation_source"] == "protocol_account_replay"
+    assert rm["prob_liquidation_source"] == "position_hf"
     assert rm["protocol_liquidation_signal_available"] is True
     assert rm["prob_protocol_liquidation_pct"] == pytest.approx(50.0)
-    assert rm["prob_liquidation_pct"] == pytest.approx(50.0)
+    assert rm["prob_liquidation_pct"] == pytest.approx(rm["prob_position_liquidation_pct"])
+
+
+def test_dashboard_account_replay_accepts_bucket_diagnostics_schema():
+    config = SimulationConfig.legacy_profile(n_simulations=8, horizon_days=2, seed=517)
+    params = {
+        "use_account_level_cascade": True,
+        "cascade_source": "account_replay",
+        "cascade_account_cohort": [
+            AccountState(
+                account_id="0xdiag",
+                collateral_eth=1.0,
+                debt_eth=1.0,
+                avg_lt=0.80,
+                collateral_weth=1.0,
+                collateral_steth_eth=0.0,
+                collateral_other_eth=0.0,
+                debt_usdc=500.0,
+                debt_usdt=0.0,
+                debt_eth_pool_usd=0.0,
+                debt_other_usd=0.0,
+            )
+        ],
+        "account_replay_max_paths": 8,
+        "account_replay_max_accounts": 1,
+    }
+    dashboard = Dashboard(config=config, params=params)
+
+    n_paths = config.n_simulations
+    n_cols = config.grid.n_cols
+    zeros_f = np.zeros((n_paths, n_cols), dtype=float)
+    zeros_i = np.zeros((n_paths, n_cols), dtype=int)
+
+    def fake_replay(*_args, **_kwargs):
+        diagnostics = ReplayDiagnostics(
+            liquidation_counts=zeros_i.copy(),
+            debt_at_risk_eth=zeros_f.copy(),
+            debt_liquidated_eth=zeros_f.copy(),
+            collateral_seized_eth=zeros_f.copy(),
+            weth_supply_reduction=zeros_f.copy(),
+            weth_borrow_reduction=zeros_f.copy(),
+            iterations_used=zeros_i.copy(),
+            max_iterations_hit_count=0,
+            max_iterations=1,
+            accounts_processed=1,
+            paths_processed=n_paths,
+            bucket_diagnostics={
+                "coverage": {
+                    "collateral": {
+                        "buckets": {
+                            "weth": {"pct_of_total": 100.0},
+                            "steth_like": {"pct_of_total": 0.0},
+                            "other": {"pct_of_total": 0.0},
+                        }
+                    },
+                    "debt": {
+                        "buckets": {
+                            "usdc": {"pct_of_total": 100.0},
+                            "usdt": {"pct_of_total": 0.0},
+                            "eth_pool": {"pct_of_total": 0.0},
+                            "other": {"pct_of_total": 0.0},
+                        },
+                        "unmapped_residue": {"pct_of_total": 0.0},
+                    },
+                }
+            },
+        )
+        return ReplayResult(
+            adjustment_array=zeros_f.copy(),
+            diagnostics=diagnostics,
+        )
+
+    with patch.object(dashboard.account_cascade_model, "simulate", side_effect=fake_replay):
+        output = dashboard.run(seed=517)
+
+    replay_summary = output.data_sources["cascade_replay_diagnostics"]
+    assert replay_summary["paths_processed"] == n_paths
+    assert replay_summary["accounts_processed"] == 1
 
 
 def test_utilization_analytics_fields_present_and_finite():
@@ -282,7 +458,7 @@ def test_utilization_analytics_fields_present_and_finite():
 
 
 def test_time_series_diagnostics_include_liquidation_series():
-    config = SimulationConfig(n_simulations=16, horizon_days=3, seed=42)
+    config = SimulationConfig.legacy_profile(n_simulations=16, horizon_days=3, seed=42)
     dashboard = Dashboard(config=config, params={})
     output = dashboard.run(seed=42)
     ts = output.time_series_diagnostics
@@ -293,7 +469,7 @@ def test_time_series_diagnostics_include_liquidation_series():
         "collateral_seized_eth",
         "liquidation_counts",
     ]
-    n_cols = config.horizon_days + 1
+    n_cols = config.grid.n_cols
     for key in required:
         assert key in ts
         series = ts[key]
@@ -326,7 +502,7 @@ def test_execution_cost_knobs_propagate_to_output():
 
 def test_spread_yield_component_ignores_exchange_rate_jumps_by_default():
     dashboard = Dashboard(
-        config=SimulationConfig(n_simulations=4, horizon_days=2, seed=101),
+        config=SimulationConfig.legacy_profile(n_simulations=4, horizon_days=2, seed=101),
         params={"spread_shock_vol_annual": 0.0},
     )
     borrow = np.full((4, 3), 0.03, dtype=float)
@@ -348,7 +524,7 @@ def test_spread_yield_component_ignores_exchange_rate_jumps_by_default():
 
 def test_spread_realized_exchange_yield_mode_applies_annualized_cap():
     dashboard = Dashboard(
-        config=SimulationConfig(n_simulations=1, horizon_days=2, seed=202),
+        config=SimulationConfig.legacy_profile(n_simulations=1, horizon_days=2, seed=202),
         params={
             "spread_model": {
                 "shock_vol_annual": 0.0,
@@ -378,7 +554,7 @@ def test_spread_realized_exchange_yield_mode_applies_annualized_cap():
 
 def test_steth_liquidation_flow_impact_scales_with_dt():
     dashboard = Dashboard(
-        config=SimulationConfig(n_simulations=1, horizon_days=2, seed=303),
+        config=SimulationConfig.legacy_profile(n_simulations=1, horizon_days=2, seed=303),
         params={
             "market": MarketParams(steth_eth_price=1.0),
             "steth_depeg_kappa": 0.0,
@@ -411,7 +587,7 @@ def test_steth_liquidation_flow_impact_scales_with_dt():
 
 
 def test_spread_liquidation_flow_shock_scales_with_dt():
-    config = SimulationConfig(n_simulations=4, horizon_days=2, seed=404)
+    config = SimulationConfig.legacy_profile(n_simulations=4, horizon_days=2, seed=404)
     params = {
         "use_account_level_cascade": True,
         "cascade_source": "account_replay",
@@ -441,7 +617,7 @@ def test_spread_liquidation_flow_shock_scales_with_dt():
     dashboard = Dashboard(config=config, params=params)
 
     n_paths = config.n_simulations
-    n_cols = config.horizon_days + 1
+    n_cols = config.grid.n_cols
     zeros_f = np.zeros((n_paths, n_cols), dtype=float)
     zeros_i = np.zeros((n_paths, n_cols), dtype=int)
     ones_f = np.ones((n_paths, n_cols), dtype=float)
@@ -588,7 +764,7 @@ def test_invalid_sigma_base_resolves_via_calibrated_sigma_then_records_reason():
 
 
 def test_k_vol_zero_parity_for_execution_and_utilization_deltas():
-    config = SimulationConfig(n_simulations=24, horizon_days=3, seed=808)
+    config = SimulationConfig.legacy_profile(n_simulations=24, horizon_days=3, seed=808)
     cohort = [
         AccountState(
             account_id="0xparity",

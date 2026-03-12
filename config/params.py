@@ -9,8 +9,25 @@ from datetime import datetime, timezone
 import os
 
 import numpy as np
+from config.time_grid import (
+    LEGACY_PROFILE_NAME,
+    LEGACY_TIMESTEP_DAYS,
+    OPERATIONAL_PROFILE_NAME,
+    DEFAULT_TIMESTEP_MINUTES,
+    build_simulation_grid,
+)
 
 DEFAULT_GAS_PRICE_GWEI = 30.0
+STAKING_APY_METHOD_LATEST = "latest"
+STAKING_APY_METHOD_TRAILING_7D_AVG = "trailing_7d_avg"
+STAKING_APY_METHOD_OPTIONS = {
+    STAKING_APY_METHOD_LATEST,
+    STAKING_APY_METHOD_TRAILING_7D_AVG,
+}
+STAKING_APY_SHORT_HORIZON_DAYS = 30
+STAKING_APY_SHORT_HORIZON_DEFAULT = STAKING_APY_METHOD_TRAILING_7D_AVG
+STAKING_APY_LONG_HORIZON_DEFAULT = STAKING_APY_METHOD_LATEST
+DEFAULT_STAKING_APY_LOOKBACK_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -66,7 +83,7 @@ class MarketParams:
     gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI
     # Source: Etherscan proxy API eth_gasPrice
     eth_collateral_fraction: float = 0.0
-    # Source: DeFiLlama Aave V3 Ethereum ETH-symbol collateral share
+    # Source: Aave subgraph ETH-symbol collateral share
 
 
 @dataclass(frozen=True)
@@ -184,9 +201,63 @@ class ABMConfig:
 class SimulationConfig:
     """Default simulation configuration."""
     n_simulations: int = 10_000
-    horizon_days: int = 30
-    dt: float = 1.0 / 365.0  # Daily steps in year fractions
+    horizon_days: float = 1.0
+    timestep_minutes: float | None = DEFAULT_TIMESTEP_MINUTES
+    timestep_days: float | None = None
+    allow_step_cap_override: bool = False
+    profile_name: str = OPERATIONAL_PROFILE_NAME
     seed: int = 42
+
+    @classmethod
+    def operational_profile(
+        cls,
+        *,
+        n_simulations: int = 10_000,
+        seed: int = 42,
+        horizon_days: float = 1.0,
+        timestep_minutes: float | None = DEFAULT_TIMESTEP_MINUTES,
+    ) -> "SimulationConfig":
+        return cls(
+            n_simulations=n_simulations,
+            horizon_days=horizon_days,
+            timestep_minutes=timestep_minutes,
+            timestep_days=None,
+            allow_step_cap_override=False,
+            profile_name=OPERATIONAL_PROFILE_NAME,
+            seed=seed,
+        )
+
+    @classmethod
+    def legacy_profile(
+        cls,
+        *,
+        n_simulations: int = 10_000,
+        seed: int = 42,
+        horizon_days: float = 30.0,
+    ) -> "SimulationConfig":
+        return cls(
+            n_simulations=n_simulations,
+            horizon_days=horizon_days,
+            timestep_minutes=None,
+            timestep_days=LEGACY_TIMESTEP_DAYS,
+            allow_step_cap_override=False,
+            profile_name=LEGACY_PROFILE_NAME,
+            seed=seed,
+        )
+
+    @property
+    def grid(self):
+        return build_simulation_grid(
+            horizon_days=self.horizon_days,
+            timestep_minutes=self.timestep_minutes,
+            timestep_days=self.timestep_days,
+            allow_step_cap_override=self.allow_step_cap_override,
+        )
+
+    @property
+    def dt(self) -> float:
+        """Compatibility accessor: timestep in year fractions."""
+        return float(self.grid.dt_years)
 
 
 def _clean_series(values: list[float] | np.ndarray | None, min_points: int = 1) -> np.ndarray:
@@ -531,16 +602,115 @@ def _calibrate_governance_and_slashing(
     }
 
 
-def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
+def _normalize_staking_apy_method(method: str) -> str:
+    """Validate and normalize staking APY method selection."""
+    normalized = str(method).strip().lower()
+    if normalized not in STAKING_APY_METHOD_OPTIONS:
+        valid = ", ".join(sorted(STAKING_APY_METHOD_OPTIONS))
+        raise ValueError(f"Invalid staking_apy_method '{method}'. Expected one of: {valid}")
+    return normalized
+
+
+def _resolve_staking_apy_method(
+    *,
+    staking_apy_method: str | None,
+    horizon_days: int,
+) -> str:
+    """Resolve default staking APY methodology from horizon unless explicitly set."""
+    if staking_apy_method is not None:
+        return _normalize_staking_apy_method(staking_apy_method)
+    if int(horizon_days) <= STAKING_APY_SHORT_HORIZON_DAYS:
+        return STAKING_APY_SHORT_HORIZON_DEFAULT
+    return STAKING_APY_LONG_HORIZON_DEFAULT
+
+
+def _resolve_staking_apy_metadata(
+    fetched: object,
+    *,
+    resolved_method: str,
+    resolved_lookback_days: int,
+) -> dict:
+    """Extract staking APY provenance metadata from fetched payload."""
+    metadata = getattr(fetched, "staking_apy_metadata", None)
+    if isinstance(metadata, dict) and metadata:
+        return dict(metadata)
+
+    legacy_entry = None
+    for entry in reversed(getattr(fetched, "params_log", [])):
+        if isinstance(entry, dict) and entry.get("name") == "staking_apy":
+            legacy_entry = entry
+            break
+
+    if legacy_entry is not None:
+        source_ts = legacy_entry.get("fetched_at")
+        source_ts = source_ts if isinstance(source_ts, str) else None
+        source_text = str(legacy_entry.get("source", "")).lower()
+        inferred_method = (
+            STAKING_APY_METHOD_TRAILING_7D_AVG
+            if "trailing average" in source_text
+            else STAKING_APY_METHOD_LATEST
+        )
+        lookback = (
+            DEFAULT_STAKING_APY_LOOKBACK_DAYS
+            if inferred_method == STAKING_APY_METHOD_TRAILING_7D_AVG
+            else 1
+        )
+        return {
+            "method": inferred_method,
+            "lookback_window_days": lookback,
+            "sample_count": 1,
+            "source_type": "params_log_legacy",
+            "source_timestamp": source_ts,
+        }
+
+    return {
+        "method": resolved_method,
+        "lookback_window_days": (
+            resolved_lookback_days
+            if resolved_method == STAKING_APY_METHOD_TRAILING_7D_AVG
+            else 1
+        ),
+        "sample_count": 0,
+        "source_type": "unavailable",
+        "source_timestamp": None,
+    }
+
+
+def load_params(
+    force_refresh: bool = False,
+    strict_aave: bool = True,
+    staking_apy_method: str | None = None,
+    staking_apy_lookback_days: int = DEFAULT_STAKING_APY_LOOKBACK_DAYS,
+    horizon_days: int | None = None,
+    cohort_analytics_override: dict | None = None,
+) -> dict:
     """
     Load parameters from on-chain data via fetcher.
 
     In strict mode (default), critical Aave fields must come from live
-    on-chain calls (preferred) or DeFiLlama fallback. Cache/default fallback
-    for those fields is disabled.
+    on-chain calls. Cohort/cascade calibration is loaded from the Aave
+    subgraph. Cache/default fallback for critical Aave fields is disabled.
+
+    staking_apy_method:
+        Optional explicit APY methodology override (`latest` or
+        `trailing_7d_avg`). If omitted, short horizons default to
+        trailing 7d average.
+    staking_apy_lookback_days:
+        Lookback window used by trailing-average staking APY method.
+    horizon_days:
+        Optional horizon used for method default resolution.
 
     Returns dict with all parameter dataclass instances plus metadata.
     """
+    resolved_horizon_days = int(
+        horizon_days if horizon_days is not None else SimulationConfig.horizon_days
+    )
+    resolved_staking_method = _resolve_staking_apy_method(
+        staking_apy_method=staking_apy_method,
+        horizon_days=resolved_horizon_days,
+    )
+    resolved_staking_lookback_days = max(int(staking_apy_lookback_days), 1)
+
     try:
         from data.fetcher import (
             _is_stale,
@@ -582,6 +752,8 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
                     use_cache=True,
                     force_refresh=force_refresh,
                     strict_aave=strict_aave,
+                    staking_apy_method=resolved_staking_method,
+                    staking_apy_lookback_days=resolved_staking_lookback_days,
                 )
             except RuntimeError as exc:
                 if strict_aave and "Strict Aave fetch failed" in str(exc):
@@ -593,9 +765,31 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
                         use_cache=True,
                         force_refresh=False,
                         strict_aave=False,
+                        staking_apy_method=resolved_staking_method,
+                        staking_apy_lookback_days=resolved_staking_lookback_days,
                     )
                 else:
                     raise
+
+        if cohort_analytics_override is not None:
+            cohort_analytics = dict(cohort_analytics_override)
+            cohort_source = "aave_subgraph_preloaded"
+        else:
+            from data.subgraph_fetcher import fetch_subgraph_cohort_analytics_from_env
+
+            cohort_analytics = fetch_subgraph_cohort_analytics_from_env()
+            cohort_source = "aave_subgraph"
+        subgraph_eth_collateral_fraction = cohort_analytics.get("eth_collateral_fraction")
+        if subgraph_eth_collateral_fraction is not None:
+            try:
+                fetched.eth_collateral_fraction = float(subgraph_eth_collateral_fraction)
+                fetched.log_param(
+                    "eth_collateral_fraction",
+                    fetched.eth_collateral_fraction,
+                    "Aave subgraph borrower/collateral positions — ETH-symbol collateral share",
+                )
+            except (TypeError, ValueError):
+                pass
 
         historical_stress_data = []
         try:
@@ -641,6 +835,11 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
             weth_borrow_apy_timestamps=getattr(fetched, "weth_borrow_apy_timestamps", []),
             steth_eth_price_history=getattr(fetched, "steth_eth_price_history", []),
             historical_stress_data=historical_stress_data,
+        )
+        staking_apy_metadata = _resolve_staking_apy_metadata(
+            fetched,
+            resolved_method=resolved_staking_method,
+            resolved_lookback_days=resolved_staking_lookback_days,
         )
         adv_has_provenance = any(
             isinstance(entry, dict) and entry.get("name") == "adv_weth"
@@ -689,6 +888,12 @@ def load_params(force_refresh: bool = False, strict_aave: bool = True) -> dict:
             "historical_stress_data": historical_stress_data,
             "depeg_calibration": depeg_calibration,
             "tail_risk_calibration": tail_calibration,
+            "cohort_source": cohort_source,
+            "cohort_analytics": cohort_analytics,
+            "cascade_avg_ltv": cohort_analytics.get("avg_ltv_weighted"),
+            "cascade_avg_lt": cohort_analytics.get("avg_lt_weighted"),
+            "staking_apy_method": staking_apy_metadata.get("method", resolved_staking_method),
+            "staking_apy_metadata": staking_apy_metadata,
             **tail_params,
             "last_updated": fetched.last_updated,
             "data_source": fetched.data_source,

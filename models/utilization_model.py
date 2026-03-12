@@ -103,6 +103,7 @@ class UtilizationModel:
 
     def simulate_from_eth_paths(self, eth_price_paths: np.ndarray,
                                 u0: float = 0.78,
+                                dt_years: float = 1.0 / 365.0,
                                 rng: np.random.Generator | None = None) -> np.ndarray:
         """
         Simulate utilization driven by ETH price paths.
@@ -117,8 +118,8 @@ class UtilizationModel:
 
         log_returns = np.diff(np.log(eth_price_paths), axis=1)
 
-        # Rolling vol (5-day window)
-        dt = 1.0 / 365.0
+        # Rolling vol (5-step window) using provided grid timestep.
+        dt = float(dt_years)
         window = min(5, n_steps)
         eth_vol = np.zeros((n_paths, n_steps))
         for t in range(n_steps):

@@ -17,6 +17,7 @@ Pipeline:
 """
 
 import json
+import os
 import numpy as np
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from config.params import (
     SpreadModelParams,
     SimulationConfig, load_params,
 )
+from config.time_grid import build_simulation_grid
 from models.aave_model import InterestRateModel, LiquidationEngine
 from models.price_simulation import GBMSimulator, VolatilityEstimator
 from models.depeg_model import DepegModel
@@ -47,17 +49,30 @@ from models.risk_metrics import RiskMetrics, UnwindCostEstimator
 from models.slippage_model import CurveSlippageModel
 from models.stress_tests import StressTestEngine
 from models.weth_execution_cost import QuadraticCEXCostModel
-from src.oracle_dynamics.exchange_rate import generate_lido_exchange_rate
+from models.zerox_quote_model import ZeroXQuoteConfig, ZeroXUnwindQuoteEstimator
+from src.oracle_dynamics.exchange_rate import (
+    EXCHANGE_RATE_MODE_CAPO_SLASHING,
+    generate_lido_exchange_rate,
+    resolve_exchange_rate_mode,
+)
 
 
 DEFAULT_CASCADE_AVG_LTV = 0.70
 DEFAULT_CASCADE_AVG_LT = 0.80
+OUTPUT_SCHEMA_VERSION = "2.0.0"
+DEFAULT_COLLATERAL_BUCKET_ASSUMPTIONS = {
+    "weth": {"beta": 1.0, "haircut": 0.0},
+    "steth_like": {"beta": 1.0, "haircut": 0.0},
+    "other": {"beta": 0.5, "haircut": 0.25},
+}
 
 
 @dataclass
 class DashboardOutput:
     """Complete dashboard output."""
     timestamp: str
+    schema_version: str
+    schema_compatibility: dict
     data_sources: dict
     position_summary: dict
     current_apy: dict
@@ -75,8 +90,11 @@ class DashboardOutput:
     time_series_diagnostics: dict
     simulation_config: dict
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(asdict(self), indent=indent, default=_json_default)
+        return json.dumps(self.to_dict(), indent=indent, default=_json_default)
 
 
 def _json_default(obj):
@@ -235,6 +253,92 @@ class Dashboard:
                 chosen = np.concatenate([chosen, extras[fill_idx]])
 
         return np.sort(chosen[:max_paths])
+
+    @staticmethod
+    def _resolve_collateral_bucket_assumptions(raw: Any) -> dict[str, dict[str, float]]:
+        base = {
+            bucket: {"beta": float(values["beta"]), "haircut": float(values["haircut"])}
+            for bucket, values in DEFAULT_COLLATERAL_BUCKET_ASSUMPTIONS.items()
+        }
+        if not isinstance(raw, dict):
+            return base
+
+        for bucket in ("weth", "steth_like", "other"):
+            values = raw.get(bucket)
+            if not isinstance(values, dict):
+                continue
+            beta = values.get("beta")
+            haircut = values.get("haircut")
+            if beta is not None:
+                base[bucket]["beta"] = float(np.clip(beta, 0.0, 5.0))
+            if haircut is not None:
+                base[bucket]["haircut"] = float(np.clip(haircut, 0.0, 0.95))
+        return base
+
+    @staticmethod
+    def _summarize_collateral_assumption_impact(
+        accounts: list[AccountState],
+        assumptions: dict[str, dict[str, float]],
+    ) -> dict[str, Any]:
+        totals = {"weth": 0.0, "steth_like": 0.0, "other": 0.0}
+        for account in accounts:
+            totals["weth"] += (
+                float(account.collateral_weth)
+                if account.collateral_weth is not None
+                else 0.0
+            )
+            totals["steth_like"] += (
+                float(account.collateral_steth_eth)
+                if account.collateral_steth_eth is not None
+                else 0.0
+            )
+            totals["other"] += (
+                float(account.collateral_other_eth)
+                if account.collateral_other_eth is not None
+                else 0.0
+            )
+
+        raw_total = float(sum(totals.values()))
+        adjusted = {}
+        adjusted_total = 0.0
+        for bucket, raw_value in totals.items():
+            beta = float(assumptions.get(bucket, {}).get("beta", 1.0))
+            haircut = float(assumptions.get(bucket, {}).get("haircut", 0.0))
+            adjusted_value = float(raw_value) * beta * (1.0 - haircut)
+            adjusted[bucket] = adjusted_value
+            adjusted_total += adjusted_value
+
+        impact_eth = adjusted_total - raw_total
+        impact_pct = (
+            (impact_eth / raw_total) * 100.0
+            if raw_total > 0.0
+            else 0.0
+        )
+
+        other_raw = totals["other"]
+        other_beta = float(assumptions.get("other", {}).get("beta", 1.0))
+        other_haircut = float(assumptions.get("other", {}).get("haircut", 0.0))
+        other_adjusted = other_raw * other_beta * (1.0 - other_haircut)
+        other_impact = other_adjusted - other_raw
+
+        return {
+            "assumptions": assumptions,
+            "raw_collateral_eth": raw_total,
+            "adjusted_collateral_eth": adjusted_total,
+            "impact_eth": impact_eth,
+            "impact_pct_of_raw": impact_pct,
+            "bucket_raw_eth": {k: float(v) for k, v in totals.items()},
+            "bucket_adjusted_eth": {k: float(v) for k, v in adjusted.items()},
+            "other_bucket_sensitivity": {
+                "raw_eth": float(other_raw),
+                "adjusted_eth": float(other_adjusted),
+                "impact_eth": float(other_impact),
+                "assumption": {
+                    "beta": other_beta,
+                    "haircut": other_haircut,
+                },
+            },
+        }
 
     @staticmethod
     def _project_replay_adjustments(
@@ -419,7 +523,45 @@ class Dashboard:
         }
 
     @staticmethod
-    def _rolling_vol_from_returns(log_returns: np.ndarray, window: int = 5) -> np.ndarray:
+    def _cumulative_threshold_breach_probability(
+        paths: np.ndarray,
+        *,
+        threshold: float = 1.0,
+    ) -> list[float]:
+        arr = np.asarray(paths, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return []
+        breached = arr < threshold
+        breached_cumulative = np.logical_or.accumulate(breached, axis=1)
+        return [float(v * 100.0) for v in np.mean(breached_cumulative, axis=0)]
+
+    @staticmethod
+    def _first_threshold_breach_probability(
+        paths: np.ndarray,
+        *,
+        threshold: float = 1.0,
+    ) -> list[float]:
+        arr = np.asarray(paths, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return []
+        first_breach = RiskMetrics.first_breach_step(arr, threshold=threshold)
+        probs = np.zeros(arr.shape[1], dtype=float)
+        valid = first_breach[first_breach >= 0]
+        if valid.size > 0:
+            probs[: arr.shape[1]] = (
+                np.bincount(valid, minlength=arr.shape[1])[: arr.shape[1]]
+                / arr.shape[0]
+                * 100.0
+            )
+        return [float(v) for v in probs]
+
+    @staticmethod
+    def _rolling_vol_from_returns(
+        log_returns: np.ndarray,
+        *,
+        dt_years: float,
+        window: int = 5,
+    ) -> np.ndarray:
         arr = np.asarray(log_returns, dtype=float)
         if arr.ndim != 2:
             raise ValueError("log_returns must be 2D")
@@ -428,9 +570,10 @@ class Dashboard:
             return np.zeros_like(arr)
         out = np.zeros_like(arr)
         window = max(int(window), 1)
+        annualizer = np.sqrt(1.0 / max(float(dt_years), np.finfo(float).eps))
         for t in range(n_steps):
             start = max(0, t - window + 1)
-            out[:, t] = np.std(arr[:, start:t + 1], axis=1) * np.sqrt(365.0)
+            out[:, t] = np.std(arr[:, start:t + 1], axis=1) * annualizer
         return out
 
     @staticmethod
@@ -477,7 +620,7 @@ class Dashboard:
     def _build_annualized_sigma_paths(
         eth_paths: np.ndarray,
         *,
-        dt: float,
+        dt_days: float,
         lookback_days: int,
         sigma_base_annualized: float,
     ) -> np.ndarray:
@@ -496,9 +639,9 @@ class Dashboard:
             return sigma_paths
 
         returns = np.diff(np.log(paths), axis=1)
-        step_days = max(float(dt) * 365.0, np.finfo(float).eps)
+        step_days = max(float(dt_days), np.finfo(float).eps)
         lookback_steps = max(int(round(float(lookback_days) / step_days)), 1)
-        annualizer = np.sqrt(1.0 / max(float(dt), np.finfo(float).eps))
+        annualizer = np.sqrt(365.0 / max(float(dt_days), np.finfo(float).eps))
 
         for col in range(1, n_cols):
             ret_count = col
@@ -695,19 +838,32 @@ class Dashboard:
         dt: float,
         rng: np.random.Generator,
         exogenous_shock_paths: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        return_components: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]] | tuple[
+        np.ndarray,
+        np.ndarray,
+        dict[str, Any],
+        dict[str, np.ndarray],
+    ]:
         n_paths, n_cols = borrow_rate_paths.shape
         n_steps = n_cols - 1
         eps = np.finfo(float).eps
 
-        staking_apy = float(self.wsteth.staking_apy)
+        if self.spread_fixed_staking_yield_mode:
+            staking_apy = float(self.spread_fixed_staking_yield_apy)
+        else:
+            staking_apy = float(self.wsteth.staking_apy)
         steth_supply_apy = float(self.wsteth.steth_supply_apy)
         yield_component_paths = np.full(
             (n_paths, n_cols),
             staking_apy + steth_supply_apy,
             dtype=float,
         )
-        if self.spread_params.use_realized_exchange_yield and n_steps > 0:
+        if (
+            self.spread_params.use_realized_exchange_yield
+            and not self.spread_fixed_staking_yield_mode
+            and n_steps > 0
+        ):
             exchange_growth = np.diff(exchange_rate_paths, axis=1) / np.maximum(
                 exchange_rate_paths[:, :-1],
                 eps,
@@ -728,6 +884,18 @@ class Dashboard:
         if n_steps <= 0:
             corr_meta = self._estimate_spread_correlation()
             corr_meta["shock_vol_annual"] = float(self.spread_params.shock_vol_annual)
+            corr_meta["fixed_staking_yield_mode"] = self.spread_fixed_staking_yield_mode
+            corr_meta["fixed_staking_yield_apy"] = staking_apy
+            if return_components:
+                return (
+                    base_spread_paths,
+                    yield_component_paths,
+                    corr_meta,
+                    {
+                        "carry_spread_paths": base_spread_paths.copy(),
+                        "market_spread_paths": np.zeros_like(base_spread_paths),
+                    },
+                )
             return base_spread_paths, yield_component_paths, corr_meta
 
         corr_meta = self._estimate_spread_correlation()
@@ -735,7 +903,11 @@ class Dashboard:
         corr_vol = float(corr_meta["corr_eth_vol"])
 
         eth_ret = np.diff(np.log(np.maximum(eth_paths, eps)), axis=1)
-        eth_vol = self._rolling_vol_from_returns(eth_ret, window=min(5, n_steps))
+        eth_vol = self._rolling_vol_from_returns(
+            eth_ret,
+            dt_years=dt,
+            window=min(5, n_steps),
+        )
 
         ret_std = float(np.std(eth_ret))
         vol_std = float(np.std(eth_vol))
@@ -777,6 +949,20 @@ class Dashboard:
             )
 
         corr_meta["shock_vol_annual"] = shock_sigma
+        corr_meta["fixed_staking_yield_mode"] = self.spread_fixed_staking_yield_mode
+        corr_meta["fixed_staking_yield_apy"] = staking_apy
+
+        if return_components:
+            market_spread_paths = spread_paths - base_spread_paths
+            return (
+                spread_paths,
+                yield_component_paths,
+                corr_meta,
+                {
+                    "carry_spread_paths": base_spread_paths,
+                    "market_spread_paths": market_spread_paths,
+                },
+            )
         return spread_paths, yield_component_paths, corr_meta
 
     def __init__(self, capital_eth: float = 10.0, n_loops: int = 10,
@@ -787,7 +973,10 @@ class Dashboard:
         # Load live params by default (cache fallback) unless explicitly provided
         if params is None:
             try:
-                params = load_params(force_refresh=False)
+                params = load_params(
+                    force_refresh=False,
+                    horizon_days=getattr(config, "horizon_days", None),
+                )
             except Exception:
                 params = {}
         self.params = params or {}
@@ -806,11 +995,49 @@ class Dashboard:
         raw_weth_total_supply = self.params.get("weth_total_supply")
         raw_weth_total_borrows = self.params.get("weth_total_borrows")
         self.base_gas_price_gwei = self._resolve_gas_price_gwei(self.market.gas_price_gwei)
+        self.unwind_cost_model = str(
+            self.params.get("unwind_cost_model", "curve")
+        ).strip().lower()
+        if self.unwind_cost_model not in {"curve", "live_0x"}:
+            raise ValueError(
+                "unwind_cost_model must be one of: 'curve', 'live_0x'"
+            )
+        self.zerox_slippage_bps = int(
+            np.clip(self.params.get("zerox_slippage_bps", 50), 0, 10_000)
+        )
+        self.zerox_use_min_buy_amount = bool(
+            self.params.get("zerox_use_min_buy_amount", False)
+        )
+        self.zerox_chain_id = int(self.params.get("zerox_chain_id", 1))
+        self.zerox_base_url = str(
+            self.params.get("zerox_base_url", "https://api.0x.org")
+        ).strip()
+        self.zerox_api_key = str(
+            self.params.get("zerox_api_key", os.getenv("ZEROX_API_KEY", ""))
+        ).strip()
+        self.zerox_taker = str(
+            self.params.get(
+                "zerox_taker",
+                os.getenv("ZEROX_TAKER_ADDRESS", os.getenv("ZEROX_TAKER", "")),
+            )
+        ).strip()
         self.gov_shock_prob_annual = float(self.params.get("governance_shock_prob_annual", 0.20))
         self.gov_ir_spread = float(self.params.get("governance_ir_spread", 0.04))
         self.gov_lt_haircut = float(self.params.get("governance_lt_haircut", 0.02))
         self.slashing_intensity_annual = float(self.params.get("slashing_intensity_annual", 0.02))
         self.slashing_severity = float(self.params.get("slashing_severity", 0.08))
+        self.exchange_rate_mode = resolve_exchange_rate_mode(
+            self.params.get("exchange_rate_mode", EXCHANGE_RATE_MODE_CAPO_SLASHING)
+        )
+        self.staking_apy_method = str(
+            self.params.get("staking_apy_method", "unknown")
+        ).strip().lower()
+        staking_apy_metadata = self.params.get("staking_apy_metadata")
+        self.staking_apy_metadata = (
+            dict(staking_apy_metadata)
+            if isinstance(staking_apy_metadata, dict)
+            else {}
+        )
         depeg_calibration = self.params.get("depeg_calibration")
         self.depeg_calibration = depeg_calibration if isinstance(depeg_calibration, dict) else {}
         tail_calibration = self.params.get("tail_risk_calibration")
@@ -829,8 +1056,31 @@ class Dashboard:
         self.use_account_level_cascade = bool(self.params.get("use_account_level_cascade", False))
         fallback_reason = self.params.get("cascade_fallback_reason")
         self.cascade_fallback_reason = str(fallback_reason) if fallback_reason else None
+        self.cascade_cohort_metadata = self.params.get("cascade_cohort_metadata")
+        if hasattr(self.cascade_cohort_metadata, "diagnostics"):
+            diagnostics_raw = getattr(self.cascade_cohort_metadata, "diagnostics")
+        elif isinstance(self.cascade_cohort_metadata, dict):
+            diagnostics_raw = self.cascade_cohort_metadata.get("diagnostics")
+        else:
+            diagnostics_raw = None
+        self.cascade_cohort_diagnostics = (
+            dict(diagnostics_raw) if isinstance(diagnostics_raw, dict) else {}
+        )
+        bucket_mapping_payload = self.params.get("account_bucket_mapping")
+        self.account_bucket_mapping = (
+            dict(bucket_mapping_payload)
+            if isinstance(bucket_mapping_payload, dict)
+            else {}
+        )
         self.account_cascade_cohort = self._coerce_account_states(
             self.params.get("cascade_account_cohort", [])
+        )
+        self.collateral_bucket_assumptions = self._resolve_collateral_bucket_assumptions(
+            self.params.get("collateral_bucket_assumptions")
+        )
+        self.collateral_assumption_diagnostics = self._summarize_collateral_assumption_impact(
+            self.account_cascade_cohort,
+            self.collateral_bucket_assumptions,
         )
         self.account_replay_max_paths = int(self.params.get("account_replay_max_paths", 512))
         self.account_replay_max_accounts = int(self.params.get("account_replay_max_accounts", 5000))
@@ -1122,6 +1372,12 @@ class Dashboard:
         self.spread_feedback_to_utilization = float(
             np.clip(self.params.get("spread_feedback_to_utilization", 0.15), 0.0, 5.0)
         )
+        self.spread_fixed_staking_yield_mode = bool(
+            self.params.get("spread_fixed_staking_yield_mode", False)
+        )
+        self.spread_fixed_staking_yield_apy = float(
+            self.params.get("spread_fixed_staking_yield_apy", self.wsteth.staking_apy)
+        )
 
         cascade_ltv_value = self.params.get("cascade_avg_ltv")
         cascade_lt_value = self.params.get("cascade_avg_lt")
@@ -1169,6 +1425,14 @@ class Dashboard:
 
         # Config can be overridden externally; otherwise use fetched sim config
         self.config = config or self.params.get("sim_config", SIM_CONFIG)
+        self.grid = build_simulation_grid(
+            horizon_days=self.config.horizon_days,
+            timestep_minutes=getattr(self.config, "timestep_minutes", None),
+            timestep_days=getattr(self.config, "timestep_days", None),
+            allow_step_cap_override=bool(
+                getattr(self.config, "allow_step_cap_override", False)
+            ),
+        )
 
         self.position = LoopedPosition(capital_eth, n_loops,
                                        emode=self.emode,
@@ -1287,6 +1551,30 @@ class Dashboard:
         self.unwind_estimator = UnwindCostEstimator(
             slippage_model=CurveSlippageModel(params=self.curve_pool)
         )
+        self.live_unwind_estimator: ZeroXUnwindQuoteEstimator | None = None
+        if self.unwind_cost_model == "live_0x":
+            if not self.zerox_api_key:
+                raise ValueError(
+                    "live_0x unwind mode requires ZEROX_API_KEY (env) or params['zerox_api_key']"
+                )
+            if not self.zerox_taker:
+                raise ValueError(
+                    "live_0x unwind mode requires ZEROX_TAKER_ADDRESS (env) or params['zerox_taker']"
+                )
+            price_wsteth_in_eth = (
+                float(self.wsteth.wsteth_steth_rate) * float(self.market.steth_eth_price)
+            )
+            self.live_unwind_estimator = ZeroXUnwindQuoteEstimator(
+                api_key=self.zerox_api_key,
+                taker=self.zerox_taker,
+                price_wsteth_in_eth=max(price_wsteth_in_eth, np.finfo(float).eps),
+                config=ZeroXQuoteConfig(
+                    base_url=self.zerox_base_url,
+                    chain_id=self.zerox_chain_id,
+                    slippage_bps=self.zerox_slippage_bps,
+                    use_min_buy_amount=self.zerox_use_min_buy_amount,
+                ),
+            )
         current_borrow = float(self.rate_model.borrow_rate(self.market.current_weth_utilization))
         market_state = {
             "current_utilization": self.market.current_weth_utilization,
@@ -1302,8 +1590,15 @@ class Dashboard:
             "eth_price_history": self.eth_price_history,
             "slashing_intensity_annual": self.slashing_intensity_annual,
             "slashing_severity": self.slashing_severity,
+            "capo_max_growth_annual": self.capo_max_growth_annual,
             "governance_lt_haircut": self.gov_lt_haircut,
             "governance_ir_spread": self.gov_ir_spread,
+            "exchange_rate_mode": self.exchange_rate_mode,
+            "stress_horizon_days": float(self.grid.horizon_days),
+            "stress_timestep_days": float(self.grid.dt_days),
+            "stress_allow_step_cap_override": bool(
+                getattr(self.config, "allow_step_cap_override", False)
+            ),
         }
         self.stress_engine = StressTestEngine(
             self.position, self.rate_model,
@@ -1355,7 +1650,7 @@ class Dashboard:
         dt: float,
         rng: np.random.Generator,
     ) -> np.ndarray:
-        """Simulate oracle exchange-rate paths with CAPO cap and slashing tails."""
+        """Simulate oracle exchange-rate paths with selectable mode."""
         slash_hazard = max(float(self.slashing_intensity_annual), 0.0)
         slash_prob_step = 1.0 - np.exp(-slash_hazard * dt)
         slash_severity = float(np.clip(self.slashing_severity, 0.0, 0.95))
@@ -1371,6 +1666,7 @@ class Dashboard:
             n_steps=n_steps,
             n_paths=n_paths,
             seed=int(rng.integers(0, 2**31)),
+            exchange_rate_mode=self.exchange_rate_mode,
         )
 
     def _execution_layer_paths(
@@ -1437,11 +1733,13 @@ class Dashboard:
         rng = np.random.default_rng(seed)
 
         n_paths = self.config.n_simulations
-        n_steps = self.config.horizon_days
-        dt = self.config.dt
-        if n_steps < 1:
-            raise ValueError("Simulation horizon must be at least 1 day")
-        n_cols = n_steps + 1
+        grid = self.grid
+
+        n_steps = grid.n_steps
+        n_cols = grid.n_cols
+        dt = grid.dt_years
+        dt_days = grid.dt_days
+        time_grid_days = grid.time_grid_days
 
         # === Phase 1: ETH price paths (GBM) ===
         eth_paths = self.gbm.simulate(
@@ -1462,9 +1760,14 @@ class Dashboard:
         )
         sigma_annualized_paths = self._build_annualized_sigma_paths(
             eth_paths=eth_paths,
-            dt=dt,
+            dt_days=dt_days,
             lookback_days=self.sigma_lookback_days,
             sigma_base_annualized=self.sigma_base_annualized,
+        )
+        oracle_exchange_rate_paths = self.position._oracle_exchange_rate_paths(
+            n_paths=n_paths,
+            n_cols=n_cols,
+            dt=dt,
         )
 
         # === Phase 2: Liquidation cascade effects ===
@@ -1494,6 +1797,7 @@ class Dashboard:
                 "p99": 0.0,
                 "max": 0.0,
             },
+            "bucket_diagnostics": {},
             "warnings": [],
         }
         abm_diagnostics_summary: dict[str, Any] | None = None
@@ -1760,45 +2064,87 @@ class Dashboard:
                 axis=1,
             )
 
-            def _project_diag(arr: np.ndarray | None) -> np.ndarray:
+            projected_diag_cache: dict[str, np.ndarray] = {}
+
+            def _project_diag(name: str, arr: np.ndarray | None) -> np.ndarray:
+                cached = projected_diag_cache.get(name)
+                if cached is not None:
+                    return cached
                 if arr is None:
-                    return np.zeros((n_paths, n_cols), dtype=float)
-                arr_f = np.asarray(arr, dtype=float)
-                if arr_f.shape == (n_paths, n_cols):
-                    return arr_f
-                if arr_f.shape == (replay_eth_paths.shape[0], n_cols):
-                    return self._project_replay_adjustments(
-                        full_eth_paths=eth_paths,
-                        replay_eth_paths=replay_eth_paths,
-                        replay_adjustments=arr_f,
-                    )
-                return np.zeros((n_paths, n_cols), dtype=float)
+                    projected = np.zeros((n_paths, n_cols), dtype=float)
+                else:
+                    arr_f = np.asarray(arr, dtype=float)
+                    if arr_f.shape == (n_paths, n_cols):
+                        projected = arr_f
+                    elif arr_f.shape == (replay_eth_paths.shape[0], n_cols):
+                        projected = self._project_replay_adjustments(
+                            full_eth_paths=eth_paths,
+                            replay_eth_paths=replay_eth_paths,
+                            replay_adjustments=arr_f,
+                        )
+                    else:
+                        projected = np.zeros((n_paths, n_cols), dtype=float)
+                projected_diag_cache[name] = projected
+                return projected
 
             replay_diag_projected = {
-                "liquidation_counts": np.rint(_project_diag(replay_diag.liquidation_counts)).astype(int),
-                "debt_at_risk_eth": _project_diag(replay_diag.debt_at_risk_eth),
-                "debt_liquidated_eth": _project_diag(replay_diag.debt_liquidated_eth),
-                "collateral_seized_eth": _project_diag(replay_diag.collateral_seized_eth),
-                "weth_supply_reduction": _project_diag(replay_diag.weth_supply_reduction),
-                "weth_borrow_reduction": _project_diag(replay_diag.weth_borrow_reduction),
-                "repaid_usdc_usd": _project_diag(replay_diag.repaid_usdc_usd),
-                "repaid_usdt_usd": _project_diag(replay_diag.repaid_usdt_usd),
-                "v_stables_usd": _project_diag(replay_diag.v_stables_usd),
-                "v_weth": _project_diag(replay_diag.v_weth),
-                "cost_bps": _project_diag(replay_diag.cost_bps),
-                "realized_execution_haircut": _project_diag(replay_diag.realized_execution_haircut),
-                "cumulative_price_impact_pct": _project_diag(replay_diag.cumulative_price_impact_pct),
-                "bad_debt_usd": _project_diag(replay_diag.bad_debt_usd),
-                "bad_debt_eth": _project_diag(replay_diag.bad_debt_eth),
-                "bad_debt_usdc_usd": _project_diag(replay_diag.bad_debt_usdc_usd),
-                "bad_debt_usdt_usd": _project_diag(replay_diag.bad_debt_usdt_usd),
-                "bad_debt_eth_pool_usd": _project_diag(replay_diag.bad_debt_eth_pool_usd),
-                "bad_debt_other_usd": _project_diag(replay_diag.bad_debt_other_usd),
+                "liquidation_counts": np.rint(
+                    _project_diag("liquidation_counts", replay_diag.liquidation_counts)
+                ).astype(int),
+                "debt_at_risk_eth": _project_diag("debt_at_risk_eth", replay_diag.debt_at_risk_eth),
+                "debt_liquidated_eth": _project_diag(
+                    "debt_liquidated_eth",
+                    replay_diag.debt_liquidated_eth,
+                ),
+                "collateral_seized_eth": _project_diag(
+                    "collateral_seized_eth",
+                    replay_diag.collateral_seized_eth,
+                ),
+                "weth_supply_reduction": _project_diag(
+                    "weth_supply_reduction",
+                    replay_diag.weth_supply_reduction,
+                ),
+                "weth_borrow_reduction": _project_diag(
+                    "weth_borrow_reduction",
+                    replay_diag.weth_borrow_reduction,
+                ),
+                "repaid_usdc_usd": _project_diag("repaid_usdc_usd", replay_diag.repaid_usdc_usd),
+                "repaid_usdt_usd": _project_diag("repaid_usdt_usd", replay_diag.repaid_usdt_usd),
+                "v_stables_usd": _project_diag("v_stables_usd", replay_diag.v_stables_usd),
+                "v_weth": _project_diag("v_weth", replay_diag.v_weth),
+                "cost_bps": _project_diag("cost_bps", replay_diag.cost_bps),
+                "realized_execution_haircut": _project_diag(
+                    "realized_execution_haircut",
+                    replay_diag.realized_execution_haircut,
+                ),
+                "cumulative_price_impact_pct": _project_diag(
+                    "cumulative_price_impact_pct",
+                    replay_diag.cumulative_price_impact_pct,
+                ),
+                "bad_debt_usd": _project_diag("bad_debt_usd", replay_diag.bad_debt_usd),
+                "bad_debt_eth": _project_diag("bad_debt_eth", replay_diag.bad_debt_eth),
+                "bad_debt_usdc_usd": _project_diag(
+                    "bad_debt_usdc_usd",
+                    replay_diag.bad_debt_usdc_usd,
+                ),
+                "bad_debt_usdt_usd": _project_diag(
+                    "bad_debt_usdt_usd",
+                    replay_diag.bad_debt_usdt_usd,
+                ),
+                "bad_debt_eth_pool_usd": _project_diag(
+                    "bad_debt_eth_pool_usd",
+                    replay_diag.bad_debt_eth_pool_usd,
+                ),
+                "bad_debt_other_usd": _project_diag(
+                    "bad_debt_other_usd",
+                    replay_diag.bad_debt_other_usd,
+                ),
                 "borrow_rate_after_liquidation": _project_diag(
+                    "borrow_rate_after_liquidation",
                     replay_diag.borrow_rate_after_liquidation
                 ),
-                "borrow_rate_delta": _project_diag(replay_diag.borrow_rate_delta),
-                "utilization": _project_diag(replay_diag.utilization),
+                "borrow_rate_delta": _project_diag("borrow_rate_delta", replay_diag.borrow_rate_delta),
+                "utilization": _project_diag("utilization", replay_diag.utilization),
                 "utilization_shock": np.zeros((n_paths, n_cols), dtype=float),
             }
             replay_diagnostics_summary = {
@@ -1808,9 +2154,17 @@ class Dashboard:
                 "cumulative_price_impact_pct_terminal": {
                     k: round(v, 6)
                     for k, v in self._summary_stats(
-                        _project_diag(replay_diag.cumulative_price_impact_pct)[:, -1]
+                        _project_diag(
+                            "cumulative_price_impact_pct",
+                            replay_diag.cumulative_price_impact_pct,
+                        )[:, -1]
                     ).items()
                 },
+                "bucket_diagnostics": (
+                    dict(replay_diag.bucket_diagnostics)
+                    if isinstance(replay_diag.bucket_diagnostics, dict)
+                    else {}
+                ),
                 "warnings": list(replay_diag.warnings),
             }
             cascade_account_count = len(replay_accounts)
@@ -1948,11 +2302,7 @@ class Dashboard:
         spread_without_liq_pre, _yield_without_liq_pre, _meta_without_liq_pre = self._simulate_spread_paths(
             borrow_rate_paths=borrow_rate_paths_without_liq_pre,
             eth_paths=eth_paths,
-            exchange_rate_paths=self.position._oracle_exchange_rate_paths(
-                n_paths=n_paths,
-                n_cols=n_cols,
-                dt=dt,
-            ),
+            exchange_rate_paths=oracle_exchange_rate_paths,
             dt=dt,
             rng=np.random.default_rng(spread_seed_pre),
             exogenous_shock_paths=spread_exogenous_without_liq,
@@ -1960,11 +2310,7 @@ class Dashboard:
         spread_with_liq_pre, _yield_with_liq_pre, _meta_with_liq_pre = self._simulate_spread_paths(
             borrow_rate_paths=borrow_rate_paths_pre_spread,
             eth_paths=eth_paths,
-            exchange_rate_paths=self.position._oracle_exchange_rate_paths(
-                n_paths=n_paths,
-                n_cols=n_cols,
-                dt=dt,
-            ),
+            exchange_rate_paths=oracle_exchange_rate_paths,
             dt=dt,
             rng=np.random.default_rng(spread_seed_pre),
             exogenous_shock_paths=spread_exogenous_with_liq,
@@ -2028,15 +2374,15 @@ class Dashboard:
             dt=dt,
             rng=exchange_rng,
         )
-        baseline_exchange_rate_paths = self.position._oracle_exchange_rate_paths(
-            n_paths=n_paths,
-            n_cols=n_cols,
-            dt=dt,
-        )
+        baseline_exchange_rate_paths = oracle_exchange_rate_paths
 
         # === Phase 5b: Spread dynamics (yield component - borrow rate) ===
         spread_seed = int(rng.integers(0, 2**31))
-        spread_paths_without_liq, yield_component_paths_without_liq, spread_corr_meta_without = (
+        (
+            spread_paths_without_liq,
+            yield_component_paths_without_liq,
+            spread_corr_meta_without,
+        ) = (
             self._simulate_spread_paths(
                 borrow_rate_paths=borrow_rate_paths_without_liq,
                 eth_paths=eth_paths,
@@ -2054,12 +2400,29 @@ class Dashboard:
             rng=np.random.default_rng(spread_seed),
             exogenous_shock_paths=spread_exogenous_with_liq,
         )
+        carry_spread_without_liq = yield_component_paths_without_liq - borrow_rate_paths_without_liq
+        carry_spread_with_liq = yield_component_paths - borrow_rate_paths
+        spread_components_without_liq = {
+            "carry_spread_paths": carry_spread_without_liq,
+            "market_spread_paths": spread_paths_without_liq - carry_spread_without_liq,
+        }
+        spread_components_with_liq = {
+            "carry_spread_paths": carry_spread_with_liq,
+            "market_spread_paths": spread_paths - carry_spread_with_liq,
+        }
 
         spread_terminal = spread_paths[:, -1]
         spread_terminal_without_liq = spread_paths_without_liq[:, -1]
         spread_terminal_delta_bps = (spread_terminal - spread_terminal_without_liq) * 10_000.0
+        carry_spread_terminal = spread_components_with_liq["carry_spread_paths"][:, -1]
+        market_spread_terminal = spread_components_with_liq["market_spread_paths"][:, -1]
+        market_spread_terminal_without_liq = (
+            spread_components_without_liq["market_spread_paths"][:, -1]
+        )
         spread_forecast_payload = {
-            "horizon_days": n_steps,
+            "horizon_days": round(float(grid.horizon_days), 6),
+            "grid_steps": n_steps,
+            "dt_days": round(float(dt_days), 8),
             "ci_68_pct": [
                 round(float(np.percentile(spread_terminal, 16) * 100.0), 3),
                 round(float(np.percentile(spread_terminal, 84) * 100.0), 3),
@@ -2113,6 +2476,20 @@ class Dashboard:
             },
             "liquidation_impact_terminal_bps": {
                 k: round(v, 6) for k, v in self._summary_stats(spread_terminal_delta_bps).items()
+            },
+            "decomposition_terminal_pct": {
+                "carry_spread": {
+                    k: round(v * 100.0, 6)
+                    for k, v in self._summary_stats(carry_spread_terminal).items()
+                },
+                "market_spread": {
+                    k: round(v * 100.0, 6)
+                    for k, v in self._summary_stats(market_spread_terminal).items()
+                },
+                "market_spread_without_liquidation": {
+                    k: round(v * 100.0, 6)
+                    for k, v in self._summary_stats(market_spread_terminal_without_liq).items()
+                },
             },
             "steth_depeg_terminal_pct_without_liquidation": round(
                 float(np.mean((1.0 - steth_without_liq_paths[:, -1]) * 100.0)),
@@ -2174,6 +2551,14 @@ class Dashboard:
         )
         first_hf_breach = self.risk_metrics.first_breach_step(hf_paths, threshold=1.0)
         liquidation_mask = first_hf_breach >= 0
+        position_liquidation_cumulative_prob_pct = self._cumulative_threshold_breach_probability(
+            hf_paths,
+            threshold=1.0,
+        )
+        position_liquidation_first_breach_prob_pct = self._first_threshold_breach_probability(
+            hf_paths,
+            threshold=1.0,
+        )
 
         # === Phase 8: Execution layer (unwind/depeg from flow/liquidity) ===
         execution_depeg_paths, sell_volume_paths, effective_liquidity_paths = self._execution_layer_paths(
@@ -2201,7 +2586,10 @@ class Dashboard:
 
         # Compute terminal vol per path for liquidity stress scaling
         log_returns = np.diff(np.log(eth_paths), axis=1)
-        terminal_vol = np.std(log_returns[:, -min(5, n_steps):], axis=1) * np.sqrt(365)
+        terminal_vol = (
+            np.std(log_returns[:, -min(5, n_steps):], axis=1)
+            * np.sqrt(1.0 / max(float(dt), np.finfo(float).eps))
+        )
         terminal_vol = np.clip(terminal_vol, 0.10, 3.0)
         unwind_cost_paths = self._path_unwind_costs(
             terminal_depeg=terminal_execution_depeg,
@@ -2234,12 +2622,20 @@ class Dashboard:
         stress_results = self.stress_engine.run_all()
 
         # === Phase 12: Portfolio unwind costs ===
-        unwind_pct_costs = self.unwind_estimator.portfolio_pct_costs(
-            self.position.total_debt_weth,
-            terminal_vol,
-            gas_price_gwei=self.base_gas_price_gwei,
-            steth_eth_terminal=terminal_execution_depeg,
-        )
+        if self.unwind_cost_model == "live_0x":
+            if self.live_unwind_estimator is None:
+                raise RuntimeError("live_0x unwind estimator was not initialized")
+            unwind_pct_costs = self.live_unwind_estimator.portfolio_pct_costs(
+                total_debt_weth=self.position.total_debt_weth,
+                gas_price_gwei=self.base_gas_price_gwei,
+            )
+        else:
+            unwind_pct_costs = self.unwind_estimator.portfolio_pct_costs(
+                self.position.total_debt_weth,
+                terminal_vol,
+                gas_price_gwei=self.base_gas_price_gwei,
+                steth_eth_terminal=terminal_execution_depeg,
+            )
 
         replay_v_stables_usd = replay_diag_projected["v_stables_usd"]
         replay_v_weth = replay_diag_projected["v_weth"]
@@ -2370,9 +2766,12 @@ class Dashboard:
                     replay_diag_projected["cumulative_price_impact_pct"][:, -1]
                 ).items()
             },
+            "bucket_diagnostics": replay_diagnostics_summary.get("bucket_diagnostics", {}),
+            "collateral_assumption_impact": self.collateral_assumption_diagnostics,
         }
 
         time_series_diagnostics = {
+            "time_grid_days": [float(v) for v in time_grid_days],
             "v_stables_usd": self._time_series_percentiles(replay_v_stables_usd),
             "v_weth": self._time_series_percentiles(replay_v_weth),
             "cost_bps": self._time_series_percentiles(replay_cost_bps),
@@ -2421,6 +2820,15 @@ class Dashboard:
             "spread_without_liquidation_pct": self._time_series_percentiles(
                 spread_paths_without_liq * 100.0
             ),
+            "carry_spread_pct": self._time_series_percentiles(
+                spread_components_with_liq["carry_spread_paths"] * 100.0
+            ),
+            "market_spread_pct": self._time_series_percentiles(
+                spread_components_with_liq["market_spread_paths"] * 100.0
+            ),
+            "market_spread_without_liquidation_pct": self._time_series_percentiles(
+                spread_components_without_liq["market_spread_paths"] * 100.0
+            ),
             "spread_with_liquidation_pct": self._time_series_percentiles(
                 spread_paths * 100.0
             ),
@@ -2430,6 +2838,11 @@ class Dashboard:
             "yield_component_pct": self._time_series_percentiles(yield_component_paths * 100.0),
             "yield_component_without_liquidation_pct": self._time_series_percentiles(
                 yield_component_paths_without_liq * 100.0
+            ),
+            "health_factor": self._time_series_percentiles(hf_paths),
+            "position_liquidation_cumulative_prob_pct": position_liquidation_cumulative_prob_pct,
+            "position_liquidation_first_breach_prob_pct": (
+                position_liquidation_first_breach_prob_pct
             ),
             "steth_eth_without_liquidation": self._time_series_percentiles(
                 steth_without_liq_paths
@@ -2449,18 +2862,52 @@ class Dashboard:
         current_borrow = float(self.rate_model.borrow_rate(self.market.current_weth_utilization))
         snap = self.position.snapshot(current_borrow)
 
-        # === APY forecast (next 24h) ===
-        # Extract borrow rate distribution at t+1 day
-        if n_steps >= 1:
-            rates_day1 = borrow_rate_paths[:, 1]
-            apy_day1 = self.position.net_apy(rates_day1)
-            apy_mean = float(np.mean(apy_day1))
-            apy_p16, apy_p84 = float(np.percentile(apy_day1, 16)), float(np.percentile(apy_day1, 84))
-            apy_p2_5, apy_p97_5 = float(np.percentile(apy_day1, 2.5)), float(np.percentile(apy_day1, 97.5))
-        else:
-            apy_mean = float(snap.net_apy)
-            apy_p16 = apy_p84 = apy_mean
-            apy_p2_5 = apy_p97_5 = apy_mean
+        # === APY forecast (+24h, or horizon when horizon_days < 1) ===
+        forecast_step_idx = int(np.clip(grid.step_at_24h, 0, n_steps))
+        forecast_time_days = float(
+            min(time_grid_days[forecast_step_idx], grid.horizon_days)
+        )
+        forecast_at_horizon = bool(grid.forecast_is_at_horizon)
+        forecast_label = "forecast_at_horizon" if forecast_at_horizon else "forecast_plus_24h"
+        forecast_label_display = (
+            "forecast at horizon" if forecast_at_horizon else "+24h expected net APY"
+        )
+
+        rates_forecast = borrow_rate_paths[:, forecast_step_idx]
+        apy_forecast_paths = self.position.net_apy(rates_forecast)
+        apy_mean = float(np.mean(apy_forecast_paths))
+        apy_p16 = float(np.percentile(apy_forecast_paths, 16))
+        apy_p84 = float(np.percentile(apy_forecast_paths, 84))
+        apy_p2_5 = float(np.percentile(apy_forecast_paths, 2.5))
+        apy_p97_5 = float(np.percentile(apy_forecast_paths, 97.5))
+
+        leverage = float(self.position.leverage)
+        staking_component = float(self.position.staking_apy * leverage)
+        steth_supply_component = float(self.position.steth_supply_apy * leverage)
+        current_borrow_component = float(current_borrow * (leverage - 1.0))
+        forecast_borrow_component = float(np.mean(rates_forecast) * (leverage - 1.0))
+        formula = (
+            "net_apy = leverage * (staking_yield + steth_supply_yield) "
+            "- (leverage - 1) * borrow_rate"
+        )
+        decomposition_tolerance = 1e-10
+        current_decomposition_net = (
+            staking_component + steth_supply_component - current_borrow_component
+        )
+        current_decomposition_residual = float(snap.net_apy - current_decomposition_net)
+        current_decomposition_ok = abs(current_decomposition_residual) <= decomposition_tolerance
+
+        forecast_decomposition_paths = (
+            staking_component
+            + steth_supply_component
+            - (leverage - 1.0) * np.asarray(rates_forecast, dtype=float)
+        )
+        forecast_decomposition_residual = float(
+            np.mean(apy_forecast_paths - forecast_decomposition_paths)
+        )
+        forecast_decomposition_ok = (
+            abs(forecast_decomposition_residual) <= decomposition_tolerance
+        )
 
         # === Risk decomposition shares ===
         bucket_total = (
@@ -2477,7 +2924,7 @@ class Dashboard:
         else:
             carry_risk_pct = unwind_risk_pct = slashing_risk_pct = governance_risk_pct = 0.0
 
-        liquidation_days = first_hf_breach[liquidation_mask]
+        liquidation_days = time_grid_days[first_hf_breach[liquidation_mask]]
         time_to_hf1_median = (
             float(np.median(liquidation_days))
             if liquidation_days.size > 0
@@ -2488,6 +2935,19 @@ class Dashboard:
             if liquidation_days.size > 0
             else None
         )
+        position_liq_24h_prob_pct = None
+        position_liq_7d_prob_pct = None
+        if position_liquidation_cumulative_prob_pct:
+            step_24h = int(np.searchsorted(time_grid_days, 1.0, side="left"))
+            if step_24h < len(position_liquidation_cumulative_prob_pct):
+                position_liq_24h_prob_pct = float(
+                    position_liquidation_cumulative_prob_pct[step_24h]
+                )
+            step_7d = int(np.searchsorted(time_grid_days, 7.0, side="left"))
+            if step_7d < len(position_liquidation_cumulative_prob_pct):
+                position_liq_7d_prob_pct = float(
+                    position_liquidation_cumulative_prob_pct[step_7d]
+                )
         position_prob_liquidation = float(np.clip(risk_output.prob_liquidation, 0.0, 1.0))
         if protocol_liq_counts_raw.size > 0:
             protocol_liq_counts_total = np.asarray(protocol_liq_counts_raw, dtype=float)
@@ -2503,14 +2963,10 @@ class Dashboard:
             if protocol_liq_signal_available
             else 0.0
         )
-        if protocol_liq_signal_available:
-            reported_prob_liquidation = protocol_prob_liquidation
-            reported_prob_source = "protocol_account_replay"
-        else:
-            reported_prob_liquidation = position_prob_liquidation
-            reported_prob_source = "position_hf"
+        reported_prob_liquidation = position_prob_liquidation
+        reported_prob_source = "position_hf"
 
-        horizon_label = f"{n_steps}d"
+        horizon_label = f"{grid.horizon_days:g}d"
         risk_metrics_payload = {
             f"var_95_{horizon_label}": round(risk_output.var_95, 4),
             f"cvar_95_{horizon_label}": round(risk_output.cvar_95, 4),
@@ -2523,8 +2979,24 @@ class Dashboard:
             "prob_liquidation_pct": round(reported_prob_liquidation * 100, 2),
             "prob_liquidation_source": reported_prob_source,
             "prob_position_liquidation_pct": round(position_prob_liquidation * 100, 2),
+            "prob_position_liquidation_by_24h_pct": (
+                round(position_liq_24h_prob_pct, 2)
+                if position_liq_24h_prob_pct is not None
+                else None
+            ),
+            "prob_position_liquidation_by_7d_pct": (
+                round(position_liq_7d_prob_pct, 2)
+                if position_liq_7d_prob_pct is not None
+                else None
+            ),
             "prob_protocol_liquidation_pct": round(protocol_prob_liquidation * 100, 2),
             "protocol_liquidation_signal_available": protocol_liq_signal_available,
+            "headline_liquidation_metric": "loop_position_prob_hf_lt_1",
+            "secondary_liquidation_metric": (
+                "cohort_replay_prob_any_liquidation"
+                if protocol_liq_signal_available
+                else "cohort_replay_unavailable"
+            ),
             "prob_exit_pct": round(decomposition.exit_probability * 100, 2),
             "health_factor_current": round(snap.health_factor, 4),
             "liquidation_risk": "rate/carry driven (oracle exchange-rate path + debt accrual)",
@@ -2534,7 +3006,9 @@ class Dashboard:
             "time_to_hf_lt_1_p95_days": (
                 round(time_to_hf1_p95, 2) if time_to_hf1_p95 is not None else None
             ),
-            "horizon_days": n_steps,
+            "horizon_days": round(float(grid.horizon_days), 6),
+            "grid_steps": n_steps,
+            "dt_days": round(float(dt_days), 8),
             "n_simulations": n_paths,
         }
 
@@ -2570,16 +3044,32 @@ class Dashboard:
 
         return DashboardOutput(
             timestamp=datetime.now(timezone.utc).isoformat(),
+            schema_version=OUTPUT_SCHEMA_VERSION,
+            schema_compatibility={
+                "previous_schema_version": "1.x",
+                "profile_defaults_changed": True,
+                "notes": [
+                    "Default simulation profile is now operational (1d horizon, 10m timestep).",
+                    "Legacy profile preserves historical 30d daily-step behavior.",
+                    "Liquidation headline metric is loop-position P(HF<1); cohort replay is secondary diagnostic.",
+                ],
+            },
             data_sources={
                 "params": params_source,
                 "params_last_updated": self.params_meta["last_updated"],
                 "params_log": self.params_meta["params_log"],
+                "staking_apy_method": self.staking_apy_method,
+                "staking_apy_metadata": self.staking_apy_metadata,
                 "defaults_used": self.defaults_used,
                 "vol": vol_source,
                 "aave_oracle_address": self.aave_oracle_address,
                 "cohort_source": self.cohort_source,
                 "cohort_fetch_error": self.cohort_fetch_error,
                 "cohort_borrower_count": self.cohort_analytics.get("borrower_count"),
+                "cascade_cohort_diagnostics": self.cascade_cohort_diagnostics,
+                "account_bucket_mapping": self.account_bucket_mapping,
+                "collateral_bucket_assumptions": self.collateral_bucket_assumptions,
+                "collateral_assumption_diagnostics": self.collateral_assumption_diagnostics,
                 "cascade_source": cascade_source,
                 "cascade_delegate_source": cascade_delegate_source,
                 "cascade_fallback_reason": cascade_fallback_reason,
@@ -2619,6 +3109,15 @@ class Dashboard:
                     "lambda_impact_resolution_reason": self.lambda_impact_resolution_reason,
                     "volatility_multiplier_non_decreasing": True,
                 },
+                "unwind_cost_model": {
+                    "mode": self.unwind_cost_model,
+                    "slippage_bps": self.zerox_slippage_bps,
+                    "use_min_buy_amount": self.zerox_use_min_buy_amount,
+                    "chain_id": self.zerox_chain_id,
+                    "base_url": self.zerox_base_url,
+                    "live_taker_set": bool(self.zerox_taker),
+                    "live_api_key_set": bool(self.zerox_api_key),
+                },
                 "spread_model": {
                     "shock_vol_annual": self.spread_params.shock_vol_annual,
                     "mean_reversion_speed": self.spread_params.mean_reversion_speed,
@@ -2629,6 +3128,8 @@ class Dashboard:
                     "spread_depeg_sensitivity": self.spread_depeg_sensitivity,
                     "spread_liquidation_flow_sensitivity": self.spread_liquidation_flow_sensitivity,
                     "spread_feedback_to_utilization": self.spread_feedback_to_utilization,
+                    "fixed_staking_yield_mode": self.spread_fixed_staking_yield_mode,
+                    "fixed_staking_yield_apy": self.spread_fixed_staking_yield_apy,
                 },
                 "steth_depeg_model": {
                     "kappa": self.steth_depeg_kappa,
@@ -2644,8 +3145,31 @@ class Dashboard:
                         "corr_realized_eth_return_vs_depeg_change"
                     ],
                 },
+                "exchange_rate_model": {
+                    "mode": self.exchange_rate_mode,
+                    "code_path": (
+                        "src.oracle_dynamics.exchange_rate.generate_lido_exchange_rate"
+                    ),
+                    "parameters": {
+                        "slashing_intensity_annual": self.slashing_intensity_annual,
+                        "slashing_severity": self.slashing_severity,
+                        "capo_max_growth_annual": self.capo_max_growth_annual,
+                    },
+                },
                 "governance_shock_prob_annual": self.gov_shock_prob_annual,
                 "slashing_intensity_annual": self.slashing_intensity_annual,
+                "net_apy_decomposition_check": {
+                    "current": {
+                        "tolerance": decomposition_tolerance,
+                        "passed": current_decomposition_ok,
+                        "residual": current_decomposition_residual,
+                    },
+                    "forecast": {
+                        "tolerance": decomposition_tolerance,
+                        "passed": forecast_decomposition_ok,
+                        "residual": forecast_decomposition_residual,
+                    },
+                },
                 "depeg_calibration": self.depeg_calibration,
                 "tail_risk_calibration": self.tail_risk_calibration,
                 "depeg_driver_role": "execution_layer_plus_mtm",
@@ -2669,19 +3193,44 @@ class Dashboard:
                 'total_debt_weth': round(snap.total_debt_weth, 3),
                 'current_borrow_rate_pct': round(current_borrow * 100, 3),
                 'net_apy_pct': round(snap.net_apy * 100, 3),
+                'net_apy_label': 'current net APY',
                 'health_factor': round(snap.health_factor, 4),
                 'liquidation_risk': 'carry/rate driven (HF tracks debt growth + oracle ER)',
             },
             current_apy={
+                'label': 'current net APY',
                 'net': round(float(snap.net_apy) * 100, 3),
-                'gross': round((self.position.staking_apy + self.position.steth_supply_apy) * self.position.leverage * 100, 3),
-                'borrow_cost': round(current_borrow * (self.position.leverage - 1) * 100, 3),
+                'gross': round((self.position.staking_apy + self.position.steth_supply_apy) * leverage * 100, 3),
+                'borrow_cost': round(current_borrow_component * 100, 3),
+                'staking_yield': round(staking_component * 100, 3),
+                'steth_supply_yield': round(steth_supply_component * 100, 3),
+                'leverage': round(leverage, 6),
+                'formula': formula,
                 'steth_borrow_income_bps': round(self.position.steth_supply_apy * self.position.leverage * 10000, 1),
+                'decomposition_check': {
+                    'tolerance': decomposition_tolerance,
+                    'passed': current_decomposition_ok,
+                    'residual': current_decomposition_residual,
+                },
             },
             apy_forecast_24h={
+                'label': forecast_label_display,
+                'label_key': forecast_label,
+                'step_index': forecast_step_idx,
+                'forecast_time_days': round(forecast_time_days, 8),
                 'mean': round(apy_mean * 100, 3),
                 'ci_68': [round(apy_p16 * 100, 3), round(apy_p84 * 100, 3)],
                 'ci_95': [round(apy_p2_5 * 100, 3), round(apy_p97_5 * 100, 3)],
+                'staking_yield': round(staking_component * 100, 3),
+                'steth_supply_yield': round(steth_supply_component * 100, 3),
+                'borrow_cost': round(forecast_borrow_component * 100, 3),
+                'leverage': round(leverage, 6),
+                'formula': formula,
+                'decomposition_check': {
+                    'tolerance': decomposition_tolerance,
+                    'passed': forecast_decomposition_ok,
+                    'residual': forecast_decomposition_residual,
+                },
             },
             risk_metrics=risk_metrics_payload,
             risk_decomposition={
@@ -2727,6 +3276,7 @@ class Dashboard:
                     'borrow_rate_peak': round(r.borrow_rate_peak * 100, 2),
                     'unwind_cost_100pct_avg': round(r.unwind_cost_100pct_avg, 4),
                     'time_to_hf_lt_1_days': r.time_to_hf_breach_days,
+                    'exchange_rate_mode': getattr(r, "exchange_rate_mode", self.exchange_rate_mode),
                     'source': r.source,
                 }
                 for r in stress_results
@@ -2739,14 +3289,38 @@ class Dashboard:
             time_series_diagnostics=time_series_diagnostics,
             simulation_config={
                 'n_simulations': n_paths,
-                'horizon_days': n_steps,
+                'horizon_days': round(float(grid.horizon_days), 6),
+                'n_steps': n_steps,
+                'n_cols': n_cols,
                 'seed': seed,
                 'dt': dt,
+                'dt_days': dt_days,
+                'staking_apy_method': self.staking_apy_method,
+                'staking_apy_metadata': self.staking_apy_metadata,
+                'timestep_minutes': (
+                    float(getattr(self.config, "timestep_minutes", 0.0))
+                    if getattr(self.config, "timestep_minutes", None) is not None
+                    else None
+                ),
+                'timestep_days': getattr(self.config, "timestep_days", None),
+                'timestep_source': grid.timestep_source,
+                'profile_name': getattr(self.config, "profile_name", "operational"),
+                'allow_step_cap_override': bool(
+                    getattr(self.config, "allow_step_cap_override", False)
+                ),
+                'grid_warnings': list(grid.warnings),
+                'time_grid_days': [round(float(v), 8) for v in time_grid_days],
+                'step_at_24h': int(forecast_step_idx),
+                'forecast_label_key': forecast_label,
                 'calibrated_sigma': round(self.calibrated_sigma, 4),
                 'cascade_avg_ltv': self.cascade_avg_ltv,
                 'cascade_avg_lt': self.cascade_avg_lt,
                 'cohort_source': self.cohort_source,
                 'cohort_borrower_count': self.cohort_analytics.get("borrower_count"),
+                'cascade_cohort_diagnostics': self.cascade_cohort_diagnostics,
+                'account_bucket_mapping': self.account_bucket_mapping,
+                'collateral_bucket_assumptions': self.collateral_bucket_assumptions,
+                'collateral_assumption_diagnostics': self.collateral_assumption_diagnostics,
                 'cascade_source': cascade_source,
                 'cascade_delegate_source': cascade_delegate_source,
                 'cascade_account_count': cascade_account_count,
@@ -2792,6 +3366,13 @@ class Dashboard:
                 'lambda_impact': self.lambda_impact,
                 'lambda_impact_resolution_reason': self.lambda_impact_resolution_reason,
                 'volatility_multiplier_non_decreasing': True,
+                'unwind_cost_model': self.unwind_cost_model,
+                'zerox_slippage_bps': self.zerox_slippage_bps,
+                'zerox_use_min_buy_amount': self.zerox_use_min_buy_amount,
+                'zerox_chain_id': self.zerox_chain_id,
+                'zerox_base_url': self.zerox_base_url,
+                'zerox_live_taker_set': bool(self.zerox_taker),
+                'zerox_live_api_key_set': bool(self.zerox_api_key),
                 'spread_shock_vol_annual': self.spread_params.shock_vol_annual,
                 'spread_mean_reversion_speed': self.spread_params.mean_reversion_speed,
                 'spread_use_realized_exchange_yield': self.spread_params.use_realized_exchange_yield,
@@ -2799,12 +3380,18 @@ class Dashboard:
                 'spread_depeg_sensitivity': self.spread_depeg_sensitivity,
                 'spread_liquidation_flow_sensitivity': self.spread_liquidation_flow_sensitivity,
                 'spread_feedback_to_utilization': self.spread_feedback_to_utilization,
+                'spread_fixed_staking_yield_mode': self.spread_fixed_staking_yield_mode,
+                'spread_fixed_staking_yield_apy': self.spread_fixed_staking_yield_apy,
                 'steth_depeg_kappa': self.steth_depeg_kappa,
                 'steth_depeg_long_run': self.steth_depeg_long_run,
                 'steth_depeg_sigma': self.steth_depeg_sigma,
                 'steth_depeg_max': self.steth_depeg_max,
                 'steth_depeg_corr_eth_return': self.steth_depeg_corr_eth_return,
                 'steth_depeg_liquidation_alpha': self.steth_depeg_liquidation_alpha,
+                'exchange_rate_mode': self.exchange_rate_mode,
+                'exchange_rate_code_path': (
+                    'src.oracle_dynamics.exchange_rate.generate_lido_exchange_rate'
+                ),
                 'governance_shock_prob_annual': self.gov_shock_prob_annual,
                 'governance_ir_spread': self.gov_ir_spread,
                 'governance_lt_haircut': self.gov_lt_haircut,

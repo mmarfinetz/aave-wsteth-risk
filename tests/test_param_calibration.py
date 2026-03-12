@@ -1,7 +1,5 @@
 """Tests for parameter calibration in config.params."""
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
@@ -11,6 +9,7 @@ from config.params import (
     _calibrate_governance_and_slashing,
     load_params,
 )
+from data.fetcher import FetchedData
 
 
 def _synthetic_steth_history(n_days: int = 365, seed: int = 7) -> list[float]:
@@ -44,7 +43,7 @@ def _fake_fetched_snapshot(
     borrow_ts: list[int],
     data_source: str = "test",
 ):
-    return SimpleNamespace(
+    data = FetchedData(
         ltv=0.93,
         liquidation_threshold=0.95,
         liquidation_bonus=0.01,
@@ -73,15 +72,25 @@ def _fake_fetched_snapshot(
         weth_borrow_apy_timestamps=borrow_ts,
         last_updated="2026-02-12T00:00:00+00:00",
         data_source=data_source,
-        params_log=[
-            {
-                "name": "adv_weth",
-                "value": 1_750_000.0,
-                "source": "On-chain WETH Transfer logs via eth_getLogs",
-                "fetched_at": "2026-02-12T00:00:00+00:00",
-            }
-        ],
     )
+    data.params_log = [
+        {
+            "name": "adv_weth",
+            "value": 1_750_000.0,
+            "source": "On-chain WETH Transfer logs via eth_getLogs",
+            "fetched_at": "2026-02-12T00:00:00+00:00",
+        }
+    ]
+    return data
+
+
+def _fake_subgraph_analytics() -> dict:
+    return {
+        "borrower_count": 3210,
+        "avg_ltv_weighted": 0.77,
+        "avg_lt_weighted": 0.84,
+        "eth_collateral_fraction": 0.31,
+    }
 
 
 def test_calibrate_depeg_params_from_history():
@@ -169,6 +178,10 @@ def test_load_params_returns_calibrated_tail_fields(monkeypatch):
             {"steth_eth_price": 0.936, "timestamp": 1655510400},
         ],
     )
+    monkeypatch.setattr(
+        "data.subgraph_fetcher.fetch_subgraph_cohort_analytics_from_env",
+        _fake_subgraph_analytics,
+    )
 
     payload = load_params(force_refresh=False, strict_aave=True)
 
@@ -204,6 +217,10 @@ def test_load_params_uses_cache_when_sandbox_network_disabled(monkeypatch):
     monkeypatch.setattr("data.fetcher._load_cache", lambda: cached)
     monkeypatch.setattr("data.fetcher._is_stale", lambda _data: False)
     monkeypatch.setattr("data.fetcher.fetch_historical_stress_data", lambda: [])
+    monkeypatch.setattr(
+        "data.subgraph_fetcher.fetch_subgraph_cohort_analytics_from_env",
+        _fake_subgraph_analytics,
+    )
 
     payload = load_params(force_refresh=True, strict_aave=True)
 
@@ -240,6 +257,10 @@ def test_load_params_retries_non_strict_when_strict_fetch_fails(monkeypatch):
 
     monkeypatch.setattr("data.fetcher.fetch_all", _fake_fetch_all)
     monkeypatch.setattr("data.fetcher.fetch_historical_stress_data", lambda: [])
+    monkeypatch.setattr(
+        "data.subgraph_fetcher.fetch_subgraph_cohort_analytics_from_env",
+        _fake_subgraph_analytics,
+    )
 
     payload = load_params(force_refresh=True, strict_aave=True)
 

@@ -1,6 +1,8 @@
 # Aave wstETH/WETH Risk Dashboard
 
-Monte Carlo risk dashboard for leveraged wstETH/WETH looping on Aave V3.
+Monte Carlo risk engine and backend API for leveraged wstETH/WETH looping on Aave V3.
+
+This repository contains the simulation engine and HTTP API only. The dashboard UI lives in a separate codebase.
 
 ## What this project does
 
@@ -33,21 +35,21 @@ The fetcher reads live state from Aave V3 and related contracts using public RPC
 | Curve pool params | Curve stETH/ETH (`0xDC24...`) | `A()`, `balances(0)`, `balances(1)` |
 | Gas price | RPC | `eth_gasPrice` |
 
-RPC priority: `ETH_RPC_URL` (if set) > free public endpoints (PublicNode, 1RPC, dRPC, LlamaRPC, Cloudflare) > Etherscan proxy fallback.
+RPC priority: `ETH_RPC_URL` (if set) > free public endpoints (PublicNode, 1RPC, dRPC, Cloudflare) > Etherscan proxy fallback.
 
-### API data (supplementary)
+### Supplemental data inputs
 
 | Data | Source | Notes |
 |---|---|---|
 | ETH/USD price history (90d) | CoinGecko | Used for EWMA volatility calibration |
 | stETH/ETH market price | CoinGecko | Used for market/execution diagnostics and stress calibration, not direct oracle HF |
-| ETH collateral fraction | DeFiLlama yields API | Cross-pool aggregate for cascade model |
-| Historical stress prices | DeFiLlama coins API | ETH/stETH at Terra, 3AC, FTX events |
-| stETH staking reward APY | DeFiLlama yields API | Fallback when on-chain rate unavailable |
+| Borrower/cohort analytics | Aave subgraph | Required cohort calibration inputs and ETH collateral share |
+| Historical stress records | Local cache | Optional Terra / 3AC / FTX snapshots when cache is present |
+| Staking APY / borrow APY history | Cache or defaults | No direct live feed is wired in runtime |
 
-### Aave subgraph (optional, opt-in)
+### Aave subgraph (required for live cohort analytics)
 
-The Aave subgraph provides borrower-level position data for advanced cohort analytics and account-level liquidation replay. This is entirely opt-in via `--use-subgraph-cohort` and `--use-account-level-cascade` flags. Reserve-level pool totals and baseline protocol state always come from on-chain sources, never from the subgraph.
+The Aave subgraph provides borrower-level position data for cohort calibration on every live `load_params()` run. Account-level liquidation replay remains optional via `--use-account-level-cascade`. Reserve-level pool totals and baseline protocol state always come from on-chain sources, never from the subgraph.
 
 ### Caching and fallback
 
@@ -98,15 +100,21 @@ Interpretation:
 # Install dependencies
 pip install -r requirements.txt
 
-# (Optional) Configure API keys for CoinGecko, Etherscan, custom RPC
+# Configure required subgraph endpoint and optional API keys
 cp .env.example .env
-# Edit .env with your keys — the dashboard works without them using free public RPCs
+# Edit .env with AAVE_SUBGRAPH_URL and any optional keys you want to use
 
-# Run with defaults (10 ETH, 10 loops, 10k sims, 30d horizon)
+# Run with defaults (operational profile: 1d horizon, 10m timestep)
 python run_dashboard.py
 
 # Custom parameters
 python run_dashboard.py --capital 50 --loops 7 --simulations 20000 --horizon 14
+
+# Legacy profile (backward-compatible 30d daily-step behavior)
+python run_dashboard.py --profile legacy
+
+# Explicit high-frequency operational run
+python run_dashboard.py --profile operational --horizon 1 --timestep-minutes 10
 
 # Force live data refresh (skip cache)
 python run_dashboard.py --fetch
@@ -114,11 +122,11 @@ python run_dashboard.py --fetch
 # JSON output (for programmatic consumption)
 python run_dashboard.py --json
 
-# Enable subgraph borrower analytics (requires AAVE_SUBGRAPH_URL in .env)
-python run_dashboard.py --use-subgraph-cohort
-
 # Enable account-level liquidation replay (requires AAVE_SUBGRAPH_URL in .env)
 python run_dashboard.py --use-account-level-cascade
+
+# Use live 0x quote-based unwind costs (requires ZEROX_API_KEY + taker address)
+python run_dashboard.py --unwind-cost-model live_0x --zerox-taker 0xYourEOA...
 
 # Enable hybrid Monte Carlo + ABM cascade (ABM surrogate projection)
 python run_dashboard.py --abm-enabled --abm-mode surrogate
@@ -128,9 +136,23 @@ python run_dashboard.py --abm-enabled --abm-mode full
 
 # Full-featured run
 python run_dashboard.py --capital 50 --loops 7 --simulations 20000 --horizon 30 \
-  --fetch --use-subgraph-cohort --use-account-level-cascade \
+  --fetch --use-account-level-cascade \
   --abm-enabled --abm-mode surrogate
+
+# Run the backend API locally
+python api.py
+
+# Optional demo mode from a saved payload
+python run_dashboard.py --json > out.json
+python api.py --demo
 ```
+
+## HTTP API
+
+- `GET /health`: basic liveness check
+- `GET /api/health`: API liveness check
+- `GET /api/dashboard`: run the default dashboard request from environment-backed defaults
+- `POST /api/dashboard`: submit a parameterized run request and receive `result`, `timings`, and `meta`
 
 ## Environment variables
 
@@ -139,10 +161,12 @@ python run_dashboard.py --capital 50 --loops 7 --simulations 20000 --horizon 30 
 | `ETH_RPC_URL` | No | Preferred Ethereum JSON-RPC endpoint (Alchemy, Infura, your own node). Free public RPCs are used by default. |
 | `COINGECKO_API_KEY` or `COINGECKO_DEMO_API_KEY` | No | CoinGecko ETH price history and stETH/ETH market price. Free demo key available at coingecko.com. |
 | `ETHERSCAN_API_KEY` | No | Etherscan proxy fallback for `eth_call` and gas price when public RPCs fail. |
+| `ZEROX_API_KEY` | No | Required only when `--unwind-cost-model live_0x`; authenticates 0x quote API calls. |
+| `ZEROX_TAKER_ADDRESS` | No | Required only when `--unwind-cost-model live_0x` unless provided via `--zerox-taker`. |
 | `GRAPH_API_KEY` | No | The Graph gateway auth for subgraph queries (when `AAVE_SUBGRAPH_URL` uses `/api/subgraphs/...` form). |
-| `AAVE_SUBGRAPH_URL` | No | Aave V3 subgraph endpoint. Only used with `--use-subgraph-cohort` and/or `--use-account-level-cascade`. |
+| `AAVE_SUBGRAPH_URL` | Yes for live runs | Aave V3 subgraph endpoint used for cohort analytics on every live parameter load and for optional account-level replay. |
 
-The dashboard works out of the box with no environment variables set. It uses free public Ethereum RPC endpoints for on-chain data and falls back gracefully when optional API keys are unavailable.
+The dashboard does not require paid API keys, but live runs do require `AAVE_SUBGRAPH_URL`. On-chain reads use free public Ethereum RPC endpoints by default, and CoinGecko / Etherscan keys remain optional.
 
 ## CLI options
 
@@ -151,16 +175,32 @@ The dashboard works out of the box with no environment variables set. It uses fr
 | `--capital` | `10.0` | Initial capital in ETH |
 | `--loops` | `10` | Number of recursive leverage loops |
 | `--simulations` | `10000` | Monte Carlo paths |
-| `--horizon` | `30` | Horizon in days |
+| `--profile` | `operational` | Simulation profile (`operational` = 1d/10m, `legacy` = 30d/daily) |
+| `--horizon` | profile default | Horizon in days (float) |
+| `--timestep-minutes` | profile/default | Timestep in minutes (highest precedence when set) |
+| `--timestep-days` | unset | Timestep in days (used when `--timestep-minutes` is unset) |
+| `--allow-large-step-grid` | off | Bypass hard max-step guardrail for minute-level/high-resolution grids |
 | `--seed` | `42` | RNG seed for reproducibility |
 | `--json` | off | Emit JSON output instead of formatted text |
 | `--fetch` | off | Force live data refresh (bypass fresh cache) |
+| `--staking-apy-method` | horizon-aware | Staking APY method (`latest` or `trailing_7d_avg`) |
+| `--staking-apy-lookback-days` | `7` | Lookback window for trailing staking APY |
+| `--exchange-rate-mode` | profile-aware | Exchange-rate model mode (`simple` or `capo_slashing`) |
+| `--unwind-cost-model` | `curve` | Unwind cost model (`curve` or live `live_0x`) |
+| `--zerox-slippage-bps` | `50` | Slippage tolerance used by 0x quote requests in `live_0x` mode |
+| `--zerox-chain-id` | `1` | 0x chain id in `live_0x` mode |
+| `--zerox-base-url` | `https://api.0x.org` | 0x API base URL in `live_0x` mode |
+| `--zerox-taker` | unset | Taker address for 0x `/quote` calls (or use `ZEROX_TAKER_ADDRESS`) |
+| `--zerox-use-min-buy-amount` / `--zerox-use-buy-amount` | buy amount | Choose `minBuyAmount` (conservative) or `buyAmount` for live quote unwind math |
 | `--cascade-avg-ltv` | `0.70` | Manual override for cascade cohort average LTV |
 | `--cascade-avg-lt` | `0.80` | Manual override for cascade cohort average liquidation threshold |
-| `--use-subgraph-cohort` | off | Fetch borrower/cohort analytics from Aave subgraph |
 | `--use-account-level-cascade` | off | Enable account-level liquidation replay (falls back to aggregate proxy) |
 | `--account-replay-max-paths` | `512` | Replay acceleration: max ETH paths used in account-level replay before interpolation |
 | `--account-replay-max-accounts` | `5000` | Replay acceleration: max accounts kept in account-level replay (debt-ranked) |
+| `--account-bucket-mapping-json` | unset | JSON overrides for account replay collateral/debt bucket mapping |
+| `--collateral-bucket-assumptions-json` | unset | JSON assumptions (`beta`,`haircut`) for `weth`/`steth_like`/`other` collateral buckets |
+| `--spread-fixed-staking-yield-mode` | off | Hold staking yield fixed in spread dynamics (short-horizon operations) |
+| `--spread-fixed-staking-yield-apy` | current staking APY | Fixed staking APY used when fixed-yield mode is enabled |
 | `--abm-enabled` | off | Enable inner ABM cascade layer |
 | `--abm-mode` | `off` | ABM mode (`off`, `surrogate`, `full`) |
 | `--abm-max-paths` | `256` | Max paths processed by ABM before surrogate projection |
@@ -171,9 +211,72 @@ The dashboard works out of the box with no environment variables set. It uses fr
 | `--abm-lp-response-strength` | `0.50` | LP endogenous response strength (`0-2`) |
 | `--abm-random-seed-offset` | `10000` | Seed offset for ABM internals (deterministic with global seed) |
 
-## Subgraph cohort analytics (optional)
+## Time grid and forecast semantics
 
-When enabled with `--use-subgraph-cohort`, the dashboard fetches borrower-level position data from the Aave subgraph and derives cohort calibration inputs for the cascade model:
+- One shared simulation grid is used across MC price/rate paths, account replay, spread dynamics, liquidation diagnostics, and stress modules.
+- Timestep precedence is: `--timestep-minutes` -> `--timestep-days` -> profile default.
+- Runtime guardrails:
+  - Soft warning when step count exceeds threshold.
+  - Hard fail above max-step cap unless `--allow-large-step-grid` is set.
+- `+24h` APY forecast selection uses `step_at_24h = min(round(1.0 / dt_days), n_steps)`.
+- If `horizon_days < 1.0`, forecast is evaluated at horizon end and labeled `forecast at horizon`.
+
+## Net APY decomposition identity
+
+Outputs include explicit components and formula metadata:
+
+- staking yield
+- stETH supply yield
+- borrow cost
+- leverage
+- exact formula string
+
+A decomposition consistency check is emitted with pass/fail status and residual in both:
+
+- `current_apy.decomposition_check`
+- `apy_forecast_24h.decomposition_check`
+
+Global diagnostics copy: `data_sources.net_apy_decomposition_check`.
+
+## Exchange-rate model modes (inspectable)
+
+Two code-path modes are supported:
+
+- `simple`: constant accrual, no CAPO/slashing tails (short operational runs)
+- `capo_slashing`: CAPO-capped accrual plus stochastic slashing tails (stress research)
+
+Per-step mechanics are implemented in:
+
+- `src/oracle_dynamics/exchange_rate.py`
+- function: `generate_lido_exchange_rate(...)`
+
+Run outputs always serialize selected mode and inputs in:
+
+- `data_sources.exchange_rate_model`
+- `simulation_config.exchange_rate_mode`
+
+## Liquidation probability labels
+
+- Headline metric: loop-position liquidation probability `P(HF<1)` from simulated position HF.
+- Secondary diagnostic (when available): cohort/protocol replay liquidation probability.
+- Both are labeled separately in CLI and JSON output.
+
+## Rollout plan and acceptance gates
+
+1. Release 1 (implemented in this branch):
+   - Steps 1-7 from the implementation plan.
+   - Schema bump to `2.0.0` with compatibility notes in output metadata.
+   - Core tests for grid/indexing, +24h semantics, APY decomposition, APY method/provenance, and liquidation metric priority.
+2. Release 2 (implemented in this branch):
+   - Steps 8-12 from the implementation plan.
+   - Bucket transparency/config, spread decomposition controls, collateral assumption diagnostics, exchange-rate mode switch, concise CAPO/slashing metadata path.
+   - Expanded model tests and 1-day behavior checks.
+3. Release 3 (next milestone):
+   - Position-level replay migration (per-position collateral/debt/LT, position-level liquidation logic, performance controls, parity diagnostics).
+
+## Subgraph cohort analytics
+
+Live runs fetch borrower-level position data from the Aave subgraph and derive cohort calibration inputs for the cascade model:
 
 - borrower count and LTV distribution (`p50/p75/p90/p95/p99`)
 - debt-weighted average cohort LTV and liquidation threshold
@@ -212,7 +315,7 @@ python run_dashboard.py --abm-enabled --abm-mode surrogate
 python run_dashboard.py --abm-enabled --abm-mode full
 
 # Combined with cohort analytics
-python run_dashboard.py --use-subgraph-cohort --use-account-level-cascade --abm-enabled
+python run_dashboard.py --use-account-level-cascade --abm-enabled
 
 # Faster replay for large cohorts / high simulation count
 python run_dashboard.py --use-account-level-cascade \
@@ -239,7 +342,7 @@ Assumptions:
 ## Sample output (representative; live values vary)
 
 ```text
-$ python3 run_dashboard.py --use-subgraph-cohort
+$ python3 run_dashboard.py
 ======================================================================
   wstETH/ETH Looping Strategy Risk Dashboard
 ======================================================================
@@ -249,7 +352,6 @@ $ python3 run_dashboard.py --use-subgraph-cohort
   [INFO] Fetching live protocol data...
   [OK] Fetched ETH price history
   [OK] Fetched stETH/ETH price history
-  [INFO] DeFiLlama WETH borrows missing — keeping on-chain reserve totals.
   [OK] Fetched Aave WETH params
   [OK] Fetched ETH gas price
   [OK] Fetched wstETH exchange rate
@@ -378,18 +480,18 @@ This section is the source-of-truth for parameters, where they come from, and ho
 | Parameter | Default | How derived / sourced |
 |---|---:|---|
 | `wsteth_steth_rate` | `1.225` | On-chain `stEthPerToken()` / 1e18 |
-| `staking_apy` | `0.025` | DeFiLlama wstETH pool reward APY (if present), else default |
-| `steth_supply_apy` | `0.001` | DeFiLlama Aave wstETH pool base APY, else default |
+| `staking_apy` | `0.025` | Cached staking APY when present, else shared default |
+| `steth_supply_apy` | `0.001` | On-chain Aave `getReserveData(wstETH)` `currentLiquidityRate` |
 
 ### `MarketParams` (`config/params.py`)
 
 | Parameter | Default | How derived / sourced |
 |---|---:|---|
-| `current_weth_utilization` | `0.78` | Prefer on-chain WETH borrows/supply; DeFiLlama fallback |
+| `current_weth_utilization` | `0.78` | On-chain WETH borrows divided by on-chain WETH supply |
 | `steth_eth_price` | `1.0` | CoinGecko stETH/ETH market price (used for MTM/unwind layer, not direct oracle HF for this pair) |
-| `eth_usd_price` | `2500.0` | CoinGecko history last point; DeFiLlama/CoinGecko spot fallback |
+| `eth_usd_price` | `2500.0` | CoinGecko history last point |
 | `gas_price_gwei` | `30.0` | RPC `eth_gasPrice`; Etherscan fallback; then shared default |
-| `eth_collateral_fraction` | `0.0` | DeFiLlama Aave V3 Ethereum ETH-symbol collateral share |
+| `eth_collateral_fraction` | `0.0` | Aave subgraph ETH-symbol collateral share |
 
 ### `CurvePoolParams` (`config/params.py`)
 

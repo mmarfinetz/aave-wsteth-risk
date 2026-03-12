@@ -7,7 +7,7 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -60,6 +60,7 @@ class CohortMetadata:
     fetched_at: str
     account_count: int
     warnings: list[str] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +100,7 @@ class ReplayDiagnostics:
     borrow_rate_after_liquidation: np.ndarray | None = None
     borrow_rate_delta: np.ndarray | None = None
     utilization: np.ndarray | None = None
+    bucket_diagnostics: dict[str, Any] | None = None
     paths_processed: int = 0
     replay_projection: str = "none"
     warnings: list[str] = field(default_factory=list)
@@ -125,6 +127,7 @@ class AccountLiquidationReplayEngine:
         weth_borrow_reduction_fraction: float = 0.15,
         liquidation_policy: LiquidationPolicy | None = None,
         execution_cost_model: ExecutionCostModel | None = None,
+        path_batch_size: int = 32,
     ):
         policy = liquidation_policy or LiquidationPolicy(
             close_factor_threshold=close_factor_threshold,
@@ -147,6 +150,7 @@ class AccountLiquidationReplayEngine:
             min_bps=0.0,
             max_bps=0.0,
         )
+        self.path_batch_size = max(int(path_batch_size), 1)
 
     @staticmethod
     def _supports_sigma_kwargs(method: Callable, *, required: tuple[str, ...]) -> bool:
@@ -250,11 +254,199 @@ class AccountLiquidationReplayEngine:
             return self.close_factor_full
         return self.close_factor_normal
 
+    @staticmethod
+    def _pct_of_total(value: float, total: float) -> float:
+        if total <= 0.0:
+            return 0.0
+        return float(np.clip(value / total, 0.0, 1.0) * 100.0)
+
+    @staticmethod
+    def _build_bucket_diagnostics(
+        accounts: list[AccountState],
+        initial_spot_usd: float,
+    ) -> dict[str, Any]:
+        eps = np.finfo(float).eps
+        spot = max(float(initial_spot_usd), eps)
+
+        collateral_weth = 0.0
+        collateral_steth = 0.0
+        collateral_other = 0.0
+        collateral_total = 0.0
+
+        debt_usdc = 0.0
+        debt_usdt = 0.0
+        debt_eth_pool = 0.0
+        debt_other = 0.0
+        debt_total_legacy = 0.0
+
+        for account in accounts:
+            coll_total = max(float(account.collateral_eth), 0.0)
+            collateral_total += coll_total
+            collateral_weth += (
+                max(float(account.collateral_weth), 0.0)
+                if account.collateral_weth is not None
+                else 0.0
+            )
+            collateral_steth += (
+                max(float(account.collateral_steth_eth), 0.0)
+                if account.collateral_steth_eth is not None
+                else 0.0
+            )
+            collateral_other += (
+                max(float(account.collateral_other_eth), 0.0)
+                if account.collateral_other_eth is not None
+                else 0.0
+            )
+
+            debt_total_legacy += max(float(account.debt_eth), 0.0) * spot
+            debt_usdc += (
+                max(float(account.debt_usdc), 0.0)
+                if account.debt_usdc is not None
+                else 0.0
+            )
+            debt_usdt += (
+                max(float(account.debt_usdt), 0.0)
+                if account.debt_usdt is not None
+                else 0.0
+            )
+            debt_eth_pool_usd = (
+                max(float(account.debt_eth_pool_usd), 0.0)
+                if account.debt_eth_pool_usd is not None
+                else 0.0
+            )
+            debt_eth_pool_eth = (
+                max(float(account.debt_eth_pool_eth), 0.0)
+                if account.debt_eth_pool_eth is not None
+                else 0.0
+            )
+            debt_eth_pool += max(debt_eth_pool_usd, debt_eth_pool_eth * spot)
+            debt_other += (
+                max(float(account.debt_other_usd), 0.0)
+                if account.debt_other_usd is not None
+                else 0.0
+            )
+
+        collateral_assigned = collateral_weth + collateral_steth + collateral_other
+        collateral_unmapped = max(collateral_total - collateral_assigned, 0.0)
+
+        debt_assigned = debt_usdc + debt_usdt + debt_eth_pool + debt_other
+        debt_unmapped = max(debt_total_legacy - debt_assigned, 0.0)
+
+        return {
+            "classification_logic": {
+                "source": "account_state_bucket_fields",
+                "version": "v1",
+                "coverage_percent_formula": "bucket_value / total_value * 100",
+                "unmapped_residue_formula": "max(total_value - sum(bucket_values), 0)",
+                "legacy_fallback_rules": [
+                    "If debt bucket totals are missing, replay maps legacy debt to USDC for simulation.",
+                    "If collateral bucket totals are missing, replay maps legacy collateral to WETH for simulation.",
+                ],
+            },
+            "bucket_definitions": {
+                "collateral": {
+                    "weth": "AccountState.collateral_weth (ETH)",
+                    "steth_like": "AccountState.collateral_steth_eth (ETH)",
+                    "other": "AccountState.collateral_other_eth (ETH)",
+                },
+                "debt": {
+                    "usdc": "AccountState.debt_usdc (USD)",
+                    "usdt": "AccountState.debt_usdt (USD)",
+                    "eth_pool": (
+                        "max(AccountState.debt_eth_pool_usd, "
+                        "AccountState.debt_eth_pool_eth * initial_spot_usd)"
+                    ),
+                    "other": "AccountState.debt_other_usd (USD)",
+                },
+            },
+            "coverage": {
+                "collateral": {
+                    "unit": "eth",
+                    "total": collateral_total,
+                    "buckets": {
+                        "weth": {
+                            "value": collateral_weth,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                collateral_weth, collateral_total
+                            ),
+                        },
+                        "steth_like": {
+                            "value": collateral_steth,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                collateral_steth, collateral_total
+                            ),
+                        },
+                        "other": {
+                            "value": collateral_other,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                collateral_other, collateral_total
+                            ),
+                        },
+                    },
+                    "assigned_total": {
+                        "value": collateral_assigned,
+                        "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                            collateral_assigned, collateral_total
+                        ),
+                    },
+                    "unmapped_residue": {
+                        "value": collateral_unmapped,
+                        "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                            collateral_unmapped, collateral_total
+                        ),
+                    },
+                },
+                "debt": {
+                    "unit": "usd",
+                    "total": debt_total_legacy,
+                    "buckets": {
+                        "usdc": {
+                            "value": debt_usdc,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                debt_usdc, debt_total_legacy
+                            ),
+                        },
+                        "usdt": {
+                            "value": debt_usdt,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                debt_usdt, debt_total_legacy
+                            ),
+                        },
+                        "eth_pool": {
+                            "value": debt_eth_pool,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                debt_eth_pool, debt_total_legacy
+                            ),
+                        },
+                        "other": {
+                            "value": debt_other,
+                            "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                                debt_other, debt_total_legacy
+                            ),
+                        },
+                    },
+                    "assigned_total": {
+                        "value": debt_assigned,
+                        "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                            debt_assigned, debt_total_legacy
+                        ),
+                    },
+                    "unmapped_residue": {
+                        "value": debt_unmapped,
+                        "pct_of_total": AccountLiquidationReplayEngine._pct_of_total(
+                            debt_unmapped, debt_total_legacy
+                        ),
+                    },
+                },
+            },
+        }
+
     def _build_empty_result(
         self,
         n_paths: int,
         n_timesteps: int,
         warnings: list[str],
+        bucket_diagnostics: dict[str, Any] | None = None,
     ) -> ReplayResult:
         zeros_f = np.zeros((n_paths, n_timesteps), dtype=float)
         zeros_i = np.zeros((n_paths, n_timesteps), dtype=int)
@@ -284,6 +476,7 @@ class AccountLiquidationReplayEngine:
                 borrow_rate_after_liquidation=zeros_f.copy(),
                 borrow_rate_delta=zeros_f.copy(),
                 utilization=zeros_f.copy(),
+                bucket_diagnostics=bucket_diagnostics,
                 iterations_used=zeros_i.copy(),
                 max_iterations_hit_count=0,
                 max_iterations=self.max_iterations,
@@ -407,12 +600,25 @@ class AccountLiquidationReplayEngine:
         borrow_reduction_fraction = float(
             np.clip(market_state.weth_borrow_reduction_fraction, 0.0, 1.0)
         )
+        initial_spot_usd = float(np.median(spot_paths_usd[:, 0]))
+        bucket_diagnostics = self._build_bucket_diagnostics(accounts, initial_spot_usd)
+        bucket_diagnostics["legacy_fallback_counts"] = {
+            "stable_debt_to_usdc": 0,
+            "collateral_to_weth": 0,
+            "account_count": int(len(accounts)),
+            "stable_debt_to_usdc_pct_accounts": 0.0,
+            "collateral_to_weth_pct_accounts": 0.0,
+        }
 
         if not accounts:
             warnings.append("Account replay skipped: account cohort is empty")
-            return self._build_empty_result(n_paths=n_paths, n_timesteps=n_timesteps, warnings=warnings)
+            return self._build_empty_result(
+                n_paths=n_paths,
+                n_timesteps=n_timesteps,
+                warnings=warnings,
+                bucket_diagnostics=bucket_diagnostics,
+            )
 
-        initial_spot_usd = float(np.median(spot_paths_usd[:, 0]))
         fallback_stable_breakdown = 0
         fallback_collateral_breakdown = 0
 
@@ -509,6 +715,20 @@ class AccountLiquidationReplayEngine:
                 "WETH collateral breakdown missing for "
                 f"{fallback_collateral_breakdown} accounts; falling back to collateral_eth"
             )
+        account_count = max(len(accounts), 1)
+        bucket_diagnostics["legacy_fallback_counts"] = {
+            "stable_debt_to_usdc": int(fallback_stable_breakdown),
+            "collateral_to_weth": int(fallback_collateral_breakdown),
+            "account_count": int(len(accounts)),
+            "stable_debt_to_usdc_pct_accounts": self._pct_of_total(
+                float(fallback_stable_breakdown),
+                float(account_count),
+            ),
+            "collateral_to_weth_pct_accounts": self._pct_of_total(
+                float(fallback_collateral_breakdown),
+                float(account_count),
+            ),
+        }
 
         avg_lt = np.asarray(
             [float(np.clip(a.avg_lt, 0.0, 1.0)) for a in accounts],
@@ -522,277 +742,363 @@ class AccountLiquidationReplayEngine:
             if borrow_rate_fn is not None
             else 0.0
         )
+        account_count_total = len(accounts)
 
-        for path_idx in range(n_paths):
-            collateral_weth = collateral_weth_start.copy()
-            collateral_steth = collateral_steth_start.copy()
-            collateral_other = collateral_other_start.copy()
-            debt_usdc = debt_usdc_start.copy()
-            debt_usdt = debt_usdt_start.copy()
-            debt_eth_pool_eth = debt_eth_pool_eth_start.copy()
-            debt_other = debt_other_start.copy()
+        for batch_start in range(0, n_paths, self.path_batch_size):
+            batch_end = min(batch_start + self.path_batch_size, n_paths)
+            batch_slice = slice(batch_start, batch_end)
+            batch_size = batch_end - batch_start
 
-            cumulative_supply_reduction = 0.0
-            cumulative_borrow_reduction = 0.0
-            cumulative_price_impact_log = 0.0
+            collateral_weth = np.broadcast_to(
+                collateral_weth_start,
+                (batch_size, account_count_total),
+            ).copy()
+            collateral_steth = np.broadcast_to(
+                collateral_steth_start,
+                (batch_size, account_count_total),
+            ).copy()
+            collateral_other = np.broadcast_to(
+                collateral_other_start,
+                (batch_size, account_count_total),
+            ).copy()
+            debt_usdc = np.broadcast_to(
+                debt_usdc_start,
+                (batch_size, account_count_total),
+            ).copy()
+            debt_usdt = np.broadcast_to(
+                debt_usdt_start,
+                (batch_size, account_count_total),
+            ).copy()
+            debt_eth_pool_eth = np.broadcast_to(
+                debt_eth_pool_eth_start,
+                (batch_size, account_count_total),
+            ).copy()
+            debt_other = np.broadcast_to(
+                debt_other_start,
+                (batch_size, account_count_total),
+            ).copy()
+
+            cumulative_supply_reduction = np.zeros(batch_size, dtype=float)
+            cumulative_borrow_reduction = np.zeros(batch_size, dtype=float)
+            cumulative_price_impact_log = np.zeros(batch_size, dtype=float)
 
             for step_idx in range(n_timesteps):
-                spot_price_usd = max(spot_paths_usd[path_idx, step_idx], eps)
-                steth_ratio = max(steth_paths[path_idx, step_idx], eps)
+                spot_price_usd = np.maximum(spot_paths_usd[batch_slice, step_idx], eps)
+                spot_price_usd_col = spot_price_usd[:, None]
+                steth_ratio = np.maximum(steth_paths[batch_slice, step_idx], eps)
+                steth_ratio_col = steth_ratio[:, None]
                 sigma_step = (
-                    float(sigma_paths[path_idx, step_idx])
+                    sigma_paths[batch_slice, step_idx]
                     if sigma_paths is not None
                     else None
                 )
+
                 collateral_value_eth = (
                     collateral_weth
-                    + collateral_steth * steth_ratio
+                    + collateral_steth * steth_ratio_col
                     + collateral_other
                 )
-                debt_eth_pool_usd = debt_eth_pool_eth * spot_price_usd
+                debt_eth_pool_usd = debt_eth_pool_eth * spot_price_usd_col
                 debt_total_usd = debt_usdc + debt_usdt + debt_eth_pool_usd + debt_other
 
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    hfs = (collateral_value_eth * spot_price_usd * avg_lt) / debt_total_usd
+                    hfs = (collateral_value_eth * spot_price_usd_col * avg_lt[None, :]) / debt_total_usd
                 hfs = np.where(debt_total_usd <= 0.0, np.inf, hfs)
                 at_risk_mask = hfs < 1.0
-                debt_at_risk_eth[path_idx, step_idx] = float(
-                    np.sum(debt_total_usd[at_risk_mask]) / spot_price_usd
+                debt_at_risk_eth[batch_slice, step_idx] = (
+                    np.sum(debt_total_usd * at_risk_mask, axis=1) / spot_price_usd
                 )
 
-                step_liquidations = 0
-                step_debt_liquidated_usd = 0.0
-                step_collateral_seized_weth = 0.0
-                step_repaid_usdc = 0.0
-                step_repaid_usdt = 0.0
-                step_repaid_eth_pool = 0.0
-                step_stables_usd = 0.0
-                step_bad_debt_usd = 0.0
-                step_bad_debt_usdc = 0.0
-                step_bad_debt_usdt = 0.0
-                step_bad_debt_eth_pool = 0.0
-                step_bad_debt_other = 0.0
-                step_cost_num = 0.0
-                step_cost_denom = 0.0
-                step_effective_price_num = 0.0
-                converged = False
+                step_liquidations = np.zeros(batch_size, dtype=int)
+                step_debt_liquidated_usd = np.zeros(batch_size, dtype=float)
+                step_collateral_seized_weth = np.zeros(batch_size, dtype=float)
+                step_repaid_usdc = np.zeros(batch_size, dtype=float)
+                step_repaid_usdt = np.zeros(batch_size, dtype=float)
+                step_repaid_eth_pool = np.zeros(batch_size, dtype=float)
+                step_stables_usd = np.zeros(batch_size, dtype=float)
+                step_bad_debt_usd = np.zeros(batch_size, dtype=float)
+                step_bad_debt_usdc = np.zeros(batch_size, dtype=float)
+                step_bad_debt_usdt = np.zeros(batch_size, dtype=float)
+                step_bad_debt_eth_pool = np.zeros(batch_size, dtype=float)
+                step_bad_debt_other = np.zeros(batch_size, dtype=float)
+                step_cost_num = np.zeros(batch_size, dtype=float)
+                step_cost_denom = np.zeros(batch_size, dtype=float)
+                step_effective_price_num = np.zeros(batch_size, dtype=float)
+                open_paths = np.ones(batch_size, dtype=bool)
+                converged_paths = np.zeros(batch_size, dtype=bool)
+                failed_paths = np.zeros(batch_size, dtype=bool)
 
                 for iteration in range(self.max_iterations):
-                    iterations_used[path_idx, step_idx] = iteration + 1
-                    debt_eth_pool_usd = debt_eth_pool_eth * spot_price_usd
+                    if not open_paths.any():
+                        break
+
+                    iterations_used[batch_slice, step_idx][open_paths] = iteration + 1
+
+                    debt_eth_pool_usd = debt_eth_pool_eth * spot_price_usd_col
                     debt_total_usd = debt_usdc + debt_usdt + debt_eth_pool_usd + debt_other
                     collateral_value_eth = (
                         collateral_weth
-                        + collateral_steth * steth_ratio
+                        + collateral_steth * steth_ratio_col
                         + collateral_other
                     )
-                    active_mask = (debt_total_usd > 0.0) & (collateral_value_eth > 0.0)
-                    if not np.any(active_mask):
-                        converged = True
+                    active_mask = (
+                        open_paths[:, None]
+                        & (debt_total_usd > 0.0)
+                        & (collateral_value_eth > 0.0)
+                    )
+                    active_any = active_mask.any(axis=1)
+                    no_active = open_paths & ~active_any
+                    converged_paths[no_active] = True
+                    open_paths[no_active] = False
+                    if not open_paths.any():
                         break
 
-                    debt_active = debt_total_usd[active_mask]
-                    collateral_weth_active = collateral_weth[active_mask]
-                    collateral_steth_active = collateral_steth[active_mask]
-                    collateral_other_active = collateral_other[active_mask]
-                    collateral_value_active = (
-                        collateral_weth_active
-                        + collateral_steth_active * steth_ratio
-                        + collateral_other_active
-                    )
-                    debt_usdc_active = debt_usdc[active_mask]
-                    debt_usdt_active = debt_usdt[active_mask]
-                    debt_eth_pool_active = debt_eth_pool_eth[active_mask] * spot_price_usd
-                    debt_other_active = debt_other[active_mask]
-                    avg_lt_active = avg_lt[active_mask]
+                    debt_req_safe = np.maximum(debt_total_usd, eps)
                     with np.errstate(divide="ignore", invalid="ignore"):
                         hf_active = (
-                            collateral_value_active
-                            * spot_price_usd
-                            * avg_lt_active
-                            / debt_active
+                            collateral_value_eth
+                            * spot_price_usd_col
+                            * avg_lt[None, :]
+                            / debt_req_safe
                         )
-                    hf_active = np.where(debt_active <= 0.0, np.inf, hf_active)
+                    hf_active = np.where(active_mask, hf_active, np.inf)
 
+                    close_factor_active = np.zeros_like(debt_total_usd, dtype=float)
                     close_factor_active = np.where(
-                        hf_active < self.close_factor_threshold,
+                        active_mask & (hf_active < self.close_factor_threshold),
                         self.close_factor_full,
-                        self.close_factor_normal,
+                        close_factor_active,
                     )
                     close_factor_active = np.where(
-                        hf_active < 1.0,
+                        active_mask
+                        & (hf_active >= self.close_factor_threshold)
+                        & (hf_active < 1.0),
+                        self.close_factor_normal,
                         close_factor_active,
+                    )
+
+                    requested_repay_total = debt_total_usd * close_factor_active
+                    request_mask = open_paths[:, None] & (requested_repay_total > 0.0)
+                    requested_any = request_mask.any(axis=1)
+                    no_request = open_paths & ~requested_any
+                    converged_paths[no_request] = True
+                    open_paths[no_request] = False
+                    if not open_paths.any():
+                        break
+
+                    request_mask = open_paths[:, None] & request_mask
+                    debt_req_safe = np.maximum(
+                        np.where(request_mask, debt_total_usd, 0.0),
+                        eps,
+                    )
+                    stable_share = np.where(
+                        request_mask,
+                        (debt_usdc + debt_usdt) / debt_req_safe,
                         0.0,
                     )
-
-                    requested_repay_total = debt_active * close_factor_active
-                    requested_mask = requested_repay_total > 0.0
-                    if not np.any(requested_mask):
-                        converged = True
-                        break
-
-                    active_indices = np.flatnonzero(active_mask)
-                    request_indices = active_indices[requested_mask]
-                    debt_req = debt_active[requested_mask]
-                    coll_weth_req = collateral_weth_active[requested_mask]
-                    coll_steth_req = collateral_steth_active[requested_mask]
-                    coll_other_req = collateral_other_active[requested_mask]
-                    coll_value_req = (
-                        coll_weth_req
-                        + coll_steth_req * steth_ratio
-                        + coll_other_req
+                    stable_volume_guess = np.sum(
+                        requested_repay_total * stable_share,
+                        axis=1,
                     )
-                    debt_usdc_req = debt_usdc_active[requested_mask]
-                    debt_usdt_req = debt_usdt_active[requested_mask]
-                    debt_eth_pool_req = debt_eth_pool_active[requested_mask]
-                    debt_other_req = debt_other_active[requested_mask]
-                    requested_total_req = requested_repay_total[requested_mask]
 
-                    debt_req_safe = np.maximum(debt_req, eps)
-                    stable_share_req = (debt_usdc_req + debt_usdt_req) / debt_req_safe
-                    requested_stables = requested_total_req * stable_share_req
-
-                    stable_volume_guess = float(np.sum(requested_stables))
-                    final_cost_bps = 0.0
-                    final_effective_price = spot_price_usd
-                    realized_repay_total = np.zeros_like(requested_total_req)
+                    final_cost_bps = np.zeros(batch_size, dtype=float)
+                    final_effective_price = spot_price_usd.copy()
+                    realized_repay_total = np.zeros_like(requested_repay_total)
                     for _ in range(4):
-                        volume_weth_guess = stable_volume_guess / spot_price_usd
-                        final_cost_bps = self._cost_bps(
-                            cost_model,
-                            volume_weth_guess,
-                            sigma_annualized=sigma_step,
-                            sigma_base_annualized=sigma_base_annualized,
-                            supports_sigma=cost_supports_sigma,
+                        volume_weth_guess = np.zeros(batch_size, dtype=float)
+                        volume_weth_guess[open_paths] = (
+                            stable_volume_guess[open_paths] / spot_price_usd[open_paths]
                         )
-                        final_effective_price = self._apply_price_haircut(
-                            cost_model,
-                            spot_price_usd,
-                            volume_weth_guess,
-                            sigma_annualized=sigma_step,
-                            sigma_base_annualized=sigma_base_annualized,
-                            supports_sigma=haircut_supports_sigma,
-                        )
-                        final_effective_price = max(final_effective_price, eps)
+                        for local_idx in np.flatnonzero(open_paths):
+                            sigma_value = (
+                                float(sigma_step[local_idx])
+                                if sigma_step is not None
+                                else None
+                            )
+                            final_cost_bps[local_idx] = self._cost_bps(
+                                cost_model,
+                                volume_weth_guess[local_idx],
+                                sigma_annualized=sigma_value,
+                                sigma_base_annualized=sigma_base_annualized,
+                                supports_sigma=cost_supports_sigma,
+                            )
+                            final_effective_price[local_idx] = max(
+                                self._apply_price_haircut(
+                                    cost_model,
+                                    spot_price_usd[local_idx],
+                                    volume_weth_guess[local_idx],
+                                    sigma_annualized=sigma_value,
+                                    sigma_base_annualized=sigma_base_annualized,
+                                    supports_sigma=haircut_supports_sigma,
+                                ),
+                                eps,
+                            )
 
                         max_repayable_total = (
-                            coll_value_req * final_effective_price / bonus_multiplier
+                            collateral_value_eth
+                            * final_effective_price[:, None]
+                            / bonus_multiplier
                         )
-                        realized_repay_total = np.minimum(requested_total_req, max_repayable_total)
-                        realized_stables = realized_repay_total * stable_share_req
-                        stable_volume_new = float(np.sum(realized_stables))
-                        if abs(stable_volume_new - stable_volume_guess) <= max(
-                            1e-8,
-                            1e-5 * max(stable_volume_guess, 1.0),
-                        ):
-                            stable_volume_guess = stable_volume_new
-                            break
-                        stable_volume_guess = stable_volume_new
+                        realized_repay_total = np.where(
+                            request_mask,
+                            np.minimum(requested_repay_total, max_repayable_total),
+                            0.0,
+                        )
+                        stable_volume_guess = np.sum(
+                            realized_repay_total * stable_share,
+                            axis=1,
+                        )
 
-                    repaid_mask = realized_repay_total > 0.0
-                    if not np.any(repaid_mask):
-                        # No repayment progress this iteration.
+                    repaid_mask = open_paths[:, None] & (realized_repay_total > 0.0)
+                    progress_any = repaid_mask.any(axis=1)
+                    no_progress = open_paths & ~progress_any
+                    failed_paths[no_progress] = True
+                    open_paths[no_progress] = False
+                    if not open_paths.any():
                         break
 
-                    ratio_usdc = debt_usdc_req / debt_req_safe
-                    ratio_usdt = debt_usdt_req / debt_req_safe
-                    ratio_eth_pool = debt_eth_pool_req / debt_req_safe
-                    ratio_other = debt_other_req / debt_req_safe
-
-                    repaid_usdc_now = realized_repay_total * ratio_usdc
-                    repaid_usdt_now = realized_repay_total * ratio_usdt
-                    repaid_eth_pool_now = realized_repay_total * ratio_eth_pool
-                    repaid_other_now = realized_repay_total * ratio_other
-                    collateral_seized_value_now = np.minimum(
-                        realized_repay_total * bonus_multiplier / final_effective_price,
-                        coll_value_req,
+                    ratio_usdc = np.where(request_mask, debt_usdc / debt_req_safe, 0.0)
+                    ratio_usdt = np.where(request_mask, debt_usdt / debt_req_safe, 0.0)
+                    ratio_eth_pool = np.where(
+                        request_mask,
+                        debt_eth_pool_usd / debt_req_safe,
+                        0.0,
                     )
-                    coll_value_req_safe = np.maximum(coll_value_req, eps)
-                    share_weth = coll_weth_req / coll_value_req_safe
-                    share_steth = (coll_steth_req * steth_ratio) / coll_value_req_safe
-                    share_other = coll_other_req / coll_value_req_safe
+                    ratio_other = np.where(request_mask, debt_other / debt_req_safe, 0.0)
+
+                    repaid_usdc_now = np.where(
+                        repaid_mask,
+                        realized_repay_total * ratio_usdc,
+                        0.0,
+                    )
+                    repaid_usdt_now = np.where(
+                        repaid_mask,
+                        realized_repay_total * ratio_usdt,
+                        0.0,
+                    )
+                    repaid_eth_pool_now = np.where(
+                        repaid_mask,
+                        realized_repay_total * ratio_eth_pool,
+                        0.0,
+                    )
+                    repaid_other_now = np.where(
+                        repaid_mask,
+                        realized_repay_total * ratio_other,
+                        0.0,
+                    )
+                    collateral_seized_value_now = np.where(
+                        repaid_mask,
+                        np.minimum(
+                            realized_repay_total * bonus_multiplier / final_effective_price[:, None],
+                            collateral_value_eth,
+                        ),
+                        0.0,
+                    )
+                    coll_value_req_safe = np.maximum(
+                        np.where(request_mask, collateral_value_eth, 0.0),
+                        eps,
+                    )
+                    share_weth = np.where(
+                        request_mask,
+                        collateral_weth / coll_value_req_safe,
+                        0.0,
+                    )
+                    share_steth = np.where(
+                        request_mask,
+                        collateral_steth * steth_ratio_col / coll_value_req_safe,
+                        0.0,
+                    )
+                    share_other = np.where(
+                        request_mask,
+                        collateral_other / coll_value_req_safe,
+                        0.0,
+                    )
                     collateral_seized_weth_now = np.minimum(
                         collateral_seized_value_now * share_weth,
-                        coll_weth_req,
+                        collateral_weth,
                     )
                     collateral_seized_steth_value_now = collateral_seized_value_now * share_steth
                     collateral_seized_steth_now = np.minimum(
-                        collateral_seized_steth_value_now / max(steth_ratio, eps),
-                        coll_steth_req,
+                        collateral_seized_steth_value_now / steth_ratio_col,
+                        collateral_steth,
                     )
                     collateral_seized_other_now = np.minimum(
                         collateral_seized_value_now * share_other,
-                        coll_other_req,
+                        collateral_other,
                     )
 
-                    debt_usdc[request_indices] = np.maximum(
-                        debt_usdc[request_indices] - repaid_usdc_now,
+                    debt_usdc = np.maximum(debt_usdc - repaid_usdc_now, 0.0)
+                    debt_usdt = np.maximum(debt_usdt - repaid_usdt_now, 0.0)
+                    debt_eth_pool_eth = np.maximum(
+                        debt_eth_pool_eth - (repaid_eth_pool_now / spot_price_usd_col),
                         0.0,
                     )
-                    debt_usdt[request_indices] = np.maximum(
-                        debt_usdt[request_indices] - repaid_usdt_now,
+                    debt_other = np.maximum(debt_other - repaid_other_now, 0.0)
+                    collateral_weth = np.maximum(
+                        collateral_weth - collateral_seized_weth_now,
                         0.0,
                     )
-                    debt_eth_pool_eth[request_indices] = np.maximum(
-                        debt_eth_pool_eth[request_indices] - (repaid_eth_pool_now / spot_price_usd),
+                    collateral_steth = np.maximum(
+                        collateral_steth - collateral_seized_steth_now,
                         0.0,
                     )
-                    debt_other[request_indices] = np.maximum(
-                        debt_other[request_indices] - repaid_other_now,
-                        0.0,
-                    )
-                    collateral_weth[request_indices] = np.maximum(
-                        collateral_weth[request_indices] - collateral_seized_weth_now,
-                        0.0,
-                    )
-                    collateral_steth[request_indices] = np.maximum(
-                        collateral_steth[request_indices] - collateral_seized_steth_now,
-                        0.0,
-                    )
-                    collateral_other[request_indices] = np.maximum(
-                        collateral_other[request_indices] - collateral_seized_other_now,
+                    collateral_other = np.maximum(
+                        collateral_other - collateral_seized_other_now,
                         0.0,
                     )
 
                     repaid_stables_now = repaid_usdc_now + repaid_usdt_now
-                    repaid_stables_sum = float(np.sum(repaid_stables_now))
-                    step_debt_liquidated_usd += float(np.sum(realized_repay_total))
-                    # Only seized WETH drains WETH reserve supply; other collateral
-                    # buckets should not feed WETH utilization shock.
-                    step_collateral_seized_weth += float(np.sum(collateral_seized_weth_now))
-                    step_repaid_usdc += float(np.sum(repaid_usdc_now))
-                    step_repaid_usdt += float(np.sum(repaid_usdt_now))
-                    step_repaid_eth_pool += float(np.sum(repaid_eth_pool_now))
+                    repaid_stables_sum = np.sum(repaid_stables_now, axis=1)
+                    step_debt_liquidated_usd += np.sum(realized_repay_total, axis=1)
+                    step_collateral_seized_weth += np.sum(collateral_seized_weth_now, axis=1)
+                    step_repaid_usdc += np.sum(repaid_usdc_now, axis=1)
+                    step_repaid_usdt += np.sum(repaid_usdt_now, axis=1)
+                    step_repaid_eth_pool += np.sum(repaid_eth_pool_now, axis=1)
                     step_stables_usd += repaid_stables_sum
-                    step_liquidations += int(np.sum(repaid_mask))
+                    step_liquidations += np.sum(repaid_mask, axis=1).astype(int)
                     step_cost_num += final_cost_bps * repaid_stables_sum
                     step_cost_denom += repaid_stables_sum
                     step_effective_price_num += final_effective_price * repaid_stables_sum
 
-                    debt_eth_pool_usd = debt_eth_pool_eth * spot_price_usd
-                    remaining_debt_total = debt_usdc + debt_usdt + debt_eth_pool_usd + debt_other
+                    debt_eth_pool_usd = debt_eth_pool_eth * spot_price_usd_col
+                    remaining_debt_total = (
+                        debt_usdc + debt_usdt + debt_eth_pool_usd + debt_other
+                    )
                     remaining_collateral_value_eth = (
                         collateral_weth
-                        + collateral_steth * steth_ratio
+                        + collateral_steth * steth_ratio_col
                         + collateral_other
                     )
-                    insolvent_mask = (remaining_debt_total > eps) & (
-                        remaining_collateral_value_eth <= eps
+                    insolvent_mask = (
+                        (remaining_debt_total > eps)
+                        & (remaining_collateral_value_eth <= eps)
                     )
-                    newly_bad_debt_usd = float(np.sum(remaining_debt_total[insolvent_mask]))
-                    if newly_bad_debt_usd > 0.0:
-                        step_bad_debt_usd += newly_bad_debt_usd
-                        step_bad_debt_usdc += float(np.sum(debt_usdc[insolvent_mask]))
-                        step_bad_debt_usdt += float(np.sum(debt_usdt[insolvent_mask]))
-                        step_bad_debt_eth_pool += float(np.sum(debt_eth_pool_usd[insolvent_mask]))
-                        step_bad_debt_other += float(np.sum(debt_other[insolvent_mask]))
-                        debt_usdc[insolvent_mask] = 0.0
-                        debt_usdt[insolvent_mask] = 0.0
-                        debt_eth_pool_eth[insolvent_mask] = 0.0
-                        debt_other[insolvent_mask] = 0.0
+                    step_bad_debt_usd += np.sum(
+                        np.where(insolvent_mask, remaining_debt_total, 0.0),
+                        axis=1,
+                    )
+                    step_bad_debt_usdc += np.sum(
+                        np.where(insolvent_mask, debt_usdc, 0.0),
+                        axis=1,
+                    )
+                    step_bad_debt_usdt += np.sum(
+                        np.where(insolvent_mask, debt_usdt, 0.0),
+                        axis=1,
+                    )
+                    step_bad_debt_eth_pool += np.sum(
+                        np.where(insolvent_mask, debt_eth_pool_usd, 0.0),
+                        axis=1,
+                    )
+                    step_bad_debt_other += np.sum(
+                        np.where(insolvent_mask, debt_other, 0.0),
+                        axis=1,
+                    )
+                    debt_usdc = np.where(insolvent_mask, 0.0, debt_usdc)
+                    debt_usdt = np.where(insolvent_mask, 0.0, debt_usdt)
+                    debt_eth_pool_eth = np.where(insolvent_mask, 0.0, debt_eth_pool_eth)
+                    debt_other = np.where(insolvent_mask, 0.0, debt_other)
 
-                if not converged:
-                    max_iterations_hit_count += 1
+                max_iterations_hit_count += int(np.sum(open_paths | failed_paths))
 
                 step_weth_supply_reduction = step_collateral_seized_weth
                 step_weth_borrow_reduction = (
@@ -801,72 +1107,102 @@ class AccountLiquidationReplayEngine:
                 cumulative_supply_reduction += step_weth_supply_reduction
                 cumulative_borrow_reduction += step_weth_borrow_reduction
 
-                new_borrows = max(borrows - cumulative_borrow_reduction, 0.0)
-                new_deposits = max(deposits - cumulative_supply_reduction, new_borrows)
-                if new_deposits <= 0.0:
-                    util_now = 0.99
-                else:
-                    util_now = float(np.clip(new_borrows / new_deposits, 0.0, 0.99))
-                adjustment_array[path_idx, step_idx] = util_now - base_util
+                new_borrows = np.maximum(borrows - cumulative_borrow_reduction, 0.0)
+                new_deposits = np.maximum(deposits - cumulative_supply_reduction, new_borrows)
+                util_now = np.full(batch_size, 0.99, dtype=float)
+                np.divide(
+                    new_borrows,
+                    new_deposits,
+                    out=util_now,
+                    where=new_deposits > 0.0,
+                )
+                util_now = np.clip(util_now, 0.0, 0.99)
+                adjustment_array[batch_slice, step_idx] = util_now - base_util
 
-                liquidation_counts[path_idx, step_idx] = step_liquidations
-                debt_liquidated_eth[path_idx, step_idx] = step_debt_liquidated_usd / spot_price_usd
-                collateral_seized_eth[path_idx, step_idx] = step_collateral_seized_weth
-                weth_supply_reduction[path_idx, step_idx] = step_weth_supply_reduction
-                weth_borrow_reduction[path_idx, step_idx] = step_weth_borrow_reduction
-                repaid_usdc_usd[path_idx, step_idx] = step_repaid_usdc
-                repaid_usdt_usd[path_idx, step_idx] = step_repaid_usdt
-                v_stables_usd[path_idx, step_idx] = step_stables_usd
-                v_weth[path_idx, step_idx] = step_stables_usd / spot_price_usd
-                if step_cost_denom > 0.0:
-                    cost_avg = step_cost_num / step_cost_denom
-                    eff_price_avg = step_effective_price_num / step_cost_denom
-                else:
-                    cost_avg = 0.0
-                    eff_price_avg = spot_price_usd
-                cost_bps[path_idx, step_idx] = cost_avg
-                realized_execution_haircut[path_idx, step_idx] = np.clip(
+                liquidation_counts[batch_slice, step_idx] = step_liquidations
+                debt_liquidated_eth[batch_slice, step_idx] = step_debt_liquidated_usd / spot_price_usd
+                collateral_seized_eth[batch_slice, step_idx] = step_collateral_seized_weth
+                weth_supply_reduction[batch_slice, step_idx] = step_weth_supply_reduction
+                weth_borrow_reduction[batch_slice, step_idx] = step_weth_borrow_reduction
+                repaid_usdc_usd[batch_slice, step_idx] = step_repaid_usdc
+                repaid_usdt_usd[batch_slice, step_idx] = step_repaid_usdt
+                v_stables_usd[batch_slice, step_idx] = step_stables_usd
+                v_weth[batch_slice, step_idx] = step_stables_usd / spot_price_usd
+                cost_avg = np.zeros(batch_size, dtype=float)
+                eff_price_avg = spot_price_usd.copy()
+                np.divide(
+                    step_cost_num,
+                    step_cost_denom,
+                    out=cost_avg,
+                    where=step_cost_denom > 0.0,
+                )
+                np.divide(
+                    step_effective_price_num,
+                    step_cost_denom,
+                    out=eff_price_avg,
+                    where=step_cost_denom > 0.0,
+                )
+                cost_bps[batch_slice, step_idx] = cost_avg
+                realized_execution_haircut[batch_slice, step_idx] = np.clip(
                     1.0 - eff_price_avg / spot_price_usd,
                     0.0,
                     1.0,
                 )
-                effective_sell_price_usd[path_idx, step_idx] = eff_price_avg
-                bad_debt_usd[path_idx, step_idx] = step_bad_debt_usd
-                bad_debt_eth[path_idx, step_idx] = step_bad_debt_usd / spot_price_usd
-                bad_debt_usdc_usd[path_idx, step_idx] = step_bad_debt_usdc
-                bad_debt_usdt_usd[path_idx, step_idx] = step_bad_debt_usdt
-                bad_debt_eth_pool_usd[path_idx, step_idx] = step_bad_debt_eth_pool
-                bad_debt_other_usd[path_idx, step_idx] = step_bad_debt_other
-                if borrow_rate_fn is not None:
-                    rate_now = float(np.asarray(borrow_rate_fn(util_now)))
-                    borrow_rate_after_liquidation[path_idx, step_idx] = rate_now
-                    borrow_rate_delta[path_idx, step_idx] = rate_now - base_rate
-                utilization[path_idx, step_idx] = util_now
+                effective_sell_price_usd[batch_slice, step_idx] = eff_price_avg
+                bad_debt_usd[batch_slice, step_idx] = step_bad_debt_usd
+                bad_debt_eth[batch_slice, step_idx] = step_bad_debt_usd / spot_price_usd
+                bad_debt_usdc_usd[batch_slice, step_idx] = step_bad_debt_usdc
+                bad_debt_usdt_usd[batch_slice, step_idx] = step_bad_debt_usdt
+                bad_debt_eth_pool_usd[batch_slice, step_idx] = step_bad_debt_eth_pool
+                bad_debt_other_usd[batch_slice, step_idx] = step_bad_debt_other
+                utilization[batch_slice, step_idx] = util_now
 
-                step_price_impact_log = self._permanent_price_impact_log(
-                    cost_model,
-                    step_collateral_seized_weth,
-                    lambda_impact=lambda_impact,
-                    sigma_annualized=sigma_step,
-                    sigma_base_annualized=sigma_base_annualized,
-                    supports_sigma=impact_supports_sigma,
+                step_price_impact_log = np.zeros(batch_size, dtype=float)
+                for local_idx in np.flatnonzero(step_collateral_seized_weth > 0.0):
+                    sigma_value = (
+                        float(sigma_step[local_idx])
+                        if sigma_step is not None
+                        else None
+                    )
+                    step_price_impact_log[local_idx] = self._permanent_price_impact_log(
+                        cost_model,
+                        step_collateral_seized_weth[local_idx],
+                        lambda_impact=lambda_impact,
+                        sigma_annualized=sigma_value,
+                        sigma_base_annualized=sigma_base_annualized,
+                        supports_sigma=impact_supports_sigma,
+                    )
+                valid_impact = np.isfinite(step_price_impact_log)
+                cumulative_price_impact_log = np.where(
+                    valid_impact,
+                    cumulative_price_impact_log + step_price_impact_log,
+                    cumulative_price_impact_log,
                 )
-                if np.isfinite(step_price_impact_log):
-                    cumulative_price_impact_log += float(step_price_impact_log)
-                    if step_idx + 1 < n_timesteps and step_price_impact_log != 0.0:
-                        price_mult = float(np.exp(step_price_impact_log))
-                        paths[path_idx, step_idx + 1 :] = np.maximum(
-                            paths[path_idx, step_idx + 1 :] * price_mult,
+                if step_idx + 1 < n_timesteps:
+                    impact_mask = valid_impact & (step_price_impact_log != 0.0)
+                    if impact_mask.any():
+                        price_mult = np.exp(step_price_impact_log[impact_mask])[:, None]
+                        future_paths = paths[batch_slice, step_idx + 1 :]
+                        future_spot_paths = spot_paths_usd[batch_slice, step_idx + 1 :]
+                        future_paths[impact_mask] = np.maximum(
+                            future_paths[impact_mask] * price_mult,
                             eps,
                         )
-                        spot_paths_usd[path_idx, step_idx + 1 :] = np.maximum(
-                            spot_paths_usd[path_idx, step_idx + 1 :] * price_mult,
+                        future_spot_paths[impact_mask] = np.maximum(
+                            future_spot_paths[impact_mask] * price_mult,
                             eps,
                         )
-                cumulative_price_impact_pct[path_idx, step_idx] = max(
+                cumulative_price_impact_pct[batch_slice, step_idx] = np.maximum(
                     0.0,
-                    (1.0 - float(np.exp(cumulative_price_impact_log))) * 100.0,
+                    (1.0 - np.exp(cumulative_price_impact_log)) * 100.0,
                 )
+
+        if borrow_rate_fn is not None:
+            borrow_rate_after_liquidation[:, :] = np.asarray(
+                borrow_rate_fn(utilization),
+                dtype=float,
+            )
+            borrow_rate_delta[:, :] = borrow_rate_after_liquidation - base_rate
 
         if max_iterations_hit_count > 0:
             warning = (
@@ -900,6 +1236,7 @@ class AccountLiquidationReplayEngine:
             borrow_rate_after_liquidation=borrow_rate_after_liquidation,
             borrow_rate_delta=borrow_rate_delta,
             utilization=utilization,
+            bucket_diagnostics=bucket_diagnostics,
             iterations_used=iterations_used,
             max_iterations_hit_count=max_iterations_hit_count,
             max_iterations=self.max_iterations,

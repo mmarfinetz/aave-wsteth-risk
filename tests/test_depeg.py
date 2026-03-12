@@ -136,7 +136,9 @@ class TestDepegModel:
         from models.price_simulation import GBMSimulator
         from config.params import SimulationConfig
 
-        config = SimulationConfig(n_simulations=1000, horizon_days=30, seed=42)
+        config = SimulationConfig.legacy_profile(
+            n_simulations=1000, horizon_days=30, seed=42
+        )
         gbm = GBMSimulator(mu=0.0, sigma=0.60, config=config)
         eth_paths = gbm.simulate(s0=2500.0, n_paths=1000, n_steps=30)
 

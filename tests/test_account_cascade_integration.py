@@ -14,12 +14,11 @@ from models.account_liquidation_replay import (
 )
 from run_dashboard import (
     resolve_account_level_cascade_params,
-    resolve_subgraph_cohort_params,
 )
 
 
 def _small_config() -> SimulationConfig:
-    return SimulationConfig(n_simulations=12, horizon_days=2, seed=31)
+    return SimulationConfig.legacy_profile(n_simulations=12, horizon_days=2, seed=31)
 
 
 def _sample_accounts() -> list[AccountState]:
@@ -70,7 +69,7 @@ def test_enabled_success(monkeypatch):
         replay_called["value"] = True
         return _zero_replay_result(
             n_paths=dashboard.config.n_simulations,
-            n_steps=dashboard.config.horizon_days,
+            n_steps=dashboard.config.grid.n_steps,
         )
 
     dashboard.account_cascade_model.simulate = fake_replay
@@ -135,28 +134,26 @@ def test_json_schema_compat():
     assert "cascade_source" in parsed["simulation_config"]
 
 
-def test_both_flags_replay_takes_precedence(monkeypatch):
-    monkeypatch.setattr(
-        "run_dashboard.fetch_subgraph_cohort_analytics_from_env",
-        lambda: {
-            "borrower_count": 5,
-            "avg_ltv_weighted": 0.78,
-            "avg_lt_weighted": 0.84,
-        },
-    )
+def test_cohort_inputs_and_replay_takes_precedence(monkeypatch):
     monkeypatch.setattr(
         "run_dashboard.fetch_account_cohort_from_env",
         lambda: (_sample_accounts(), _sample_metadata(2)),
     )
 
-    params = {}
-    params.update(resolve_subgraph_cohort_params(use_subgraph_cohort=True))
+    params = {
+        "cohort_source": "aave_subgraph",
+        "cohort_analytics": {
+            "borrower_count": 5,
+            "avg_ltv_weighted": 0.78,
+            "avg_lt_weighted": 0.84,
+        },
+    }
     params.update(resolve_account_level_cascade_params(use_account_level_cascade=True))
     dashboard = Dashboard(config=_small_config(), params=params)
 
     dashboard.account_cascade_model.simulate = lambda *args, **kwargs: _zero_replay_result(
         n_paths=dashboard.config.n_simulations,
-        n_steps=dashboard.config.horizon_days,
+        n_steps=dashboard.config.grid.n_steps,
     )
     dashboard.stress_engine.run_all = lambda: []
     dashboard.cascade_model.estimate_utilization_impact = lambda *_a, **_k: (_ for _ in ()).throw(
@@ -186,7 +183,7 @@ def test_account_replay_acceleration_caps_paths_and_accounts(monkeypatch):
         captured["n_accounts"] = len(accounts)
         return _zero_replay_result(
             n_paths=eth_price_paths.shape[0],
-            n_steps=dashboard.config.horizon_days,
+            n_steps=dashboard.config.grid.n_steps,
         )
 
     dashboard.account_cascade_model.simulate = fake_replay

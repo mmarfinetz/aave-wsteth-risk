@@ -9,7 +9,7 @@ from models.account_liquidation_replay import AccountState
 
 
 def _config() -> SimulationConfig:
-    return SimulationConfig(n_simulations=24, horizon_days=3, seed=47)
+    return SimulationConfig.legacy_profile(n_simulations=24, horizon_days=3, seed=47)
 
 
 def _accounts() -> list[AccountState]:
@@ -53,7 +53,7 @@ def test_abm_full_mode_updates_source_and_diagnostics():
     abm_diag = output.data_sources["cascade_abm_diagnostics"]
     assert abm_diag["agent_action_counts"]["liquidator_liquidations"] >= 0
     assert "utilization_shock" in output.time_series_diagnostics
-    assert len(output.time_series_diagnostics["utilization_shock"]["mean"]) == cfg.horizon_days + 1
+    assert len(output.time_series_diagnostics["utilization_shock"]["mean"]) == cfg.grid.n_cols
 
 
 def test_abm_surrogate_mode_projects_subset_paths():

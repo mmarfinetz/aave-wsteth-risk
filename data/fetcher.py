@@ -4,7 +4,7 @@ On-chain and API data fetcher for Aave V3, wstETH, Curve, and ETH market data.
 Sources:
 - Aave V3 PoolDataProvider: 0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3
 - wstETH contract: 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0
-- DeFiLlama API: https://api.llama.fi
+- Aave subgraph: borrower/cohort analytics and ETH-collateral share
 - CoinGecko API: https://api.coingecko.com/api/v3
 - Curve stETH/ETH pool: 0xDC24316b9AE028F1497c275EB9192a3Ea0f67022
 
@@ -34,6 +34,13 @@ CACHE_FILE = CACHE_DIR / "params_cache.json"
 STALE_THRESHOLD_SECONDS = 86400
 ADV_CACHE_REUSE_SECONDS = 6 * 3600
 _LAST_HTTP_ERROR_CODE: int | None = None
+STAKING_APY_METHOD_LATEST = "latest"
+STAKING_APY_METHOD_TRAILING_7D_AVG = "trailing_7d_avg"
+STAKING_APY_METHOD_OPTIONS = {
+    STAKING_APY_METHOD_LATEST,
+    STAKING_APY_METHOD_TRAILING_7D_AVG,
+}
+DEFAULT_STAKING_APY_LOOKBACK_DAYS = 7
 
 # Aave V3 Ethereum mainnet addresses
 AAVE_V3_POOL_DATA_PROVIDER = "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3"
@@ -56,7 +63,6 @@ DEFAULT_RPC_ENDPOINTS = [
     "https://ethereum-rpc.publicnode.com",  # PublicNode — free, no auth
     "https://1rpc.io/eth",                  # 1RPC — free, no auth
     "https://eth.drpc.org",                 # dRPC — free, no auth
-    "https://eth.llamarpc.com",             # DeFiLlama — free, no auth
     "https://cloudflare-eth.com",           # Cloudflare — free, no auth
 ]
 
@@ -92,7 +98,6 @@ STRICT_AAVE_REQUIRED_PARAMS = {
     "current_weth_utilization",
     "weth_total_supply",
     "weth_total_borrows",
-    "eth_collateral_fraction",
     "steth_supply_apy",
     "aave_oracle_address",
 }
@@ -129,6 +134,7 @@ class FetchedData:
     # wstETH
     wsteth_steth_rate: float = 1.225
     staking_apy: float = 0.025
+    staking_apy_metadata: dict[str, Any] = field(default_factory=dict)
     steth_supply_apy: float = 0.001
 
     # Market
@@ -312,7 +318,7 @@ def _positive_float(value: Any) -> float | None:
 
 
 def _timestamp_to_unix_seconds(value: Any) -> int | None:
-    """Parse timestamps from DeFiLlama/CoinGecko payloads into Unix seconds."""
+    """Parse timestamps from external payloads into Unix seconds."""
     if value is None:
         return None
     if isinstance(value, (int, np.integer)):
@@ -348,6 +354,49 @@ def _timestamp_to_unix_seconds(value: Any) -> int | None:
     return None
 
 
+def _unix_seconds_to_iso8601(value: int | None) -> str | None:
+    """Convert Unix timestamp seconds to UTC ISO-8601 string."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _nonnegative_float(value: Any) -> float | None:
+    """Parse non-negative numeric values, returning None for invalid entries."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric < 0.0:
+        return None
+    return numeric
+
+
+def _normalize_staking_apy_method(method: str | None) -> str:
+    """Normalize staking APY methodology selection."""
+    normalized = str(method or STAKING_APY_METHOD_LATEST).strip().lower()
+    if normalized not in STAKING_APY_METHOD_OPTIONS:
+        valid = ", ".join(sorted(STAKING_APY_METHOD_OPTIONS))
+        raise ValueError(f"Invalid staking_apy_method '{method}'. Expected one of: {valid}")
+    return normalized
+
+
+def _staking_apy_method_from_metadata(metadata: Any) -> str | None:
+    """Return normalized staking APY method from metadata dict if present."""
+    if not isinstance(metadata, dict):
+        return None
+    method = metadata.get("method")
+    if not isinstance(method, str):
+        return None
+    method = method.strip().lower()
+    if method in STAKING_APY_METHOD_OPTIONS:
+        return method
+    return None
+
+
 def _has_logged_param(data: FetchedData, name: str) -> bool:
     """Return True if a parameter was logged in the current fetch run."""
     return any(
@@ -357,14 +406,14 @@ def _has_logged_param(data: FetchedData, name: str) -> bool:
 
 
 def _is_live_aave_source(source: str) -> bool:
-    """Return True when source provenance is on-chain Aave/wstETH or DeFiLlama."""
+    """Return True when source provenance is on-chain Aave/wstETH or subgraph."""
     lower = source.lower()
     return (
         "aave" in lower
         or "on-chain" in lower
         or "onchain" in lower
+        or "subgraph" in lower
         or "wsteth contract" in lower
-        or "defillama" in lower
     )
 
 
@@ -373,7 +422,7 @@ def _validate_strict_aave_sources(data: FetchedData) -> tuple[bool, list[str]]:
     Validate strict Aave sourcing for critical fields.
 
     In strict mode, every critical Aave field must be fetched in the current run
-    and sourced from Aave/wstETH on-chain calls or DeFiLlama fallback.
+    and sourced from Aave/wstETH on-chain calls or subgraph inputs.
     """
     latest_source_by_name: dict[str, str] = {}
     for entry in data.params_log:
@@ -394,34 +443,6 @@ def _validate_strict_aave_sources(data: FetchedData) -> tuple[bool, list[str]]:
             errors.append(f"{name}: invalid source '{source}'")
 
     return (len(errors) == 0, errors)
-
-
-def _fetch_eth_usd_spot_from_defillama(data: FetchedData) -> bool:
-    """Fetch ETH/USD spot from DeFiLlama coins endpoint."""
-    url = "https://coins.llama.fi/prices/current/coingecko:ethereum"
-    result = _http_get_json(url, timeout=20)
-    if not isinstance(result, dict):
-        return False
-
-    coins = result.get("coins")
-    if not isinstance(coins, dict):
-        return False
-
-    eth_entry = coins.get("coingecko:ethereum")
-    if not isinstance(eth_entry, dict):
-        return False
-
-    price = _positive_float(eth_entry.get("price"))
-    if price is None:
-        return False
-
-    data.eth_usd_price = float(price)
-    data.log_param(
-        "eth_usd_price",
-        round(data.eth_usd_price, 2),
-        "DeFiLlama coins API ETH/USD spot",
-    )
-    return True
 
 
 def _fetch_eth_usd_spot_from_coingecko(data: FetchedData) -> bool:
@@ -446,43 +467,6 @@ def _fetch_eth_usd_spot_from_coingecko(data: FetchedData) -> bool:
         "CoinGecko ETH/USD simple price",
     )
     return True
-
-
-def _resolve_weth_price_usd(data: FetchedData) -> float | None:
-    """
-    Resolve WETH/USD using explicit, non-default sources.
-
-    Priority:
-    1) ETH/USD from fetched price history
-    2) DeFiLlama coins spot ETH/USD
-    3) CoinGecko simple spot ETH/USD
-    """
-    if data.eth_price_history:
-        hist_price = _positive_float(data.eth_usd_price)
-        if hist_price is not None:
-            print(
-                "  [INFO] DeFiLlama WETH price missing — using ETH/USD from "
-                "price history fallback."
-            )
-            return hist_price
-
-    if _fetch_eth_usd_spot_from_defillama(data):
-        print(
-            "  [INFO] DeFiLlama WETH price missing — using ETH/USD from "
-            "DeFiLlama spot fallback."
-        )
-        return _positive_float(data.eth_usd_price)
-
-    if _fetch_eth_usd_spot_from_coingecko(data):
-        print(
-            "  [INFO] DeFiLlama WETH price missing — using ETH/USD from "
-            "CoinGecko spot fallback."
-        )
-        return _positive_float(data.eth_usd_price)
-
-    return None
-
-
 def _get_rpc_url() -> str | None:
     """Read optional user-provided Ethereum RPC URL from environment."""
     return os.getenv("ETH_RPC_URL") or None
@@ -960,134 +944,6 @@ def _fetch_weth_reserve_data_onchain(data: FetchedData) -> bool:
     return True
 
 
-def _fetch_defillama_weth_market_state(data: FetchedData) -> bool:
-    """
-    Fetch ETH collateral fraction and (when available) WETH utilization from
-    DeFiLlama.
-
-    Primary value: eth_collateral_fraction (cross-pool aggregate — only
-    available from an API that lists all Aave V3 Ethereum pools).
-
-    WETH supply/borrows are best sourced on-chain via getReserveData; this
-    function only overrides them when DeFiLlama provides complete data.
-    """
-    fetched = False
-    have_onchain_weth_state = (
-        _has_logged_param(data, "weth_total_supply")
-        and _has_logged_param(data, "weth_total_borrows")
-    )
-    url = "https://yields.llama.fi/pools"
-    result = _http_get_json(url, timeout=20)
-    if result is None or not isinstance(result, dict):
-        return False
-
-    pools = result.get("data", [])
-
-    # --- ETH collateral fraction (cross-pool aggregate) ---
-    aave_eth_pools = [
-        pool for pool in pools
-        if pool.get("project") == "aave-v3" and pool.get("chain") == "Ethereum"
-    ]
-    total_supply_usd_all = 0.0
-    eth_supply_usd = 0.0
-    for pool in aave_eth_pools:
-        supply_usd = float(pool.get("totalSupplyUsd") or pool.get("tvlUsd") or 0.0)
-        if supply_usd <= 0:
-            continue
-        total_supply_usd_all += supply_usd
-        if "ETH" in str(pool.get("symbol", "")).upper():
-            eth_supply_usd += supply_usd
-
-    if total_supply_usd_all > 0:
-        data.eth_collateral_fraction = round(
-            min(max(eth_supply_usd / total_supply_usd_all, 0.0), 1.0), 4
-        )
-        data.log_param(
-            "eth_collateral_fraction",
-            data.eth_collateral_fraction,
-            "DeFiLlama yields API — Aave V3 Ethereum ETH-symbol collateral share",
-        )
-        fetched = True
-
-    # --- WETH supply/borrows (supplement on-chain if DeFiLlama has full data) ---
-    weth_pool = None
-    for pool in pools:
-        if (pool.get("project") == "aave-v3"
-                and pool.get("chain") == "Ethereum"
-                and pool.get("symbol") == "WETH"):
-            weth_pool = pool
-            break
-
-    if weth_pool is None:
-        return fetched
-
-    total_supply_usd = float(weth_pool.get("totalSupplyUsd") or weth_pool.get("tvlUsd") or 0.0)
-    total_borrow_usd_raw = (
-        weth_pool.get("totalBorrowUsd")
-        or weth_pool.get("totalBorrowUSD")
-        or weth_pool.get("totalBorrow")
-    )
-
-    if total_supply_usd <= 0 or total_borrow_usd_raw is None:
-        if have_onchain_weth_state:
-            print(
-                "  [INFO] DeFiLlama WETH borrows missing — keeping on-chain "
-                "reserve totals."
-            )
-            return True
-        if _fetch_weth_reserve_data_onchain(data):
-            print("  [INFO] DeFiLlama WETH borrows missing — used on-chain fallback")
-            return True
-        return fetched
-
-    total_borrow_usd = max(float(total_borrow_usd_raw), 0.0)
-    if have_onchain_weth_state:
-        print(
-            "  [INFO] DeFiLlama WETH totals available — retaining on-chain "
-            "reserve totals."
-        )
-        return True
-
-    utilization = total_borrow_usd / total_supply_usd
-    data.current_weth_utilization = round(min(max(utilization, 0.0), 1.0), 4)
-    data.log_param(
-        "current_weth_utilization",
-        data.current_weth_utilization,
-        "DeFiLlama yields API — Aave V3 Ethereum WETH",
-    )
-
-    # WETH price: try DeFiLlama fields, then ETH/USD (WETH = wrapped ETH,
-    # they are fungible by definition so ETH/USD IS the WETH price).
-    weth_price_usd = None
-    for key in ("underlyingTokenPriceUsd", "priceUsd", "price"):
-        weth_price_usd = _positive_float(weth_pool.get(key))
-        if weth_price_usd is not None:
-            break
-    if weth_price_usd is None:
-        weth_price_usd = _resolve_weth_price_usd(data)
-
-    if weth_price_usd is not None:
-        total_supply_eth = total_supply_usd / weth_price_usd
-        total_borrow_eth = total_borrow_usd / weth_price_usd
-        if total_supply_eth > 0:
-            total_borrow_eth = min(max(total_borrow_eth, 0.0), total_supply_eth)
-            data.weth_total_supply = round(total_supply_eth, 2)
-            data.weth_total_borrows = round(total_borrow_eth, 2)
-            data.log_param(
-                "weth_total_supply",
-                data.weth_total_supply,
-                "DeFiLlama yields API — Aave V3 Ethereum WETH totalSupplyUsd",
-            )
-            data.log_param(
-                "weth_total_borrows",
-                data.weth_total_borrows,
-                "DeFiLlama yields API — Aave V3 Ethereum WETH totalBorrowUsd",
-            )
-    fetched = True
-
-    return fetched
-
-
 def fetch_aave_weth_params(data: FetchedData) -> bool:
     """
     Fetch Aave WETH market state + core risk params.
@@ -1096,20 +952,14 @@ def fetch_aave_weth_params(data: FetchedData) -> bool:
     - On-chain via public RPC (fallback: Etherscan proxy) eth_call:
       eMode LTV/LT/bonus, reserve factor, rate strategy params, oracle address,
       WETH supply/borrows via getReserveData + totalSupply
-    - DeFiLlama:
-      ETH collateral fraction (cross-pool aggregate), WETH supply/borrows
-      (supplements on-chain when available)
     """
     onchain_ok = _fetch_aave_onchain_pool_params(data)
     reserve_ok = _fetch_weth_reserve_data_onchain(data)
-    llama_ok = _fetch_defillama_weth_market_state(data)
-    any_ok = onchain_ok or reserve_ok or llama_ok
+    any_ok = onchain_ok or reserve_ok
     if any_ok:
         sources = []
         if onchain_ok or reserve_ok:
             sources.append("on-chain")
-        if llama_ok:
-            sources.append("DeFiLlama")
         data.data_source = " + ".join(sources) + " APIs"
     return any_ok
 
@@ -1334,108 +1184,64 @@ def fetch_steth_eth_price_history(data: FetchedData, days: int = 365) -> bool:
     return False
 
 
-def _resolve_defillama_weth_pool_id() -> str | None:
-    """Resolve the DeFiLlama pool id for Aave V3 Ethereum WETH."""
-    payload = _http_get_json("https://yields.llama.fi/pools", timeout=20)
-    if not isinstance(payload, dict):
-        return None
-    pools = payload.get("data", [])
-    if not isinstance(pools, list):
-        return None
-
-    for pool in pools:
-        if not isinstance(pool, dict):
-            continue
-        if (
-            pool.get("project") == "aave-v3"
-            and pool.get("chain") == "Ethereum"
-            and str(pool.get("symbol", "")).upper() == "WETH"
-        ):
-            pool_id = pool.get("pool")
-            if isinstance(pool_id, str) and pool_id:
-                return pool_id
-    return None
-
-
 def fetch_weth_borrow_apy_history(data: FetchedData, min_points: int = 30) -> bool:
     """
-    Fetch Aave V3 Ethereum WETH borrow APY history from DeFiLlama chart API.
+    No live borrow-APY history source is wired in the fetcher.
 
-    Preference order for APY keys:
-    1) apyBaseBorrow
-    2) apyBorrow
-    3) apy
-    4) apyBase (fallback when borrow-specific keys are missing)
+    Runtime falls back to cache when available; otherwise downstream calibration
+    code uses its internal default correlations/priors.
     """
-    pool_id = _resolve_defillama_weth_pool_id()
-    if not pool_id:
-        return False
+    _ = (data, min_points)
+    return False
 
-    chart_url = f"https://yields.llama.fi/chart/{pool_id}"
-    payload = _http_get_json(chart_url, timeout=20)
-    if not isinstance(payload, dict):
-        return False
-    points = payload.get("data")
-    if not isinstance(points, list) or len(points) < min_points:
-        return False
 
-    rates: list[float] = []
-    timestamps: list[int] = []
-    for point in points:
-        if not isinstance(point, dict):
-            continue
+def _set_staking_apy_with_metadata(
+    data: FetchedData,
+    *,
+    apy_decimal: float,
+    method: str,
+    lookback_window_days: int,
+    sample_count: int,
+    source_type: str,
+    source_timestamp: int | None,
+    source_label: str,
+) -> None:
+    """Store staking APY and provenance metadata."""
+    data.staking_apy = round(float(apy_decimal), 6)
+    data.staking_apy_metadata = {
+        "method": method,
+        "lookback_window_days": max(int(lookback_window_days), 1),
+        "sample_count": max(int(sample_count), 0),
+        "source_type": str(source_type),
+        "source_timestamp": _unix_seconds_to_iso8601(source_timestamp),
+    }
+    data.log_param("staking_apy", data.staking_apy, source_label)
 
-        rate_pct = None
-        for key in ("apyBaseBorrow", "apyBorrow", "apy", "apyBase"):
-            candidate = point.get(key)
-            if candidate is None:
-                continue
-            try:
-                rate_pct = float(candidate)
-            except (TypeError, ValueError):
-                rate_pct = None
-            if rate_pct is not None:
-                break
-        if rate_pct is None:
-            continue
 
-        ts = _timestamp_to_unix_seconds(point.get("timestamp"))
-        if ts is None:
-            continue
+def fetch_staking_apy(
+    data: FetchedData,
+    *,
+    method: str = STAKING_APY_METHOD_LATEST,
+    lookback_days: int = DEFAULT_STAKING_APY_LOOKBACK_DAYS,
+) -> bool:
+    """
+    No direct live staking-APY source is wired in the fetcher.
 
-        # DeFiLlama APY fields are percentages.
-        rate_decimal = rate_pct / 100.0
-        if rate_decimal < 0.0:
-            continue
-        rates.append(float(rate_decimal))
-        timestamps.append(ts)
-
-    if len(rates) < min_points:
-        return False
-
-    order = np.argsort(np.asarray(timestamps, dtype=np.int64))
-    data.weth_borrow_apy_history = [float(rates[i]) for i in order]
-    data.weth_borrow_apy_timestamps = [int(timestamps[i]) for i in order]
-    data.log_param(
-        "weth_borrow_apy_history",
-        f"{len(data.weth_borrow_apy_history)} points",
-        f"DeFiLlama chart API ({pool_id})",
-    )
-    return True
+    Runtime falls back to cached staking APY when available; otherwise the
+    default parameter surface remains in effect.
+    """
+    _ = (data, _normalize_staking_apy_method(method), max(int(lookback_days), 1))
+    return False
 
 
 def fetch_steth_supply_apy(data: FetchedData) -> bool:
     """
     Fetch stETH supply APY on Aave.
 
-    Priority:
+    Source:
     1) On-chain Aave getReserveData(wstETH).currentLiquidityRate
-    2) DeFiLlama fallback
     """
-    if _fetch_steth_supply_apy_onchain(data):
-        return True
-
-    return _fetch_steth_supply_apy_from_defillama(data)
+    return _fetch_steth_supply_apy_onchain(data)
 
 
 def _fetch_steth_supply_apy_onchain(data: FetchedData) -> bool:
@@ -1462,33 +1268,6 @@ def _fetch_steth_supply_apy_onchain(data: FetchedData) -> bool:
         "Aave V3 Pool getReserveData(wstETH) currentLiquidityRate",
     )
     return True
-
-
-def _fetch_steth_supply_apy_from_defillama(data: FetchedData) -> bool:
-    """Fallback: fetch stETH supply APY from DeFiLlama."""
-    url = "https://yields.llama.fi/pools"
-    result = _http_get_json(url, timeout=20)
-    if result is None or not isinstance(result, dict):
-        return False
-
-    pools = result.get("data", [])
-    for pool in pools:
-        if (pool.get("project") == "aave-v3"
-                and pool.get("chain") == "Ethereum"
-                and "WSTETH" in pool.get("symbol", "").upper()):
-            apy = pool.get("apyBase", 0)
-            if apy is not None:
-                data.steth_supply_apy = round(apy / 100.0, 6)
-                data.log_param("steth_supply_apy", data.steth_supply_apy,
-                               "DeFiLlama yields API — Aave V3 wstETH pool")
-
-                staking_reward = pool.get("apyReward", 0)
-                if staking_reward and staking_reward > 0:
-                    data.staking_apy = round(staking_reward / 100.0, 6)
-                    data.log_param("staking_apy", data.staking_apy,
-                                   "DeFiLlama yields API — wstETH staking reward")
-                return True
-    return False
 
 
 def _fetch_curve_pool_onchain(data: FetchedData) -> bool:
@@ -1581,6 +1360,7 @@ def _save_cache(data: FetchedData) -> None:
         "eth_collateral_fraction": data.eth_collateral_fraction,
         "wsteth_steth_rate": data.wsteth_steth_rate,
         "staking_apy": data.staking_apy,
+        "staking_apy_metadata": data.staking_apy_metadata,
         "steth_supply_apy": data.steth_supply_apy,
         "steth_eth_price": data.steth_eth_price,
         "eth_usd_price": data.eth_usd_price,
@@ -1600,6 +1380,98 @@ def _save_cache(data: FetchedData) -> None:
         json.dump(cache_dict, f, indent=2)
 
 
+def _backfill_legacy_staking_apy_metadata(data: FetchedData) -> None:
+    """Backfill staking APY metadata for older cache schemas."""
+    if _staking_apy_method_from_metadata(getattr(data, "staking_apy_metadata", None)):
+        return
+
+    latest_staking_entry = None
+    for entry in reversed(getattr(data, "params_log", [])):
+        if isinstance(entry, dict) and entry.get("name") == "staking_apy":
+            latest_staking_entry = entry
+            break
+    if latest_staking_entry is None:
+        return
+
+    source_text = str(latest_staking_entry.get("source", "")).lower()
+    method = (
+        STAKING_APY_METHOD_TRAILING_7D_AVG
+        if "trailing average" in source_text
+        else STAKING_APY_METHOD_LATEST
+    )
+    lookback_window_days = (
+        DEFAULT_STAKING_APY_LOOKBACK_DAYS
+        if method == STAKING_APY_METHOD_TRAILING_7D_AVG
+        else 1
+    )
+    source_timestamp = latest_staking_entry.get("fetched_at")
+    data.staking_apy_metadata = {
+        "method": method,
+        "lookback_window_days": lookback_window_days,
+        "sample_count": 1,
+        "source_type": "cache_legacy_params_log",
+        "source_timestamp": source_timestamp if isinstance(source_timestamp, str) else None,
+    }
+
+
+def _cached_staking_apy_matches_request(
+    cached: FetchedData | None,
+    *,
+    method: str,
+    lookback_days: int,
+) -> bool:
+    """Check whether cached staking APY metadata matches the requested method."""
+    if cached is None:
+        return False
+
+    _backfill_legacy_staking_apy_metadata(cached)
+    metadata = getattr(cached, "staking_apy_metadata", {})
+    cached_method = _staking_apy_method_from_metadata(metadata)
+    if cached_method is None:
+        has_legacy_log = any(
+            isinstance(entry, dict) and entry.get("name") == "staking_apy"
+            for entry in getattr(cached, "params_log", [])
+        )
+        if not has_legacy_log:
+            return False
+        cached_method = STAKING_APY_METHOD_LATEST
+
+    if cached_method != method:
+        return False
+
+    if (
+        method == STAKING_APY_METHOD_TRAILING_7D_AVG
+        and isinstance(metadata, dict)
+        and "lookback_window_days" in metadata
+    ):
+        try:
+            cached_lookback = int(metadata.get("lookback_window_days"))
+        except (TypeError, ValueError):
+            return False
+        if cached_lookback != int(lookback_days):
+            return False
+
+    return True
+
+
+def _cached_staking_apy_value(cached: FetchedData | None) -> float | None:
+    """Return cached staking APY if provenance is available."""
+    if cached is None:
+        return None
+
+    _backfill_legacy_staking_apy_metadata(cached)
+    has_provenance = bool(
+        _staking_apy_method_from_metadata(getattr(cached, "staking_apy_metadata", {}))
+        or any(
+            isinstance(entry, dict) and entry.get("name") == "staking_apy"
+            for entry in getattr(cached, "params_log", [])
+        )
+    )
+    if not has_provenance:
+        return None
+    return _nonnegative_float(getattr(cached, "staking_apy", None))
+
+
 def _load_cache() -> FetchedData | None:
     """Load cached data if available."""
     if not CACHE_FILE.exists():
@@ -1611,6 +1483,7 @@ def _load_cache() -> FetchedData | None:
         for key, val in cache.items():
             if hasattr(data, key):
                 setattr(data, key, val)
+        _backfill_legacy_staking_apy_metadata(data)
 
         # Backfill derived utilization for older cache schemas where it may be 0.0.
         if (data.current_weth_utilization <= 0.0
@@ -1629,8 +1502,6 @@ def _load_cache() -> FetchedData | None:
 def _needs_refresh(data: FetchedData) -> bool:
     """Check for missing critical fields in cache that require refetch."""
     if data.current_weth_utilization <= 0.0:
-        return True
-    if not (0.0 < data.eth_collateral_fraction <= 1.0):
         return True
     if not (0.0 < data.ltv <= 1.0):
         return True
@@ -1714,13 +1585,15 @@ def fetch_all(
     use_cache: bool = True,
     force_refresh: bool = False,
     strict_aave: bool = True,
+    staking_apy_method: str = STAKING_APY_METHOD_LATEST,
+    staking_apy_lookback_days: int = DEFAULT_STAKING_APY_LOOKBACK_DAYS,
 ) -> FetchedData:
     """
     Fetch all protocol parameters from on-chain/API sources.
 
     Strategy:
     1. Try to fetch from live APIs
-    2. In strict mode, require live Aave fields from on-chain/DeFiLlama only
+    2. In strict mode, require live Aave fields from on-chain/subgraph only
     3. Outside strict mode, fall back to cache with stale-data warning
     4. Cache successful fetches with timestamps
 
@@ -1729,20 +1602,34 @@ def fetch_all(
         force_refresh: If True, skip cache and always try APIs first
         strict_aave: If True, do not allow cache/defaults for critical Aave
             fields. Require live values from on-chain (preferred) or
-            DeFiLlama fallback.
+            subgraph inputs.
+        staking_apy_method: APY methodology: latest | trailing_7d_avg
+        staking_apy_lookback_days: lookback used by trailing-average method
 
     Returns:
         FetchedData with all parameters and provenance log
     """
+    resolved_staking_method = _normalize_staking_apy_method(staking_apy_method)
+    resolved_staking_lookback_days = max(int(staking_apy_lookback_days), 1)
     cached = _load_cache() if use_cache else None
 
     # In non-strict mode, try cache first if not forcing refresh.
     if use_cache and not force_refresh and not strict_aave:
         if cached and not _is_stale(cached):
+            method_matches = _cached_staking_apy_matches_request(
+                cached,
+                method=resolved_staking_method,
+                lookback_days=resolved_staking_lookback_days,
+            )
             if _needs_refresh(cached):
                 print(
                     "  [INFO] Cache is fresh but missing critical fields; "
                     "attempting live refresh."
+                )
+            elif not method_matches:
+                print(
+                    "  [INFO] Cache is fresh but staking APY method does not "
+                    "match request; attempting live refresh."
                 )
             else:
                 cached.data_source = "cache (fresh)"
@@ -1769,6 +1656,14 @@ def fetch_all(
         ("stETH/ETH market price", fetch_steth_eth_price),
         ("WETH borrow APY history", fetch_weth_borrow_apy_history),
         ("stETH supply APY", fetch_steth_supply_apy),
+        (
+            "wstETH staking APY",
+            lambda d: fetch_staking_apy(
+                d,
+                method=resolved_staking_method,
+                lookback_days=resolved_staking_lookback_days,
+            ),
+        ),
         ("Curve pool params", fetch_curve_pool_params),
     ]
 
@@ -1824,6 +1719,34 @@ def fetch_all(
                         f"({data.adv_weth:,.0f} WETH/day)"
                     )
                     success = True
+            if (
+                not success
+                and name == "wstETH staking APY"
+                and cached is not None
+            ):
+                cached_staking_apy = _cached_staking_apy_value(cached)
+                cached_method_matches = _cached_staking_apy_matches_request(
+                    cached,
+                    method=resolved_staking_method,
+                    lookback_days=resolved_staking_lookback_days,
+                )
+                if cached_staking_apy is not None and cached_method_matches:
+                    data.staking_apy = round(float(cached_staking_apy), 6)
+                    if isinstance(getattr(cached, "staking_apy_metadata", None), dict):
+                        data.staking_apy_metadata = dict(cached.staking_apy_metadata)
+                    data.log_param(
+                        "staking_apy",
+                        data.staking_apy,
+                        (
+                            "cache fallback — prior wstETH staking APY "
+                            f"({cached.last_updated})"
+                        ),
+                    )
+                    print(
+                        "  [INFO] Using cached wstETH staking APY fallback "
+                        f"({data.staking_apy:.4%}, {resolved_staking_method})"
+                    )
+                    success = True
             if success:
                 print(f"  [OK] Fetched {name}")
                 fetch_succeeded = True
@@ -1852,7 +1775,7 @@ def fetch_all(
 
     if fetch_succeeded:
         if strict_aave:
-            data.data_source = "live API (Aave strict: on-chain + DeFiLlama fallback)"
+            data.data_source = "live API (Aave strict: on-chain + subgraph)"
         else:
             data.data_source = "live API"
         _save_cache(data)
@@ -1906,39 +1829,15 @@ def _historical_cache_complete(cache: dict | None) -> bool:
     return all(name in cache for name in required_names)
 
 
-def _fetch_defillama_historical(timestamp: int) -> dict | None:
-    """
-    Fetch ETH/USD and stETH/USD prices at a Unix timestamp from DeFiLlama.
-    Source: https://coins.llama.fi/prices/historical/{timestamp}/{coins}
-    Free, no auth required.
-    Returns dict with 'eth_usd' and 'steth_usd', or None on failure.
-    """
-    coins = "coingecko:ethereum,coingecko:staked-ether"
-    url = f"https://coins.llama.fi/prices/historical/{timestamp}/{coins}?searchWidth=4h"
-    result = _http_get_json(url, timeout=20)
-    if not result or "coins" not in result:
-        return None
-    coins_data = result["coins"]
-    eth_price = coins_data.get("coingecko:ethereum", {}).get("price")
-    steth_price = coins_data.get("coingecko:staked-ether", {}).get("price")
-    if eth_price is not None and steth_price is not None:
-        return {"eth_usd": float(eth_price), "steth_usd": float(steth_price)}
-    return None
-
-
 _SECONDS_PER_WEEK = 7 * 86400
 
 
 def fetch_historical_stress_data() -> list[dict]:
     """
-    Fetch stETH/ETH and ETH/USD prices at specific historical stress dates.
+    Load historical stress records from cache.
 
-    For each date in HISTORICAL_STRESS_DATES, fetches from DeFiLlama (free, no auth):
-    - stETH/ETH price (staked-ether price / ethereum price)
-    - ETH/USD price (and 7d prior for drawdown computation)
-
-    Source: https://coins.llama.fi/prices/historical/{timestamp}/{coins}
-    Cache strategy: cache on success, fall back to cache on failure.
+    Live historical stress fetching was removed to keep runtime fast and avoid
+    external dependencies beyond the core on-chain/subgraph/CoinGecko path.
 
     Returns list of dicts:
         [{"name": ..., "steth_eth_price": ..., "eth_usd_price": ...,
@@ -1959,54 +1858,8 @@ def fetch_historical_stress_data() -> list[dict]:
             cached_results.append(cached_record)
         return cached_results
 
-    results = []
-
-    for entry in HISTORICAL_STRESS_DATES:
-        name = entry["name"]
-        ts = entry["timestamp"]
-
-        # Fetch event-day prices (ETH + stETH) and 7d-prior ETH price
-        day_data = _fetch_defillama_historical(ts)
-        prior_data = _fetch_defillama_historical(ts - _SECONDS_PER_WEEK)
-
-        if day_data and prior_data:
-            eth_usd = day_data["eth_usd"]
-            steth_usd = day_data["steth_usd"]
-            steth_eth = steth_usd / eth_usd if eth_usd > 0 else 1.0
-            record = {
-                "name": name,
-                "timestamp": int(ts),
-                "steth_eth_price": round(steth_eth, 6),
-                "eth_usd_price": round(eth_usd, 2),
-                "eth_usd_price_7d_prior": round(prior_data["eth_usd"], 2),
-                "source": "DeFiLlama historical price API",
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-            }
-            results.append(record)
-            print(f"  [OK] Fetched historical stress data for {name}")
-            continue
-
-        # Fall back to cache
-        if cache and name in cache:
-            cached_record = dict(cache[name])
-            cached_record["name"] = name
-            cached_record["timestamp"] = int(cached_record.get("timestamp", timestamp_by_name.get(name, 0)))
-            if "source" not in cached_record or "cache" not in cached_record["source"]:
-                cached_record["source"] = f"cache — {cached_record.get('source', 'unknown')}"
-            results.append(cached_record)
-            print(f"  [WARN] API failed for {name} — using cached data")
-            continue
-
-        print(f"  [WARN] API + cache failed for {name} — skipping scenario")
-
-    # Update cache with any API-fetched results
-    if any(r.get("source") == "DeFiLlama historical price API" for r in results):
-        cache_data = cache or {}
-        for r in results:
-            cache_data[r["name"]] = {k: v for k, v in r.items() if k != "name"}
-        _save_historical_stress_cache(cache_data)
-
-    return results
+    print("  [WARN] Historical stress cache unavailable — skipping historical stress scenarios")
+    return []
 
 
 def print_params_log(data: FetchedData) -> None:

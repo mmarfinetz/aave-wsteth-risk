@@ -7,9 +7,15 @@ exchange rate (stEthPerToken()), NOT the market stETH/ETH price. Therefore:
 - Depeg only affects P&L (mark-to-market) and unwind costs
 """
 
+import numpy as np
 import pytest
 
 from config.params import DEFAULT_GAS_PRICE_GWEI
+from src.oracle_dynamics.exchange_rate import (
+    EXCHANGE_RATE_MODE_CAPO_SLASHING,
+    EXCHANGE_RATE_MODE_SIMPLE,
+    generate_lido_exchange_rate,
+)
 from models.stress_tests import (
     DEFAULT_CASCADE_AVG_LTV,
     DEFAULT_CASCADE_AVG_LT,
@@ -259,6 +265,7 @@ class TestStressTests:
         assert hasattr(result, 'borrow_rate_peak')
         assert hasattr(result, 'unwind_cost_100pct_avg')
         assert hasattr(result, 'source')
+        assert hasattr(result, 'exchange_rate_mode')
 
     def test_baseline_matches_market_state(self):
         """Baseline borrow rate should equal rate_model.borrow_rate(current_util)."""
@@ -279,6 +286,7 @@ class TestStressTests:
             assert hasattr(s, 'source'), f"Scenario {s.name} missing 'source'"
             assert isinstance(s.source, str), f"Scenario {s.name} source not a string"
             assert len(s.source) > 0, f"Scenario {s.name} has empty source"
+            assert s.exchange_rate_mode == EXCHANGE_RATE_MODE_CAPO_SLASHING
 
     def test_results_have_source(self):
         """Every result should have a non-empty source field."""
@@ -358,3 +366,116 @@ class TestStressTests:
         )
         baseline = self._find_scenario(engine.build_scenarios(), "Baseline")
         assert baseline.gas_price_gwei == pytest.approx(DEFAULT_GAS_PRICE_GWEI, rel=1e-12)
+
+    def test_exchange_rate_mode_defaults_to_capo_slashing(self):
+        assert self.engine.exchange_rate_mode == EXCHANGE_RATE_MODE_CAPO_SLASHING
+        baseline = self._find_scenario(self.engine.build_scenarios(), "Baseline")
+        assert baseline.exchange_rate_mode == EXCHANGE_RATE_MODE_CAPO_SLASHING
+
+        result = self.engine.run_scenario(baseline)
+        assert result.exchange_rate_mode == EXCHANGE_RATE_MODE_CAPO_SLASHING
+
+    def test_simple_mode_skips_slashing_tail_and_marks_results(self):
+        market_state = dict(self.market_state)
+        market_state["exchange_rate_mode"] = EXCHANGE_RATE_MODE_SIMPLE
+        engine = StressTestEngine(
+            self.position,
+            self.rate_model,
+            market_state=market_state,
+        )
+
+        scenarios = engine.build_scenarios()
+        names = {s.name for s in scenarios}
+        assert "Slashing Tail" not in names
+
+        baseline = self._find_scenario(scenarios, "Baseline")
+        assert baseline.exchange_rate_mode == EXCHANGE_RATE_MODE_SIMPLE
+        result = engine.run_scenario(baseline)
+        assert result.exchange_rate_mode == EXCHANGE_RATE_MODE_SIMPLE
+
+    def test_stress_mode_switch_parity_without_tails(self):
+        capo_engine = StressTestEngine(
+            self.position,
+            self.rate_model,
+            market_state=dict(self.market_state),
+        )
+        simple_market_state = dict(self.market_state)
+        simple_market_state["exchange_rate_mode"] = EXCHANGE_RATE_MODE_SIMPLE
+        simple_engine = StressTestEngine(
+            self.position,
+            self.rate_model,
+            market_state=simple_market_state,
+        )
+
+        capo_baseline = self._find_scenario(capo_engine.build_scenarios(), "Baseline")
+        simple_baseline = self._find_scenario(simple_engine.build_scenarios(), "Baseline")
+        capo_result = capo_engine.run_scenario(capo_baseline)
+        simple_result = simple_engine.run_scenario(simple_baseline)
+
+        assert simple_result.health_factor == pytest.approx(capo_result.health_factor, rel=1e-12)
+        assert simple_result.pnl_30d == pytest.approx(capo_result.pnl_30d, rel=1e-12)
+        assert simple_result.net_apy == pytest.approx(capo_result.net_apy, rel=1e-12)
+
+    def test_exchange_rate_mode_switch_parity_when_capo_and_slashing_inactive(self):
+        common = dict(
+            initial_rate=1.22,
+            staking_yield=0.025,
+            slashing_probability=0.0,
+            slashing_severity=0.20,
+            capo_max_growth=0.10,
+            dt=1.0 / 365.0,
+            n_steps=30,
+            n_paths=5,
+            seed=7,
+        )
+        capo_paths = generate_lido_exchange_rate(
+            exchange_rate_mode=EXCHANGE_RATE_MODE_CAPO_SLASHING,
+            **common,
+        )
+        simple_paths = generate_lido_exchange_rate(
+            exchange_rate_mode=EXCHANGE_RATE_MODE_SIMPLE,
+            **common,
+        )
+        assert capo_paths == pytest.approx(simple_paths, rel=1e-12, abs=1e-12)
+
+    def test_exchange_rate_simple_mode_is_seed_independent(self):
+        common = dict(
+            initial_rate=1.22,
+            staking_yield=0.03,
+            slashing_probability=0.35,
+            slashing_severity=0.20,
+            capo_max_growth=0.09,
+            dt=1.0 / 365.0,
+            n_steps=40,
+            n_paths=8,
+        )
+        paths_seed_1 = generate_lido_exchange_rate(
+            exchange_rate_mode=EXCHANGE_RATE_MODE_SIMPLE,
+            seed=1,
+            **common,
+        )
+        paths_seed_999 = generate_lido_exchange_rate(
+            exchange_rate_mode=EXCHANGE_RATE_MODE_SIMPLE,
+            seed=999,
+            **common,
+        )
+        assert paths_seed_1 == pytest.approx(paths_seed_999, rel=1e-12, abs=1e-12)
+
+    def test_exchange_rate_capo_slashing_reproducible_given_seed(self):
+        common = dict(
+            initial_rate=1.22,
+            staking_yield=0.03,
+            slashing_probability=0.25,
+            slashing_severity=0.10,
+            capo_max_growth=0.09,
+            dt=1.0 / 365.0,
+            n_steps=50,
+            n_paths=16,
+            exchange_rate_mode=EXCHANGE_RATE_MODE_CAPO_SLASHING,
+        )
+        paths_a = generate_lido_exchange_rate(seed=123, **common)
+        paths_b = generate_lido_exchange_rate(seed=123, **common)
+        paths_c = generate_lido_exchange_rate(seed=124, **common)
+
+        assert paths_a == pytest.approx(paths_b, rel=1e-12, abs=1e-12)
+        assert np.any(np.abs(paths_a - paths_c) > 0.0)

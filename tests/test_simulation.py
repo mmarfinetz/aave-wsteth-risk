@@ -38,7 +38,9 @@ class TestVolatilityEstimator:
 
 class TestGBMSimulator:
     def setup_method(self):
-        self.config = SimulationConfig(n_simulations=1000, horizon_days=30, seed=42)
+        self.config = SimulationConfig.legacy_profile(
+            n_simulations=1000, horizon_days=30, seed=42
+        )
 
     def test_zero_vol_deterministic(self):
         """With zero volatility, all paths should follow pure drift."""
@@ -66,7 +68,9 @@ class TestGBMSimulator:
 
     def test_antithetic_variance_reduction(self):
         """Antithetic variates should reduce variance of terminal prices."""
-        config_large = SimulationConfig(n_simulations=10000, horizon_days=30, seed=42)
+        config_large = SimulationConfig.legacy_profile(
+            n_simulations=10000, horizon_days=30, seed=42
+        )
         sim = GBMSimulator(mu=0.0, sigma=0.60, config=config_large)
 
         # Antithetic (default)
@@ -79,7 +83,9 @@ class TestGBMSimulator:
 
     def test_terminal_log_normal(self):
         """Terminal distribution should be approximately log-normal."""
-        config = SimulationConfig(n_simulations=50000, horizon_days=90, seed=123)
+        config = SimulationConfig.legacy_profile(
+            n_simulations=50000, horizon_days=90, seed=123
+        )
         sim = GBMSimulator(mu=0.0, sigma=0.60, config=config)
         paths = sim.simulate(s0=100.0)
         log_finals = np.log(paths[:, -1])

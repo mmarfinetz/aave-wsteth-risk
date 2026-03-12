@@ -3,10 +3,11 @@
 import pytest
 
 from data.fetcher import (
+    CACHE_DIR,
     CURVE_STETH_POOL,
     ERC20_TRANSFER_TOPIC,
     FetchedData,
-    STRICT_AAVE_REQUIRED_PARAMS,
+    HISTORICAL_STRESS_DATES,
     SEL_CURVE_A,
     SEL_CURVE_BALANCES,
     SEL_GET_BASE_VARIABLE_BORROW_RATE_BY_ASSET,
@@ -19,17 +20,20 @@ from data.fetcher import (
     SEL_GET_VARIABLE_RATE_SLOPE2_BY_ASSET,
     SEL_OPTIMAL_USAGE_RATIO_BY_ASSET,
     SEL_TOTAL_SUPPLY,
+    STRICT_AAVE_REQUIRED_PARAMS,
     WETH_ADDRESS,
     _eth_call,
     _fetch_aave_onchain_pool_params,
     _fetch_curve_pool_onchain,
-    _fetch_defillama_weth_market_state,
     _fetch_weth_reserve_data_onchain,
     _needs_refresh,
     _parse_gas_hex,
     _rpc_eth_call,
+    _save_historical_stress_cache,
     _validate_strict_aave_sources,
     fetch_all,
+    fetch_historical_stress_data,
+    fetch_staking_apy,
     fetch_steth_eth_price_history,
     fetch_steth_supply_apy,
     fetch_weth_adv_onchain,
@@ -49,23 +53,20 @@ def _encode_emode_dynamic_tuple(
     label: str = "ETH correlated",
 ) -> str:
     """
-    Encode ABI payload for return type:
+    Encode ABI payload for:
     tuple(uint16 ltv,uint16 lt,uint16 bonus,address priceSource,string label)
-
-    This mirrors dynamic top-level tuple encoding where the first word is an
-    offset to the tuple head.
     """
     encoded_label = label.encode("utf-8")
     padded_len = ((len(encoded_label) + 31) // 32) * 32
     label_word = encoded_label.ljust(padded_len, b"\x00").hex()
 
     words = [
-        32,            # offset to tuple head
-        ltv_bps,       # tuple[0]
-        lt_bps,        # tuple[1]
-        bonus_bps,     # tuple[2]
-        price_source,  # tuple[3]
-        160,           # tuple[4] string offset from tuple head (5 * 32)
+        32,
+        ltv_bps,
+        lt_bps,
+        bonus_bps,
+        price_source,
+        160,
         len(encoded_label),
     ]
     return "0x" + "".join(f"{int(v):064x}" for v in words) + label_word
@@ -78,9 +79,9 @@ class TestFetcherOnchainParams:
         strategy_addr = "0x1111111111111111111111111111111111111111"
         oracle_addr = "0x2222222222222222222222222222222222222222"
 
-        slope1_ray = 27 * 10**24   # 0.027
-        slope2_ray = 8 * 10**26    # 0.80
-        optimal_ray = 9 * 10**26   # 0.90
+        slope1_ray = 27 * 10**24
+        slope2_ray = 8 * 10**26
+        optimal_ray = 9 * 10**26
 
         def fake_eth_call(to_address: str, call_data: str, timeout: int = 15):
             selector = call_data[2:10]
@@ -89,7 +90,6 @@ class TestFetcherOnchainParams:
             if selector == SEL_GET_PRICE_ORACLE:
                 return _encode_words(int(oracle_addr, 16))
             if selector == SEL_GET_RESERVE_CONFIGURATION_DATA:
-                # decimals, ltv, lt, bonus, reserveFactor, ...
                 return _encode_words(18, 8000, 8500, 10500, 1500, 1, 1, 0, 1, 0)
             if selector == SEL_GET_INTEREST_RATE_STRATEGY_ADDRESS:
                 return _encode_words(int(strategy_addr, 16))
@@ -123,8 +123,7 @@ class TestFetcherOnchainParams:
         data = FetchedData()
 
         def fake_eth_call(_to_address: str, call_data: str, timeout: int = 15):
-            selector = call_data[2:10]
-            if selector == SEL_GET_EMODE_CATEGORY_DATA:
+            if call_data[2:10] == SEL_GET_EMODE_CATEGORY_DATA:
                 return _encode_emode_dynamic_tuple(9300, 9500, 10100)
             return None
 
@@ -139,7 +138,8 @@ class TestFetcherOnchainParams:
         sources = {
             entry["name"]: entry["source"]
             for entry in data.params_log
-            if isinstance(entry, dict) and entry.get("name") in {
+            if isinstance(entry, dict)
+            and entry.get("name") in {
                 "ltv",
                 "liquidation_threshold",
                 "liquidation_bonus",
@@ -150,135 +150,11 @@ class TestFetcherOnchainParams:
         assert sources["liquidation_bonus"] == "Aave V3 Pool getEModeCategoryData(1)"
 
 
-class TestFetcherDefiLlama:
-    def test_fetches_weth_pool_totals_and_utilization(self, monkeypatch):
-        data = FetchedData()
-        mock_payload = {
-            "data": [
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "WETH",
-                    "totalSupplyUsd": 8_000_000_000.0,
-                    "totalBorrowUsd": 6_400_000_000.0,
-                    "underlyingTokenPriceUsd": 2500.0,
-                },
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "wstETH",
-                    "totalSupplyUsd": 5_000_000_000.0,
-                },
-            ]
-        }
-        monkeypatch.setattr("data.fetcher._http_get_json", lambda *_args, **_kwargs: mock_payload)
-
-        ok = _fetch_defillama_weth_market_state(data)
-        assert ok
-        assert data.current_weth_utilization == pytest.approx(0.8, rel=1e-12)
-        assert data.weth_total_supply == pytest.approx(3_200_000.0, rel=1e-12)
-        assert data.weth_total_borrows == pytest.approx(2_560_000.0, rel=1e-12)
-
-        names = {entry["name"] for entry in data.params_log if isinstance(entry, dict)}
-        assert "current_weth_utilization" in names
-        assert "weth_total_supply" in names
-        assert "weth_total_borrows" in names
-
-    def test_uses_eth_price_history_fallback_when_weth_price_missing(self, monkeypatch):
-        """When DeFiLlama omits WETH price fields, use fetched ETH/USD history."""
-        data = FetchedData()
-        data.eth_usd_price = 2500.0
-        data.eth_price_history = [2400.0, 2500.0]
-        mock_payload = {
-            "data": [
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "WETH",
-                    "totalSupplyUsd": 8_000_000_000.0,
-                    "totalBorrowUsd": 6_400_000_000.0,
-                    # No underlyingTokenPriceUsd / priceUsd / price
-                },
-            ]
-        }
-        monkeypatch.setattr("data.fetcher._http_get_json", lambda *_args, **_kwargs: mock_payload)
-
-        ok = _fetch_defillama_weth_market_state(data)
-        assert ok
-        assert data.weth_total_supply == pytest.approx(3_200_000.0, rel=1e-12)
-        assert data.weth_total_borrows == pytest.approx(2_560_000.0, rel=1e-12)
-
-    def test_uses_defillama_spot_fallback_when_history_missing(self, monkeypatch):
-        data = FetchedData()
-        data.eth_price_history = []
-        data.eth_usd_price = 0.0
-
-        pool_payload = {
-            "data": [
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "WETH",
-                    "totalSupplyUsd": 8_000_000_000.0,
-                    "totalBorrowUsd": 6_400_000_000.0,
-                },
-            ]
-        }
-        coins_payload = {"coins": {"coingecko:ethereum": {"price": 2500.0}}}
-
-        def fake_http_get_json(url, timeout=20):
-            if "yields.llama.fi/pools" in url:
-                return pool_payload
-            if "coins.llama.fi/prices/current/coingecko:ethereum" in url:
-                return coins_payload
-            return None
-
-        monkeypatch.setattr("data.fetcher._http_get_json", fake_http_get_json)
-
-        ok = _fetch_defillama_weth_market_state(data)
-        assert ok
-        assert data.weth_total_supply == pytest.approx(3_200_000.0, rel=1e-12)
-        assert data.weth_total_borrows == pytest.approx(2_560_000.0, rel=1e-12)
-        assert data.eth_usd_price == pytest.approx(2500.0, rel=1e-12)
-
-    def test_defillama_missing_borrows_returns_collateral_fraction_only(self, monkeypatch):
-        """When DeFiLlama lacks borrow data, it still returns collateral fraction
-        and leaves supply/borrows for on-chain to handle."""
-        data = FetchedData()
-        data.weth_total_supply = 111.0
-        data.weth_total_borrows = 77.0
-        mock_payload = {
-            "data": [
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "WETH",
-                    "totalSupplyUsd": 8_000_000_000.0,
-                    # No totalBorrowUsd
-                },
-            ]
-        }
-        monkeypatch.setattr("data.fetcher._http_get_json", lambda *_args, **_kwargs: mock_payload)
-        monkeypatch.setattr("data.fetcher._fetch_weth_reserve_data_onchain", lambda _d: False)
-
-        ok = _fetch_defillama_weth_market_state(data)
-        # Should still return True for collateral fraction
-        assert ok
-        # Supply/borrows should NOT be overwritten
-        assert data.weth_total_supply == pytest.approx(111.0, rel=1e-12)
-        assert data.weth_total_borrows == pytest.approx(77.0, rel=1e-12)
-
-
 class TestOnchainWethAdv:
     def test_fetch_weth_adv_onchain_computes_trailing_average(self, monkeypatch):
         data = FetchedData()
-
         monkeypatch.setattr("data.fetcher._rpc_block_number", lambda timeout=15: 20)
 
-        # Expected windows with lookback_days=2, blocks_per_day=4, chunk_blocks=2:
-        # day0: [17,20] => chunks [17,18], [19,20] => 10 + 20 WETH
-        # day1: [13,16] => chunks [13,14], [15,16] => 30 + 40 WETH
-        # ADV = (30 + 70) / 2 = 50 WETH/day.
         chunk_volume = {
             (17, 18): 10.0,
             (19, 20): 20.0,
@@ -316,11 +192,11 @@ class TestOnchainWethAdv:
 
         def fake_get_logs(_address, from_block, to_block, topics=None, timeout=20):
             if (from_block, to_block) == (17, 20):
-                return None  # force chunk split
+                return None
             if (from_block, to_block) == (17, 18):
                 return [{"data": hex(int(30 * 1e18))}]
             if (from_block, to_block) == (19, 20):
-                return None  # unresolved remainder
+                return None
             return []
 
         monkeypatch.setattr("data.fetcher._rpc_get_logs", fake_get_logs)
@@ -334,7 +210,6 @@ class TestOnchainWethAdv:
             min_coverage_ratio=0.25,
         )
         assert ok
-        # 2/4 blocks covered, scaled by 4/2 => 60 WETH/day
         assert data.adv_weth == pytest.approx(60.0, rel=1e-12)
         assert any(
             isinstance(entry, dict)
@@ -348,7 +223,6 @@ class TestFetcherRefreshLogic:
     def test_needs_refresh_when_pool_params_not_in_provenance_log(self):
         data = FetchedData()
         data.current_weth_utilization = 0.78
-        data.eth_collateral_fraction = 0.3
         data.ltv = 0.93
         data.liquidation_threshold = 0.95
         data.liquidation_bonus = 0.01
@@ -359,7 +233,6 @@ class TestFetcherRefreshLogic:
     def test_no_refresh_needed_when_required_pool_params_logged(self):
         data = FetchedData()
         data.current_weth_utilization = 0.78
-        data.eth_collateral_fraction = 0.3
         data.ltv = 0.93
         data.liquidation_threshold = 0.95
         data.liquidation_bonus = 0.01
@@ -383,17 +256,13 @@ class TestStrictAaveSourcing:
     def test_validate_strict_aave_sources_accepts_live_sources(self):
         data = FetchedData()
         for idx, name in enumerate(sorted(STRICT_AAVE_REQUIRED_PARAMS)):
-            source = "Aave V3 on-chain"
-            if name == "eth_collateral_fraction":
-                source = "DeFiLlama yields API — Aave V3 Ethereum ETH-symbol collateral share"
-            data.log_param(name, idx + 1, source)
+            data.log_param(name, idx + 1, "Aave V3 on-chain")
 
         ok, errors = _validate_strict_aave_sources(data)
         assert ok
         assert errors == []
 
     def test_fetch_all_strict_mode_rejects_cache_fallback(self, monkeypatch):
-        """Strict mode must not silently use stale cache for required Aave fields."""
         monkeypatch.setattr("data.fetcher._load_cache", lambda: FetchedData())
         monkeypatch.setattr("data.fetcher.fetch_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price_history", lambda _d: False)
@@ -403,6 +272,7 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_weth_borrow_apy_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_supply_apy", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_staking_apy", lambda _d, **_kw: False)
         monkeypatch.setattr("data.fetcher.fetch_curve_pool_params", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_weth_adv_onchain", lambda _d: False)
 
@@ -433,6 +303,7 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_weth_borrow_apy_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_supply_apy", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_staking_apy", lambda _d, **_kw: False)
         monkeypatch.setattr("data.fetcher.fetch_curve_pool_params", lambda _d: False)
         monkeypatch.setattr("data.fetcher._save_cache", lambda _d: None)
 
@@ -445,10 +316,7 @@ class TestStrictAaveSourcing:
             for entry in fetched.params_log
         )
 
-    def test_fetch_all_reuses_recent_cached_onchain_adv_without_live_fetch(
-        self,
-        monkeypatch,
-    ):
+    def test_fetch_all_reuses_recent_cached_onchain_adv_without_live_fetch(self, monkeypatch):
         cached = FetchedData()
         cached.adv_weth = 1_111_111.0
         cached.last_updated = "2099-01-01T00:00:00+00:00"
@@ -475,6 +343,7 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_weth_borrow_apy_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_supply_apy", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_staking_apy", lambda _d, **_kw: False)
         monkeypatch.setattr("data.fetcher.fetch_curve_pool_params", lambda _d: False)
         monkeypatch.setattr("data.fetcher._save_cache", lambda _d: None)
 
@@ -488,42 +357,42 @@ class TestStrictAaveSourcing:
         )
 
 
-class TestStethSupplyApySourcePriority:
-    def test_fetch_steth_supply_apy_prefers_onchain(self, monkeypatch):
+class TestStethSupplyApy:
+    def test_fetch_steth_supply_apy_reads_onchain_liquidity_rate(self, monkeypatch):
         data = FetchedData()
-        llama_called = []
-
-        def fake_onchain(d):
-            d.steth_supply_apy = 0.0123
-            d.log_param("steth_supply_apy", d.steth_supply_apy, "Aave V3 on-chain")
-            return True
-
-        def fake_llama(_d):
-            llama_called.append(True)
-            return True
-
-        monkeypatch.setattr("data.fetcher._fetch_steth_supply_apy_onchain", fake_onchain)
-        monkeypatch.setattr("data.fetcher._fetch_steth_supply_apy_from_defillama", fake_llama)
+        liquidity_rate_ray = int(0.0123 * 1e27)
+        monkeypatch.setattr(
+            "data.fetcher._eth_call",
+            lambda *_args, **_kwargs: _encode_words(0, 0, liquidity_rate_ray),
+        )
 
         ok = fetch_steth_supply_apy(data)
         assert ok
-        assert llama_called == []
         assert data.steth_supply_apy == pytest.approx(0.0123, rel=1e-12)
+        assert any(
+            entry["name"] == "steth_supply_apy"
+            and "currentLiquidityRate" in entry["source"]
+            for entry in data.params_log
+        )
 
-    def test_fetch_steth_supply_apy_falls_back_to_defillama(self, monkeypatch):
+    def test_fetch_steth_supply_apy_returns_false_when_onchain_call_fails(self, monkeypatch):
         data = FetchedData()
-        monkeypatch.setattr("data.fetcher._fetch_steth_supply_apy_onchain", lambda _d: False)
+        monkeypatch.setattr("data.fetcher._eth_call", lambda *_args, **_kwargs: None)
+        assert not fetch_steth_supply_apy(data)
 
-        def fake_llama(d):
-            d.steth_supply_apy = 0.0042
-            d.log_param("steth_supply_apy", d.steth_supply_apy, "DeFiLlama yields API")
-            return True
 
-        monkeypatch.setattr("data.fetcher._fetch_steth_supply_apy_from_defillama", fake_llama)
+class TestDisabledLiveFeeds:
+    def test_fetch_staking_apy_returns_false_without_live_source(self):
+        data = FetchedData()
+        assert not fetch_staking_apy(data, method="latest")
+        assert data.staking_apy == pytest.approx(0.025, rel=1e-12)
+        assert data.staking_apy_metadata == {}
 
-        ok = fetch_steth_supply_apy(data)
-        assert ok
-        assert data.steth_supply_apy == pytest.approx(0.0042, rel=1e-12)
+    def test_fetch_weth_borrow_apy_history_returns_false_without_live_source(self):
+        data = FetchedData()
+        assert not fetch_weth_borrow_apy_history(data, min_points=30)
+        assert data.weth_borrow_apy_history == []
+        assert data.weth_borrow_apy_timestamps == []
 
 
 class TestAdditionalHistoricalFeeds:
@@ -539,60 +408,20 @@ class TestAdditionalHistoricalFeeds:
         assert data.steth_eth_price == pytest.approx(prices[-1][1], rel=1e-12)
         assert any(e["name"] == "steth_eth_price_history" for e in data.params_log)
 
-    def test_fetch_weth_borrow_apy_history(self, monkeypatch):
-        data = FetchedData()
-
-        pools_payload = {
-            "data": [
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "WETH",
-                    "pool": "pool-id-123",
-                }
-            ]
-        }
-        chart_payload = {
-            "data": [
-                {"timestamp": 1700000000 + i * 86400, "apyBaseBorrow": 3.0 + 0.01 * i}
-                for i in range(45)
-            ]
-        }
-
-        def fake_http(url, timeout=20):
-            if "yields.llama.fi/pools" in url:
-                return pools_payload
-            if "yields.llama.fi/chart/pool-id-123" in url:
-                return chart_payload
-            return None
-
-        monkeypatch.setattr("data.fetcher._http_get_json", fake_http)
-
-        ok = fetch_weth_borrow_apy_history(data, min_points=30)
-        assert ok
-        assert len(data.weth_borrow_apy_history) == 45
-        assert len(data.weth_borrow_apy_timestamps) == 45
-        # 3% -> decimal 0.03
-        assert data.weth_borrow_apy_history[0] == pytest.approx(0.03, rel=1e-12)
-        assert any(e["name"] == "weth_borrow_apy_history" for e in data.params_log)
-
 
 class TestRpcFallbackChain:
     def test_rpc_eth_call_tries_endpoints_in_order(self, monkeypatch):
-        """Verify _rpc_eth_call tries endpoints sequentially until one succeeds."""
         from data.fetcher import DEFAULT_RPC_ENDPOINTS
 
         monkeypatch.setattr("data.fetcher._get_rpc_url", lambda: None)
-
         call_log = []
-        # Pick the last endpoint as the one that succeeds.
         success_endpoint = DEFAULT_RPC_ENDPOINTS[-1]
 
         def fake_rpc_request(endpoint, payload, timeout=10):
             call_log.append(endpoint)
             if endpoint == success_endpoint:
                 return {"jsonrpc": "2.0", "id": 1, "result": "0x" + "00" * 31 + "2a"}
-            return None  # All others fail
+            return None
 
         monkeypatch.setattr("data.fetcher._rpc_json_request", fake_rpc_request)
 
@@ -601,9 +430,7 @@ class TestRpcFallbackChain:
         assert call_log == DEFAULT_RPC_ENDPOINTS
 
     def test_rpc_eth_call_tries_user_rpc_first(self, monkeypatch):
-        """If ETH_RPC_URL is set, try it before public endpoints."""
         monkeypatch.setattr("data.fetcher._get_rpc_url", lambda: "https://my-node.example.com")
-
         call_log = []
 
         def fake_rpc_request(endpoint, payload, timeout=10):
@@ -619,7 +446,6 @@ class TestRpcFallbackChain:
         assert call_log == ["https://my-node.example.com"]
 
     def test_eth_call_falls_back_to_etherscan(self, monkeypatch):
-        """When all RPC endpoints fail, _eth_call falls back to Etherscan."""
         monkeypatch.setattr("data.fetcher._rpc_eth_call", lambda *a, **kw: None)
         monkeypatch.setattr(
             "data.fetcher._etherscan_eth_call_direct",
@@ -630,12 +456,9 @@ class TestRpcFallbackChain:
         assert result == "0xabcdef01"
 
     def test_eth_call_prefers_rpc_over_etherscan(self, monkeypatch):
-        """When RPC succeeds, Etherscan is not called."""
         etherscan_called = []
 
-        monkeypatch.setattr(
-            "data.fetcher._rpc_eth_call", lambda *a, **kw: "0xfromrpc"
-        )
+        monkeypatch.setattr("data.fetcher._rpc_eth_call", lambda *a, **kw: "0xfromrpc")
         monkeypatch.setattr(
             "data.fetcher._etherscan_eth_call_direct",
             lambda *a, **kw: etherscan_called.append(True) or "0xfrometherscan",
@@ -648,17 +471,13 @@ class TestRpcFallbackChain:
 
 class TestWethReserveDataOnchain:
     def test_fetch_weth_reserve_data_onchain(self, monkeypatch):
-        """Verify getReserveData struct parsing and totalSupply calls."""
         atoken_addr = 0x4D5F47FA6A74757F35C14FD3A6EF8E3C9BC514E8
         debt_token_addr = 0xEADC19AE70B220BE84090EF8D1c2c0CB9863B559
 
-        # Build a 15-word getReserveData result with aToken at index 8,
-        # variableDebtToken at index 10 (ReserveDataLegacy struct layout)
         reserve_words = [0] * 15
         reserve_words[8] = atoken_addr
         reserve_words[10] = debt_token_addr
 
-        # 3,200,000 ETH supply, 2,496,000 ETH borrows (in wei)
         supply_wei = int(3_200_000 * 1e18)
         borrow_wei = int(2_496_000 * 1e18)
 
@@ -688,16 +507,13 @@ class TestWethReserveDataOnchain:
         assert "current_weth_utilization" in names
 
     def test_fetch_weth_reserve_data_onchain_fails_gracefully(self, monkeypatch):
-        """Returns False when on-chain calls fail."""
         monkeypatch.setattr("data.fetcher._eth_call", lambda *a, **kw: None)
         data = FetchedData()
-        ok = _fetch_weth_reserve_data_onchain(data)
-        assert not ok
+        assert not _fetch_weth_reserve_data_onchain(data)
 
 
 class TestCurvePoolOnchain:
     def test_fetch_curve_pool_onchain(self, monkeypatch):
-        """Verify A() and balances() on-chain parsing for Curve pool."""
         amp = 50
         eth_balance_wei = int(50_000 * 1e18)
         steth_balance_wei = int(50_000 * 1e18)
@@ -709,7 +525,6 @@ class TestCurvePoolOnchain:
             if selector == SEL_CURVE_A:
                 return _encode_words(amp)
             if selector == SEL_CURVE_BALANCES:
-                # Decode which balance index is requested
                 idx = int(call_data[10:], 16)
                 if idx == 0:
                     return _encode_words(eth_balance_wei)
@@ -723,7 +538,6 @@ class TestCurvePoolOnchain:
         ok = _fetch_curve_pool_onchain(data)
         assert ok
         assert data.curve_amp_factor == 50
-        # (50000 + 50000) / 2 = 50000
         assert data.curve_pool_depth_eth == pytest.approx(50_000.0, rel=1e-6)
 
         names = {e["name"] for e in data.params_log}
@@ -731,139 +545,65 @@ class TestCurvePoolOnchain:
         assert "curve_pool_depth_eth" in names
 
     def test_fetch_curve_pool_onchain_fails_gracefully(self, monkeypatch):
-        """Returns False when on-chain calls fail."""
         monkeypatch.setattr("data.fetcher._eth_call", lambda *a, **kw: None)
         data = FetchedData()
-        ok = _fetch_curve_pool_onchain(data)
-        assert not ok
+        assert not _fetch_curve_pool_onchain(data)
 
 
 class TestGasPriceRpc:
     def test_rpc_gas_price_parses_hex(self):
-        """Verify hex wei → gwei parsing via _parse_gas_hex."""
         data = FetchedData()
-        # 20 gwei = 20 * 1e9 = 20_000_000_000 = 0x4A817C800
         ok = _parse_gas_hex("0x4a817c800", "test source", data)
         assert ok
         assert data.gas_price_gwei == pytest.approx(20.0, rel=1e-6)
         assert any(e["name"] == "gas_price_gwei" for e in data.params_log)
 
     def test_rpc_gas_price_rejects_zero(self):
-        """Zero gas price should be rejected."""
         data = FetchedData()
-        ok = _parse_gas_hex("0x0", "test source", data)
-        assert not ok
+        assert not _parse_gas_hex("0x0", "test source", data)
 
     def test_rpc_gas_price_rejects_invalid_hex(self):
-        """Invalid hex should be rejected."""
         data = FetchedData()
-        ok = _parse_gas_hex("not_hex", "test source", data)
-        assert not ok
-
-
-class TestDefiLlamaMissingBorrowsFallback:
-    def test_defillama_missing_borrows_falls_back_to_onchain(self, monkeypatch):
-        """When DeFiLlama has no borrow data, on-chain fallback kicks in."""
-        data = FetchedData()
-        # DeFiLlama payload without borrow fields
-        mock_payload = {
-            "data": [
-                {
-                    "project": "aave-v3",
-                    "chain": "Ethereum",
-                    "symbol": "WETH",
-                    "totalSupplyUsd": 8_000_000_000.0,
-                    # No totalBorrowUsd!
-                },
-            ]
-        }
-        monkeypatch.setattr(
-            "data.fetcher._http_get_json",
-            lambda *_args, **_kwargs: mock_payload,
-        )
-
-        # Mock _fetch_weth_reserve_data_onchain to succeed
-        def fake_onchain(d):
-            d.weth_total_supply = 3_200_000.0
-            d.weth_total_borrows = 2_496_000.0
-            d.current_weth_utilization = 0.78
-            d.log_param("weth_total_supply", d.weth_total_supply, "on-chain")
-            d.log_param("weth_total_borrows", d.weth_total_borrows, "on-chain")
-            d.log_param("current_weth_utilization", d.current_weth_utilization, "on-chain")
-            return True
-
-        monkeypatch.setattr(
-            "data.fetcher._fetch_weth_reserve_data_onchain", fake_onchain
-        )
-
-        ok = _fetch_defillama_weth_market_state(data)
-        assert ok
-        assert data.weth_total_supply == pytest.approx(3_200_000.0, rel=1e-6)
-        assert data.weth_total_borrows == pytest.approx(2_496_000.0, rel=1e-6)
-        assert data.current_weth_utilization == pytest.approx(0.78, rel=1e-3)
+        assert not _parse_gas_hex("not_hex", "test source", data)
 
 
 class TestHistoricalStressData:
-    def test_api_success_returns_records_with_required_keys(self, monkeypatch, tmp_path):
-        """When DeFiLlama returns valid data for all dates, result has correct structure."""
-        from data.fetcher import (
-            HISTORICAL_STRESS_DATES,
-            fetch_historical_stress_data,
-        )
-
-        # Redirect cache file to tmp_path so test doesn't mutate real cache
-        cache_file = tmp_path / "stress_cache.json"
-        monkeypatch.setattr("data.fetcher.HISTORICAL_STRESS_CACHE_FILE", cache_file)
-
-        # Monkeypatch _fetch_defillama_historical to return valid data
-        def fake_fetch(timestamp):
-            return {"eth_usd": 1800.0, "steth_usd": 1760.0}
-
-        monkeypatch.setattr("data.fetcher._fetch_defillama_historical", fake_fetch)
-
-        # Ensure cache doesn't short-circuit
-        monkeypatch.setattr("data.fetcher._load_historical_stress_cache", lambda: None)
-
-        results = fetch_historical_stress_data()
-
-        assert len(results) == len(HISTORICAL_STRESS_DATES)
-        required_keys = {"name", "steth_eth_price", "eth_usd_price",
-                         "eth_usd_price_7d_prior", "source"}
-        for record in results:
-            assert required_keys.issubset(record.keys()), (
-                f"Missing keys in {record['name']}: {required_keys - record.keys()}"
-            )
-            assert "DeFiLlama" in record["source"]
-
-    def test_api_failure_falls_back_to_cache(self, monkeypatch, tmp_path):
-        """When API fails, pre-populated cache provides fallback records."""
-        from data.fetcher import (
-            HISTORICAL_STRESS_DATES,
-            _save_historical_stress_cache,
-            fetch_historical_stress_data,
-        )
-
-        # Redirect cache file and CACHE_DIR to tmp_path
-        cache_file = tmp_path / "stress_cache.json"
-        monkeypatch.setattr("data.fetcher.HISTORICAL_STRESS_CACHE_FILE", cache_file)
+    def test_cache_success_returns_records_with_required_keys(self, monkeypatch, tmp_path):
+        cache_file = tmp_path / "historical_stress_cache.json"
         monkeypatch.setattr("data.fetcher.CACHE_DIR", tmp_path)
+        monkeypatch.setattr("data.fetcher.HISTORICAL_STRESS_CACHE_FILE", cache_file)
 
-        # Pre-populate cache with valid records
-        cache_data = {}
+        cache_payload = {}
         for entry in HISTORICAL_STRESS_DATES:
-            cache_data[entry["name"]] = {
+            cache_payload[entry["name"]] = {
+                "timestamp": entry["timestamp"],
                 "steth_eth_price": 0.96,
                 "eth_usd_price": 1500.0,
                 "eth_usd_price_7d_prior": 1700.0,
-                "source": "DeFiLlama historical price API",
+                "source": "historical archive",
             }
-        _save_historical_stress_cache(cache_data)
-
-        # Make API return None (failure)
-        monkeypatch.setattr("data.fetcher._fetch_defillama_historical", lambda ts: None)
+        _save_historical_stress_cache(cache_payload)
 
         results = fetch_historical_stress_data()
 
         assert len(results) == len(HISTORICAL_STRESS_DATES)
+        required = {
+            "name",
+            "timestamp",
+            "steth_eth_price",
+            "eth_usd_price",
+            "eth_usd_price_7d_prior",
+            "source",
+        }
         for record in results:
-            assert "cache" in record["source"].lower()
+            assert required.issubset(record.keys())
+            assert record["source"].startswith("cache")
+
+    def test_missing_cache_returns_empty_list(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("data.fetcher.CACHE_DIR", tmp_path)
+        monkeypatch.setattr(
+            "data.fetcher.HISTORICAL_STRESS_CACHE_FILE",
+            tmp_path / "historical_stress_cache.json",
+        )
+
+        assert fetch_historical_stress_data() == []

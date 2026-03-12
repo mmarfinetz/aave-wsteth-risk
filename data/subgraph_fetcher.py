@@ -13,6 +13,8 @@ for reliable traversal of large position sets (100k+).
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 import os
 import sys
@@ -72,6 +74,16 @@ query CollateralPositions($first: Int!, $lastId: String!) {
   }
 }
 """
+
+
+@dataclass(frozen=True)
+class SubgraphPositionSnapshot:
+    """Raw borrower/collateral position snapshot fetched from the subgraph."""
+
+    borrow_positions: list[dict[str, Any]]
+    collateral_positions: list[dict[str, Any]]
+    eth_price_usd: float
+    fetched_at: str
 
 
 def _graph_api_key() -> str | None:
@@ -233,6 +245,68 @@ def _paginate_positions(
     return rows
 
 
+def fetch_subgraph_position_snapshot(
+    subgraph_url: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRIES,
+    *,
+    borrow_label: str = "borrow positions",
+    collateral_label: str = "collateral positions",
+) -> SubgraphPositionSnapshot:
+    """
+    Fetch borrower and collateral positions once for downstream reuse.
+
+    Borrow and collateral pagination are independent GraphQL traversals, so run
+    them concurrently to reduce wall-clock time on live subgraph requests.
+    """
+    if not subgraph_url or not subgraph_url.strip():
+        raise RuntimeError("AAVE_SUBGRAPH_URL is empty")
+    url = subgraph_url.strip()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        borrow_future = executor.submit(
+            _paginate_positions,
+            subgraph_url=url,
+            query=BORROWER_POSITIONS_QUERY,
+            label=borrow_label,
+            timeout=timeout,
+            retries=retries,
+        )
+        collateral_future = executor.submit(
+            _paginate_positions,
+            subgraph_url=url,
+            query=COLLATERAL_POSITIONS_QUERY,
+            label=collateral_label,
+            timeout=timeout,
+            retries=retries,
+        )
+        borrow_positions = borrow_future.result()
+        collateral_positions = collateral_future.result()
+
+    if not borrow_positions:
+        raise RuntimeError("No open borrow positions found in subgraph")
+
+    eth_price_usd = _resolve_eth_price_usd(borrow_positions)
+    if eth_price_usd <= 0.0:
+        raise RuntimeError(
+            "Could not resolve ETH/USD price from subgraph WETH market data"
+        )
+
+    print(
+        f"  [SUBGRAPH] Fetched {len(borrow_positions):,} borrow + "
+        f"{len(collateral_positions):,} collateral positions",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    return SubgraphPositionSnapshot(
+        borrow_positions=borrow_positions,
+        collateral_positions=collateral_positions,
+        eth_price_usd=eth_price_usd,
+        fetched_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+
+
 def _resolve_eth_price_usd(positions: list[dict[str, Any]]) -> float:
     """
     Extract ETH/USD price from WETH-market positions.
@@ -275,6 +349,60 @@ def _position_value_in_eth(
     liq_threshold = _normalize_ratio(market.get("liquidationThreshold"), 0.80)
 
     return value_eth, liq_threshold, decimals
+
+
+def _enabled_collateral_positions(
+    collateral_positions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Filter collateral rows to positions explicitly enabled as collateral."""
+    enabled: list[dict[str, Any]] = []
+    for pos in collateral_positions:
+        if not isinstance(pos, dict):
+            continue
+        raw_is_collateral = pos.get("isCollateral")
+        if raw_is_collateral is not None:
+            if isinstance(raw_is_collateral, bool):
+                if not raw_is_collateral:
+                    continue
+            elif str(raw_is_collateral).strip().lower() in {"false", "0", "no"}:
+                continue
+        enabled.append(pos)
+    return enabled
+
+
+def _eth_symbol_collateral_fraction(
+    collateral_positions: list[dict[str, Any]],
+    eth_price_usd: float,
+) -> float:
+    """
+    Approximate ETH-collateral share from subgraph collateral positions.
+
+    Uses the existing ETH-symbol heuristic by classifying any collateral
+    token whose symbol contains ``ETH`` as ETH-like collateral.
+    """
+    total_collateral_eth = 0.0
+    eth_like_collateral_eth = 0.0
+
+    for pos in _enabled_collateral_positions(collateral_positions):
+        value_eth, _, _ = _position_value_in_eth(pos, eth_price_usd)
+        if value_eth <= 0.0:
+            continue
+        total_collateral_eth += value_eth
+        market = pos.get("market") or {}
+        token = market.get("inputToken") or {}
+        symbol = str(token.get("symbol") or "").upper()
+        if "ETH" in symbol:
+            eth_like_collateral_eth += value_eth
+
+    if total_collateral_eth <= 0.0:
+        return 0.0
+    return float(
+        np.clip(
+            eth_like_collateral_eth / max(total_collateral_eth, np.finfo(float).eps),
+            0.0,
+            1.0,
+        )
+    )
 
 
 def _build_borrower_snapshots(
@@ -449,12 +577,17 @@ def compute_cohort_analytics(
         "Shock exposure assumes debt is static and collateral scales linearly with ETH shocks.",
         "Borrowers with no matched collateral positions are excluded from analytics.",
     ]
+    eth_collateral_fraction = _eth_symbol_collateral_fraction(
+        collateral_positions,
+        eth_price_usd,
+    )
 
     return {
         "borrower_count": len(snapshots),
         "ltv_distribution": ltv_distribution,
         "avg_ltv_weighted": round(avg_ltv_weighted, 6),
         "avg_lt_weighted": round(avg_lt_weighted, 6),
+        "eth_collateral_fraction": round(eth_collateral_fraction, 6),
         "cohort_liquidation_exposure": cohort_liquidation_exposure,
         "borrower_behavior": {
             "high_ltv_share": round(high_ltv_share, 6),
@@ -470,44 +603,17 @@ def fetch_subgraph_cohort_analytics(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int = DEFAULT_RETRIES,
 ) -> dict[str, Any]:
-    if not subgraph_url or not subgraph_url.strip():
-        raise RuntimeError("AAVE_SUBGRAPH_URL is empty")
-    url = subgraph_url.strip()
-
-    borrow_positions = _paginate_positions(
-        subgraph_url=url,
-        query=BORROWER_POSITIONS_QUERY,
-        label="borrow positions",
+    snapshot = fetch_subgraph_position_snapshot(
+        subgraph_url=subgraph_url,
         timeout=timeout,
         retries=retries,
+        borrow_label="borrow positions",
+        collateral_label="collateral positions",
     )
-    if not borrow_positions:
-        raise RuntimeError("No open borrow positions found in subgraph")
-
-    # Resolve ETH price from WETH borrow positions for USD→ETH conversion.
-    eth_price_usd = _resolve_eth_price_usd(borrow_positions)
-    if eth_price_usd <= 0.0:
-        raise RuntimeError(
-            "Could not resolve ETH/USD price from subgraph WETH market data"
-        )
-
-    collateral_positions = _paginate_positions(
-        subgraph_url=url,
-        query=COLLATERAL_POSITIONS_QUERY,
-        label="collateral positions",
-        timeout=timeout,
-        retries=retries,
-    )
-
-    print(
-        f"  [SUBGRAPH] Fetched {len(borrow_positions):,} borrow + "
-        f"{len(collateral_positions):,} collateral positions",
-        file=sys.stderr,
-        flush=True,
-    )
-
     return compute_cohort_analytics(
-        borrow_positions, collateral_positions, eth_price_usd,
+        snapshot.borrow_positions,
+        snapshot.collateral_positions,
+        snapshot.eth_price_usd,
     )
 
 
@@ -528,4 +634,30 @@ def fetch_subgraph_cohort_analytics_from_env(
         subgraph_url=subgraph_url,
         timeout=timeout,
         retries=retries,
+    )
+
+
+def fetch_subgraph_position_snapshot_from_env(
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRIES,
+    *,
+    borrow_label: str = "borrow positions",
+    collateral_label: str = "collateral positions",
+) -> SubgraphPositionSnapshot:
+    """Fetch a reusable borrower/collateral snapshot from the configured subgraph."""
+    subgraph_url = (os.getenv("AAVE_SUBGRAPH_URL") or "").strip()
+    if not subgraph_url:
+        raise RuntimeError("AAVE_SUBGRAPH_URL is not set")
+    if _is_gateway_url_without_embedded_key(subgraph_url) and not _graph_api_key():
+        raise RuntimeError(
+            "AAVE_SUBGRAPH_URL uses gateway.thegraph.com /api/subgraphs/... but no "
+            "Graph API key was found. Set GRAPH_API_KEY (or THEGRAPH_API_KEY) "
+            "or use an embedded-key URL (/api/<key>/subgraphs/...)."
+        )
+    return fetch_subgraph_position_snapshot(
+        subgraph_url=subgraph_url,
+        timeout=timeout,
+        retries=retries,
+        borrow_label=borrow_label,
+        collateral_label=collateral_label,
     )

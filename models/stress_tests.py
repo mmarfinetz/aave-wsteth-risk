@@ -4,7 +4,7 @@ hypotheticals, and sensitivity sweeps.
 
 Scenario sources:
 - Baseline: fetched market state (utilization, stETH/ETH price, gas)
-- Historical: DeFiLlama historical API with cache fallback
+- Historical: cached historical stress snapshots when available
 - Hypothetical: computed from cascade model and rate/utilization stress
 - Tail: slashing and governance parameter-shock scenarios
 
@@ -19,9 +19,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from config.params import CURVE_POOL, DEFAULT_GAS_PRICE_GWEI, EMODE, MARKET
+from config.time_grid import build_simulation_grid
 from models.aave_model import InterestRateModel
 from models.position_model import LoopedPosition
-from src.oracle_dynamics.exchange_rate import generate_lido_exchange_rate
+from src.oracle_dynamics.exchange_rate import (
+    EXCHANGE_RATE_MODE_CAPO_SLASHING,
+    EXCHANGE_RATE_MODE_SIMPLE,
+    generate_lido_exchange_rate,
+    resolve_exchange_rate_mode,
+)
 
 
 DEFAULT_CASCADE_AVG_LTV = 0.70
@@ -46,6 +52,7 @@ class StressScenario:
     lt_multiplier: float = 1.0
     rate_spread: float = 0.0
     forced_exit: bool = False
+    exchange_rate_mode: str | None = None
 
 
 @dataclass
@@ -64,6 +71,7 @@ class StressResult:
     unwind_cost_100pct_avg: float
     source: str
     time_to_hf_breach_days: float | None = None
+    exchange_rate_mode: str = EXCHANGE_RATE_MODE_CAPO_SLASHING
 
 
 def _conditional_depeg(eth_drop_abs: float, beta: float, exponent: float) -> float:
@@ -121,6 +129,10 @@ class StressTestEngine:
         self.slippage_model = slippage_model
 
         self.market_state = self._normalize_market_state(market_state)
+        self.exchange_rate_mode = resolve_exchange_rate_mode(
+            self.market_state.get("exchange_rate_mode", EXCHANGE_RATE_MODE_CAPO_SLASHING)
+        )
+        self.market_state["exchange_rate_mode"] = self.exchange_rate_mode
         self.historical_data = self._load_historical_data()
         self.hypothetical_eth_drops = self._derive_eth_drop_scenarios()
         (
@@ -152,6 +164,7 @@ class StressTestEngine:
                 "slashing_severity": 0.08,
                 "governance_lt_haircut": 0.02,
                 "governance_ir_spread": 0.04,
+                "exchange_rate_mode": EXCHANGE_RATE_MODE_CAPO_SLASHING,
             }
 
         ms = dict(market_state)
@@ -185,7 +198,11 @@ class StressTestEngine:
             ms.get("avg_lt", ms.get("cascade_avg_lt", DEFAULT_CASCADE_AVG_LT))
         )
         ms["eth_price_history"] = list(ms.get("eth_price_history", []))
-        ms["stress_horizon_days"] = int(ms.get("stress_horizon_days", 30))
+        ms["stress_horizon_days"] = float(ms.get("stress_horizon_days", 30.0))
+        ms["stress_timestep_days"] = float(ms.get("stress_timestep_days", 1.0))
+        ms["stress_allow_step_cap_override"] = bool(
+            ms.get("stress_allow_step_cap_override", False)
+        )
         ms["weth_borrow_reduction_fraction"] = float(
             ms.get("weth_borrow_reduction_fraction", 0.15)
         )
@@ -193,6 +210,9 @@ class StressTestEngine:
         ms["slashing_severity"] = float(ms.get("slashing_severity", 0.08))
         ms["governance_lt_haircut"] = float(ms.get("governance_lt_haircut", 0.02))
         ms["governance_ir_spread"] = float(ms.get("governance_ir_spread", 0.04))
+        ms["exchange_rate_mode"] = resolve_exchange_rate_mode(
+            ms.get("exchange_rate_mode", EXCHANGE_RATE_MODE_CAPO_SLASHING)
+        )
 
         return ms
 
@@ -419,6 +439,11 @@ class StressTestEngine:
         )
         return _execution_depeg_from_flow(sell_volume, effective_liquidity)
 
+    def _effective_exchange_rate_mode(self, scenario: StressScenario | None = None) -> str:
+        """Resolve effective exchange-rate mode from scenario override or engine default."""
+        scenario_mode = getattr(scenario, "exchange_rate_mode", None) if scenario else None
+        return resolve_exchange_rate_mode(scenario_mode or self.exchange_rate_mode)
+
     def _build_baseline(self) -> list[StressScenario]:
         """Build baseline scenario from current market state."""
         ms = self.market_state
@@ -437,6 +462,7 @@ class StressTestEngine:
                     f"rate={borrow_rate:.2%}"
                 ),
                 source="fetched market state",
+                exchange_rate_mode=self.exchange_rate_mode,
             )
         ]
 
@@ -474,6 +500,7 @@ class StressTestEngine:
                         f"rate={borrow_rate:.2%}"
                     ),
                     source=source,
+                    exchange_rate_mode=self.exchange_rate_mode,
                 )
             )
         return scenarios
@@ -597,6 +624,7 @@ class StressTestEngine:
                         f"rate={borrow_rate:.2%}"
                     ),
                     source=source,
+                    exchange_rate_mode=self.exchange_rate_mode,
                 )
             )
 
@@ -617,6 +645,7 @@ class StressTestEngine:
                     f"rate={spike_rate:.2%}"
                 ),
                 source="computed: utilization spike inferred from data-driven stress set",
+                exchange_rate_mode=self.exchange_rate_mode,
             )
         )
 
@@ -644,52 +673,60 @@ class StressTestEngine:
                     f"rate={extreme_rate:.2%}"
                 ),
                 source="computed: data-driven worst-case combination",
+                exchange_rate_mode=self.exchange_rate_mode,
             )
         )
 
         return scenarios
 
     def _build_tail_scenarios(self) -> list[StressScenario]:
-        """Add slashing and governance parameter-shock tails."""
+        """Add slashing and governance parameter-shock tails.
+
+        Simple exchange-rate mode omits the slashing-tail scenario.
+        """
         util = self.target_utilization_spike
         rate = float(self.rate_model.borrow_rate(util))
         slash_severity = float(np.clip(self.market_state.get("slashing_severity", 0.08), 0.0, 0.50))
         lt_haircut = float(np.clip(self.market_state.get("governance_lt_haircut", 0.02), 0.0, 0.20))
         ir_spread = max(float(self.market_state.get("governance_ir_spread", 0.04)), 0.0)
 
-        return [
-            StressScenario(
-                name="Slashing Tail",
-                steth_eth_price=self._execution_depeg(util, rate),
-                borrow_rate=rate,
-                eth_price_change=-0.05,
-                gas_price_gwei=round(self._stressed_gas_price(0.05), 3),
-                utilization_spike=util,
-                slash_probability=1.0,
-                slash_severity=slash_severity,
-                single_slash_event=True,
-                forced_exit=True,
-                description=(
-                    f"Exchange-rate slashing tail: severity={slash_severity:.1%}, util={util:.0%}"
-                ),
-                source="computed: slashing tail process on oracle exchange rate",
+        governance = StressScenario(
+            name="Governance Shock",
+            steth_eth_price=self._execution_depeg(util, rate + ir_spread),
+            borrow_rate=rate,
+            eth_price_change=-0.05,
+            gas_price_gwei=round(self._stressed_gas_price(0.05), 3),
+            utilization_spike=util,
+            lt_multiplier=1.0 - lt_haircut,
+            rate_spread=ir_spread,
+            forced_exit=True,
+            description=(
+                f"Governance LT/IR jump: LT -{lt_haircut:.1%}, IR +{ir_spread:.1%}"
             ),
-            StressScenario(
-                name="Governance Shock",
-                steth_eth_price=self._execution_depeg(util, rate + ir_spread),
-                borrow_rate=rate,
-                eth_price_change=-0.05,
-                gas_price_gwei=round(self._stressed_gas_price(0.05), 3),
-                utilization_spike=util,
-                lt_multiplier=1.0 - lt_haircut,
-                rate_spread=ir_spread,
-                forced_exit=True,
-                description=(
-                    f"Governance LT/IR jump: LT -{lt_haircut:.1%}, IR +{ir_spread:.1%}"
-                ),
-                source="computed: governance parameter shock",
+            source="computed: governance parameter shock",
+            exchange_rate_mode=self.exchange_rate_mode,
+        )
+        if self.exchange_rate_mode == EXCHANGE_RATE_MODE_SIMPLE:
+            return [governance]
+
+        slashing = StressScenario(
+            name="Slashing Tail",
+            steth_eth_price=self._execution_depeg(util, rate),
+            borrow_rate=rate,
+            eth_price_change=-0.05,
+            gas_price_gwei=round(self._stressed_gas_price(0.05), 3),
+            utilization_spike=util,
+            slash_probability=1.0,
+            slash_severity=slash_severity,
+            single_slash_event=True,
+            forced_exit=True,
+            description=(
+                f"Exchange-rate slashing tail: severity={slash_severity:.1%}, util={util:.0%}"
             ),
-        ]
+            source="computed: slashing tail process on oracle exchange rate",
+            exchange_rate_mode=self.exchange_rate_mode,
+        )
+        return [slashing, governance]
 
     def build_scenarios(self) -> list[StressScenario]:
         """Build all stress scenarios from data/model calibration."""
@@ -707,31 +744,52 @@ class StressTestEngine:
         HF is driven by oracle exchange rate, debt accrual, and optional LT shocks.
         Depeg is execution-only and applied to unwind costs, not HF.
         """
-        horizon_days = max(int(self.market_state.get("stress_horizon_days", 30)), 1)
-        n_cols = horizon_days + 1
-        dt = 1.0 / 365.0
+        stress_grid = build_simulation_grid(
+            horizon_days=float(self.market_state.get("stress_horizon_days", 30.0)),
+            timestep_minutes=None,
+            timestep_days=float(self.market_state.get("stress_timestep_days", 1.0)),
+            allow_step_cap_override=bool(
+                self.market_state.get("stress_allow_step_cap_override", False)
+            ),
+        )
+        n_steps = stress_grid.n_steps
+        n_cols = stress_grid.n_cols
+        dt = stress_grid.dt_years
 
         borrow_rate = max(float(scenario.borrow_rate) + float(scenario.rate_spread), 0.0)
         borrow_path = np.full((1, n_cols), borrow_rate)
         lt_mult = float(np.clip(scenario.lt_multiplier, 0.70, 1.0))
         lt_paths = np.full((1, n_cols), self.position.lt * lt_mult)
+        exchange_rate_mode = self._effective_exchange_rate_mode(scenario)
 
         slash_prob = float(np.clip(scenario.slash_probability, 0.0, 1.0))
         slash_severity = float(np.clip(scenario.slash_severity, 0.0, 0.95))
         single_slash_event = bool(getattr(scenario, "single_slash_event", False))
-        model_slash_prob = 0.0 if single_slash_event else slash_prob
+        if exchange_rate_mode == EXCHANGE_RATE_MODE_SIMPLE:
+            slash_prob = 0.0
+            slash_severity = 0.0
+            single_slash_event = False
+            model_slash_prob = 0.0
+        else:
+            model_slash_prob = 0.0 if single_slash_event else slash_prob
         exchange_rate_paths = generate_lido_exchange_rate(
             initial_rate=float(self.position.wsteth_steth_rate),
             staking_yield=float(self.position.staking_apy),
             slashing_probability=model_slash_prob,
             slashing_severity=slash_severity,
-            capo_max_growth=0.0968,
+            capo_max_growth=float(self.market_state.get("capo_max_growth_annual", 0.0968)),
             dt=dt,
-            n_steps=horizon_days,
+            n_steps=n_steps,
             n_paths=1,
             seed=123,
+            exchange_rate_mode=exchange_rate_mode,
         )
-        if single_slash_event and slash_prob > 0.0 and slash_severity > 0.0:
+        if (
+            exchange_rate_mode == EXCHANGE_RATE_MODE_CAPO_SLASHING
+            and single_slash_event
+            and slash_prob > 0.0
+            and slash_severity > 0.0
+        ):
             # Scenario-mode one-off slash shock to avoid repeated daily compounding.
             one_off_multiplier = 1.0 - np.clip(slash_prob * slash_severity, 0.0, 0.95)
             exchange_rate_paths[:, 1:] *= one_off_multiplier
@@ -745,7 +803,11 @@ class StressTestEngine:
         hf_min = float(np.min(hf_path[0]))
         liquidated = bool(np.any(hf_path[0] < 1.0))
         breach_steps = np.where(hf_path[0] < 1.0)[0]
-        time_to_hf_breach = float(breach_steps[0]) if breach_steps.size else None
+        time_to_hf_breach = (
+            float(stress_grid.time_grid_days[int(breach_steps[0])])
+            if breach_steps.size
+            else None
+        )
 
         net_apy = float(self.position.net_apy(borrow_rate))
         carry_pnl = float(
@@ -804,6 +866,7 @@ class StressTestEngine:
             unwind_cost_100pct_avg=unwind_total,
             source=scenario.source,
             time_to_hf_breach_days=time_to_hf_breach,
+            exchange_rate_mode=exchange_rate_mode,
         )
 
     def run_all(self) -> list[StressResult]:
