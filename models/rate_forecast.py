@@ -51,10 +51,12 @@ class RateForecast:
         if percentiles is None:
             percentiles = [5, 25, 50, 75, 95]
 
-        fan = {}
-        for p in percentiles:
-            fan[p] = np.percentile(rate_paths, p, axis=0)
-        return fan
+        percentile_array = np.asarray(percentiles, dtype=float)
+        percentile_values = np.percentile(rate_paths, percentile_array, axis=0)
+        return {
+            p: percentile_values[idx]
+            for idx, p in enumerate(percentiles)
+        }
 
     def full_forecast(self, n_paths: int, n_steps: int, dt: float,
                       u0: float = 0.78,

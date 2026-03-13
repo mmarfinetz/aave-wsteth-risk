@@ -31,6 +31,8 @@ DEFAULT_SUBGRAPH_CACHE_TTL_SECONDS = 300
 
 _SUBGRAPH_CACHE_LOCK = threading.Lock()
 _SUBGRAPH_CACHE: dict[str, tuple[float, "SubgraphRuntimeBundle"]] = {}
+_SUBGRAPH_ANALYTICS_CACHE_LOCK = threading.Lock()
+_SUBGRAPH_ANALYTICS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 @dataclass(frozen=True)
@@ -81,7 +83,34 @@ class DashboardRunRequest:
     cascade_avg_lt: float = DEFAULT_CASCADE_AVG_LT
 
     def to_cache_key(self) -> str:
-        return json.dumps(asdict(self), sort_keys=True, default=str)
+        payload = asdict(self)
+        payload.pop("force_refresh", None)
+
+        config = build_simulation_config(self)
+        abm_enabled, abm_mode = _effective_abm_state(self)
+
+        payload["profile"] = config.profile_name
+        payload["horizon_days"] = config.horizon_days
+        payload["timestep_minutes"] = config.timestep_minutes
+        payload["timestep_days"] = config.timestep_days
+        payload["staking_apy_method"] = (
+            str(self.staking_apy_method).strip().lower()
+            if self.staking_apy_method is not None and str(self.staking_apy_method).strip()
+            else None
+        )
+        payload["exchange_rate_mode"] = (
+            str(self.exchange_rate_mode).strip().lower()
+            if self.exchange_rate_mode is not None and str(self.exchange_rate_mode).strip()
+            else ("simple" if config.profile_name == "operational" else "capo_slashing")
+        )
+        payload["zerox_taker"] = (
+            str(self.zerox_taker).strip()
+            if self.zerox_taker is not None and str(self.zerox_taker).strip()
+            else None
+        )
+        payload["abm_enabled"] = abm_enabled
+        payload["abm_mode"] = abm_mode
+        return json.dumps(payload, sort_keys=True, default=str)
 
 
 @dataclass
@@ -381,6 +410,36 @@ def _subgraph_bundle_cache_key(
     )
 
 
+def _subgraph_analytics_cache_key() -> str:
+    subgraph_url = (os.getenv("AAVE_SUBGRAPH_URL") or "").strip()
+    return json.dumps({"subgraph_url": subgraph_url}, sort_keys=True)
+
+
+def load_subgraph_cohort_analytics(
+    *,
+    force_refresh: bool = False,
+    ttl_seconds: int = DEFAULT_SUBGRAPH_CACHE_TTL_SECONDS,
+) -> tuple[dict[str, Any], bool]:
+    """Fetch and cache cohort analytics for request reuse."""
+    cache_key = _subgraph_analytics_cache_key()
+    now = time.time()
+    ttl = max(int(ttl_seconds), 0)
+
+    if not force_refresh and ttl > 0:
+        with _SUBGRAPH_ANALYTICS_CACHE_LOCK:
+            cached = _SUBGRAPH_ANALYTICS_CACHE.get(cache_key)
+            if cached and (now - cached[0]) < ttl:
+                return cached[1], True
+
+    from data.subgraph_fetcher import fetch_subgraph_cohort_analytics_from_env
+
+    cohort_analytics = fetch_subgraph_cohort_analytics_from_env()
+    if ttl > 0:
+        with _SUBGRAPH_ANALYTICS_CACHE_LOCK:
+            _SUBGRAPH_ANALYTICS_CACHE[cache_key] = (now, cohort_analytics)
+    return cohort_analytics, False
+
+
 def load_subgraph_runtime_bundle(
     *,
     bucket_mapping: dict[str, Any] | None = None,
@@ -451,14 +510,25 @@ def run_dashboard_simulation(
     needs_account_cascade_inputs = request.use_account_level_cascade or abm_enabled
 
     bundle = None
+    cohort_analytics_override = None
+    subgraph_cache_hit = False
     if needs_account_cascade_inputs:
-        bundle_start = time.perf_counter()
+        subgraph_start = time.perf_counter()
         bundle = load_subgraph_runtime_bundle(
             bucket_mapping=request.account_bucket_mapping,
             force_refresh=request.force_refresh,
             ttl_seconds=subgraph_cache_ttl_seconds,
         )
-        timings.subgraph_bundle_seconds = time.perf_counter() - bundle_start
+        timings.subgraph_bundle_seconds = time.perf_counter() - subgraph_start
+        cohort_analytics_override = bundle.cohort_analytics
+        subgraph_cache_hit = bool(bundle.cache_hit)
+    else:
+        subgraph_start = time.perf_counter()
+        cohort_analytics_override, subgraph_cache_hit = load_subgraph_cohort_analytics(
+            force_refresh=request.force_refresh,
+            ttl_seconds=subgraph_cache_ttl_seconds,
+        )
+        timings.subgraph_bundle_seconds = time.perf_counter() - subgraph_start
 
     params_start = time.perf_counter()
     params = load_params(
@@ -466,9 +536,7 @@ def run_dashboard_simulation(
         staking_apy_method=request.staking_apy_method,
         staking_apy_lookback_days=int(request.staking_apy_lookback_days),
         horizon_days=config.horizon_days,
-        cohort_analytics_override=(
-            bundle.cohort_analytics if bundle is not None else None
-        ),
+        cohort_analytics_override=cohort_analytics_override,
     )
     timings.params_load_seconds = time.perf_counter() - params_start
 
@@ -562,7 +630,7 @@ def run_dashboard_simulation(
         params=params,
         output=output,
         timings=timings,
-        subgraph_cache_hit=bool(bundle.cache_hit) if bundle is not None else False,
+        subgraph_cache_hit=subgraph_cache_hit,
     )
 
 

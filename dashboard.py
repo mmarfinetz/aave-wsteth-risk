@@ -19,7 +19,7 @@ Pipeline:
 import json
 import os
 import numpy as np
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -91,7 +91,7 @@ class DashboardOutput:
     simulation_config: dict
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return dict(self.__dict__)
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=_json_default)
@@ -502,11 +502,12 @@ class Dashboard:
         arr = np.asarray(values, dtype=float)
         if arr.size == 0:
             return {"mean": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+        p50, p95, p99 = np.percentile(arr, [50.0, 95.0, 99.0])
         return {
             "mean": float(np.mean(arr)),
-            "p50": float(np.percentile(arr, 50)),
-            "p95": float(np.percentile(arr, 95)),
-            "p99": float(np.percentile(arr, 99)),
+            "p50": float(p50),
+            "p95": float(p95),
+            "p99": float(p99),
             "max": float(np.max(arr)),
         }
 
@@ -515,11 +516,12 @@ class Dashboard:
         arr = np.asarray(paths, dtype=float)
         if arr.ndim != 2 or arr.shape[0] == 0:
             return {"mean": [], "p5": [], "p50": [], "p95": []}
+        p5, p50, p95 = np.percentile(arr, [5.0, 50.0, 95.0], axis=0)
         return {
             "mean": [float(v) for v in np.mean(arr, axis=0)],
-            "p5": [float(v) for v in np.percentile(arr, 5, axis=0)],
-            "p50": [float(v) for v in np.percentile(arr, 50, axis=0)],
-            "p95": [float(v) for v in np.percentile(arr, 95, axis=0)],
+            "p5": [float(v) for v in p5],
+            "p50": [float(v) for v in p50],
+            "p95": [float(v) for v in p95],
         }
 
     @staticmethod
@@ -2770,6 +2772,12 @@ class Dashboard:
             "collateral_assumption_impact": self.collateral_assumption_diagnostics,
         }
 
+        utilization_shock_summary = self._time_series_percentiles(
+            replay_diag_projected["utilization_shock"]
+        )
+        borrow_rate_with_liq_pct = self._time_series_percentiles(borrow_rate_paths * 100.0)
+        spread_with_liq_pct = self._time_series_percentiles(spread_paths * 100.0)
+
         time_series_diagnostics = {
             "time_grid_days": [float(v) for v in time_grid_days],
             "v_stables_usd": self._time_series_percentiles(replay_v_stables_usd),
@@ -2791,12 +2799,8 @@ class Dashboard:
                 replay_diag_projected["collateral_seized_eth"]
             ),
             "liquidation_counts": self._time_series_percentiles(replay_liq_counts),
-            "utilization_shock": self._time_series_percentiles(
-                replay_diag_projected["utilization_shock"]
-            ),
-            "utilization_delta": self._time_series_percentiles(
-                replay_diag_projected["utilization_shock"]
-            ),
+            "utilization_shock": utilization_shock_summary,
+            "utilization_delta": utilization_shock_summary,
             "spread_feedback_shock": self._time_series_percentiles(
                 np.pad(
                     spread_feedback_shocks,
@@ -2806,17 +2810,15 @@ class Dashboard:
                 )
             ),
             "utilization": self._time_series_percentiles(util_paths),
-            "borrow_rate_pct": self._time_series_percentiles(borrow_rate_paths * 100.0),
+            "borrow_rate_pct": borrow_rate_with_liq_pct,
             "borrow_rate_without_liquidation_pct": self._time_series_percentiles(
                 borrow_rate_paths_without_liq * 100.0
             ),
-            "borrow_rate_with_liquidation_pct": self._time_series_percentiles(
-                borrow_rate_paths * 100.0
-            ),
+            "borrow_rate_with_liquidation_pct": borrow_rate_with_liq_pct,
             "borrow_rate_liquidation_delta_bps": self._time_series_percentiles(
                 borrow_rate_liq_delta * 10_000.0
             ),
-            "spread_pct": self._time_series_percentiles(spread_paths * 100.0),
+            "spread_pct": spread_with_liq_pct,
             "spread_without_liquidation_pct": self._time_series_percentiles(
                 spread_paths_without_liq * 100.0
             ),
@@ -2829,9 +2831,7 @@ class Dashboard:
             "market_spread_without_liquidation_pct": self._time_series_percentiles(
                 spread_components_without_liq["market_spread_paths"] * 100.0
             ),
-            "spread_with_liquidation_pct": self._time_series_percentiles(
-                spread_paths * 100.0
-            ),
+            "spread_with_liquidation_pct": spread_with_liq_pct,
             "spread_liquidation_delta_bps": self._time_series_percentiles(
                 (spread_paths - spread_paths_without_liq) * 10_000.0
             ),
