@@ -9,7 +9,11 @@ AGENTS.md
 *.pfx
 __pycache__/
 *.pyc
-data/cache/
+# Ignore cache contents but version the gated touch-model fits (small JSONs
+# with walk-forward provenance) so deployed services can load them.
+data/cache/*
+!data/cache/touch_model_48h.json
+!data/cache/touch_model_168h.json
 CLAUDE.md
 .pytest_cache/
 *.egg-info/

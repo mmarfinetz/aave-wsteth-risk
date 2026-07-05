@@ -1,0 +1,66 @@
+{
+  "model": "logistic_touch_v1",
+  "fitted_at_utc": "2026-07-05T18:43:38.858205+00:00",
+  "feature_names": [
+    "atp_logit_fast",
+    "atp_logit_30d"
+  ],
+  "coefficients": [
+    0.15511523848320694,
+    0.4879627003719174
+  ],
+  "intercept": -0.3514127695494608,
+  "feature_means": [
+    -0.697699592814994,
+    -0.35357850418063186
+  ],
+  "feature_stds": [
+    1.428781651669448,
+    0.8159831849202311
+  ],
+  "l2_penalty": 1.0,
+  "train_rows": 2536,
+  "settings": {
+    "horizon_hours": 168,
+    "stride_hours": 24,
+    "target_multipliers": [
+      0.9,
+      0.95,
+      1.05,
+      1.1
+    ],
+    "min_train_snapshots": 180,
+    "refit_every_snapshots": 30,
+    "l2_penalty": 1.0,
+    "feature_subset": [
+      "atp_logit_fast",
+      "atp_logit_30d"
+    ],
+    "model": "logistic_touch_v1"
+  },
+  "walk_forward_gate": {
+    "status": "available",
+    "sample_count": 1816,
+    "brier_score": 0.22626256220997837,
+    "climatology_brier_score": 0.24144171243377519,
+    "brier_improvement_pct": 6.286879790069532,
+    "calibration_error": 0.035453479219606045,
+    "populated_deciles": 7,
+    "upgrade_recommended": true
+  },
+  "walk_forward_skill": {
+    "model_brier": 0.22626256220997837,
+    "target_climatology_brier": 0.2294786102190798,
+    "skill_vs_target_climatology_pct": 1.4014587268203926,
+    "baseline": "per-target trailing realized touch rate (walk-forward)"
+  },
+  "history_provenance": {
+    "instrument": "ETH-PERPETUAL",
+    "candles": 17521,
+    "range_utc": [
+      "2024-07-05T18:00:00+00:00",
+      "2026-07-05T18:00:00+00:00"
+    ],
+    "fetched_at_utc": "2026-07-05T18:42:44.878387+00:00"
+  }
+}

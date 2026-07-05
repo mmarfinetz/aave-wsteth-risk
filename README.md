@@ -260,6 +260,20 @@ python api.py --demo
 - `GET /api/dashboard`: run the default dashboard request from environment-backed defaults
 - `POST /api/dashboard`: submit a parameterized run request and receive `result`, `timings`, and `meta`
 
+Trading-model layers over HTTP: set `market_regime_forecast: true` in the POST
+body (or `DASHBOARD_MARKET_REGIME_FORECAST=true` for GET defaults) and the
+server fetches Deribit features itself, enabling the regime forecast and the
+supervised touch-probability forecast. `sizing_kelly_fraction`,
+`sizing_cvar_budget_pct`, and `exit_ladder` (e.g. `"1.05:0.25,1.02:0.50"`)
+override the sizing and exit-policy defaults. The results appear under
+`result.professional_modeling.{touch_model_forecast,position_sizing,exit_policy}`.
+
+```bash
+curl -X POST localhost:5001/api/dashboard \
+  -H 'Content-Type: application/json' \
+  -d '{"loops": 4, "simulations": 2000, "horizon_days": 7, "market_regime_forecast": true}'
+```
+
 ## Environment variables
 
 | Variable | Required | Used for |

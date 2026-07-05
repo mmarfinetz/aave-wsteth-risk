@@ -66,8 +66,13 @@ class DashboardRunRequest:
     entry_sweep_target_usd: float | None = None
     entry_sweep_max_paths: int | None = None
     market_regime_features: dict[str, Any] | None = None
+    market_regime_forecast: bool = False
     market_regime_targets_usd: str | list[float] | None = None
     market_regime_n_paths: int = 20_000
+    touch_model_forecast: bool | None = None
+    sizing_kelly_fraction: float | None = None
+    sizing_cvar_budget_pct: float | None = None
+    exit_ladder: str | None = None
     opt_max_prob_hf_lt_1_pct: float | None = None
     opt_min_start_hf: float | None = None
     opt_max_entry_cost_bps: float | None = None
@@ -190,6 +195,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_optional_flag(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None:
@@ -284,8 +296,13 @@ def build_request_from_env() -> DashboardRunRequest:
         entry_sweep_target_usd=_env_float("DASHBOARD_ENTRY_SWEEP_TARGET_USD", None),
         entry_sweep_max_paths=_env_optional_int("DASHBOARD_ENTRY_SWEEP_MAX_PATHS"),
         market_regime_features=_env_json_object("DASHBOARD_MARKET_REGIME_FEATURES_JSON"),
+        market_regime_forecast=_env_flag("DASHBOARD_MARKET_REGIME_FORECAST", False),
         market_regime_targets_usd=_env_str("DASHBOARD_MARKET_REGIME_TARGETS_USD", "") or None,
         market_regime_n_paths=_env_int("DASHBOARD_MARKET_REGIME_PATHS", 20_000),
+        touch_model_forecast=_env_optional_flag("DASHBOARD_TOUCH_MODEL_FORECAST"),
+        sizing_kelly_fraction=_env_float("DASHBOARD_SIZING_KELLY_FRACTION", None),
+        sizing_cvar_budget_pct=_env_float("DASHBOARD_SIZING_CVAR_BUDGET_PCT", None),
+        exit_ladder=_env_str("DASHBOARD_EXIT_LADDER", "") or None,
         opt_max_prob_hf_lt_1_pct=_env_float(
             "DASHBOARD_OPT_MAX_PROB_HF_LT_1_PCT",
             None,
@@ -721,11 +738,29 @@ def run_dashboard_simulation(
         params["entry_sweep_max_paths"] = int(request.entry_sweep_max_paths)
     if request.market_regime_features is not None:
         params["market_regime_features"] = dict(request.market_regime_features)
+    elif request.market_regime_forecast:
+        from data.derivatives_fetcher import fetch_deribit_eth_market_features
+
+        params["market_regime_features"] = fetch_deribit_eth_market_features(
+            lookback_days=max(float(config.horizon_days), 1.0),
+        )
     if request.market_regime_targets_usd is not None:
         params["market_regime_targets_usd"] = request.market_regime_targets_usd
     if int(request.market_regime_n_paths) < 100:
         raise ValueError("market_regime_n_paths must be >= 100")
     params["market_regime_n_paths"] = int(request.market_regime_n_paths)
+    if request.touch_model_forecast is not None:
+        params["touch_model_forecast"] = bool(request.touch_model_forecast)
+    if request.sizing_kelly_fraction is not None:
+        if not 0.0 < float(request.sizing_kelly_fraction) <= 1.0:
+            raise ValueError("sizing_kelly_fraction must be in (0, 1]")
+        params["sizing_kelly_fraction"] = float(request.sizing_kelly_fraction)
+    if request.sizing_cvar_budget_pct is not None:
+        if float(request.sizing_cvar_budget_pct) <= 0.0:
+            raise ValueError("sizing_cvar_budget_pct must be positive")
+        params["sizing_cvar_budget_pct"] = float(request.sizing_cvar_budget_pct)
+    if request.exit_ladder is not None:
+        params["exit_ladder"] = str(request.exit_ladder)
     if request.opt_max_prob_hf_lt_1_pct is not None:
         if float(request.opt_max_prob_hf_lt_1_pct) < 0.0:
             raise ValueError("opt_max_prob_hf_lt_1_pct must be non-negative")

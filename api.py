@@ -73,8 +73,13 @@ class DashboardRequestModel(BaseModel):
     entry_sweep_target_usd: float | None = None
     entry_sweep_max_paths: int | None = None
     market_regime_features: dict[str, Any] | None = None
+    market_regime_forecast: bool = False
     market_regime_targets_usd: str | list[float] | None = None
     market_regime_n_paths: int = 20_000
+    touch_model_forecast: bool | None = None
+    sizing_kelly_fraction: float | None = None
+    sizing_cvar_budget_pct: float | None = None
+    exit_ladder: str | None = None
     opt_max_prob_hf_lt_1_pct: float | None = None
     opt_min_start_hf: float | None = None
     opt_max_entry_cost_bps: float | None = None

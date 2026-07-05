@@ -265,3 +265,77 @@ def test_cache_key_ignores_force_refresh_but_preserves_effective_defaults():
     )
 
     assert base_request.to_cache_key() == refresh_request.to_cache_key()
+
+
+def test_run_dashboard_simulation_passes_trading_model_params(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "dashboard_service.load_subgraph_cohort_analytics",
+        lambda **kwargs: ({"borrower_count": 8}, False),
+    )
+    monkeypatch.setattr("dashboard_service.load_params", lambda **kwargs: {})
+
+    class _DummyDashboard:
+        def __init__(self, capital_eth, n_loops, config, params):
+            captured["params"] = params
+
+        def run(self, seed=None):
+            return _DummyOutput()
+
+    monkeypatch.setattr("dashboard_service.Dashboard", _DummyDashboard)
+
+    request = DashboardRunRequest(
+        touch_model_forecast=False,
+        sizing_kelly_fraction=0.25,
+        sizing_cvar_budget_pct=15.0,
+        exit_ladder="1.05:0.25,1.02:0.50",
+    )
+    run_dashboard_simulation(request, subgraph_cache_ttl_seconds=0)
+
+    params = captured["params"]
+    assert params["touch_model_forecast"] is False
+    assert params["sizing_kelly_fraction"] == 0.25
+    assert params["sizing_cvar_budget_pct"] == 15.0
+    assert params["exit_ladder"] == "1.05:0.25,1.02:0.50"
+    # No explicit features and no forecast flag: nothing fetched or injected.
+    assert "market_regime_features" not in params
+
+
+def test_run_dashboard_simulation_validates_trading_model_params(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(
+        "dashboard_service.load_subgraph_cohort_analytics",
+        lambda **kwargs: ({"borrower_count": 8}, False),
+    )
+    monkeypatch.setattr("dashboard_service.load_params", lambda **kwargs: {})
+
+    with pytest.raises(ValueError, match="sizing_kelly_fraction"):
+        run_dashboard_simulation(
+            DashboardRunRequest(sizing_kelly_fraction=1.5),
+            subgraph_cache_ttl_seconds=0,
+        )
+    with pytest.raises(ValueError, match="sizing_cvar_budget_pct"):
+        run_dashboard_simulation(
+            DashboardRunRequest(sizing_cvar_budget_pct=-1.0),
+            subgraph_cache_ttl_seconds=0,
+        )
+
+
+def test_env_builder_reads_trading_model_flags(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_MARKET_REGIME_FORECAST", "true")
+    monkeypatch.setenv("DASHBOARD_TOUCH_MODEL_FORECAST", "false")
+    monkeypatch.setenv("DASHBOARD_SIZING_KELLY_FRACTION", "0.4")
+    monkeypatch.setenv("DASHBOARD_SIZING_CVAR_BUDGET_PCT", "12.5")
+    monkeypatch.setenv("DASHBOARD_EXIT_LADDER", "1.04:0.30")
+
+    request = build_request_from_env()
+    assert request.market_regime_forecast is True
+    assert request.touch_model_forecast is False
+    assert request.sizing_kelly_fraction == 0.4
+    assert request.sizing_cvar_budget_pct == 12.5
+    assert request.exit_ladder == "1.04:0.30"
+
+    monkeypatch.delenv("DASHBOARD_TOUCH_MODEL_FORECAST")
+    assert build_request_from_env().touch_model_forecast is None
