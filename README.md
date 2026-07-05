@@ -1,5 +1,7 @@
 # Aave wstETH/WETH Risk Dashboard
 
+[![tests](https://github.com/mmarfinetz/aave-wsteth-risk/actions/workflows/ci.yml/badge.svg)](https://github.com/mmarfinetz/aave-wsteth-risk/actions/workflows/ci.yml)
+
 Monte Carlo risk engine and backend API for leveraged wstETH/WETH looping on Aave V3.
 
 This repository contains the simulation engine and HTTP API only. The dashboard UI lives in a separate codebase.
@@ -18,6 +20,44 @@ The dashboard simulates a looped wstETH position under correlated market stress 
   climatology on 2 years of Deribit history), empirical fractional-Kelly /
   CVaR-budget position sizing, and an HF-triggered deleveraging ladder
   evaluated against a do-nothing baseline on the same simulated paths
+
+Excerpt from a live run (`--capital 10 --loops 4 --simulations 2000 --horizon 7
+--seed 42 --market-regime-forecast`, real on-chain and Deribit data,
+2026-07-05):
+
+```
+POSITION SUMMARY
+----------------------------------------
+  Leverage:              4.347x
+  Total Collateral:      43.47 ETH (35.10 wstETH)
+  Total Debt:            33.47 WETH
+  Borrow Rate:           2.07%
+  Current Net APY:       3.95%
+  Health Factor:         1.2338
+
+RISK METRICS (7.0d, 2,000 paths)
+----------------------------------------
+  VaR 95%:               0.5407 ETH
+  CVaR 95%:              0.6349 ETH
+  Terminal P&L mean:     -0.2041 ETH
+  P(terminal profit):    8.40%
+  Max Drawdown (95th):   0.6356 ETH
+
+  Touch model:         gated logistic, primary 168h, asof 2026-07-05T18:00:00+00:00
+    168h (OOS Brier +6.29% vs climatology):
+      $1,691 down: touch=48.14%
+      $1,869 up:   touch=49.68%
+  Sizing rec:          0 loops (binding: non_positive_expected_log_growth)
+    Growth-optimal:    1 loops (E[log g]=-0.00884)
+    Kelly/CVaR loops:  0 @ f=0.50 / 3 @ 2.00 ETH budget
+  Exit ladder:         HF<1.140→25%, HF<1.070→50% (default_scaled_to_entry_hf_buffer)
+    P(HF<1):           0.00% -> 0.00% with policy; triggered on 0.0% of paths
+```
+
+The sizing recommendation of 0 loops is the model working as intended: at the
+captured borrow rates the growth-optimal candidate had negative expected log
+growth, so the Kelly layer says stay out even though the CVaR budget alone
+would admit 3 loops.
 
 Two debt-leg modes are supported:
 
