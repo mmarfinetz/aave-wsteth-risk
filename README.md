@@ -14,6 +14,10 @@ The dashboard simulates a looped wstETH position under correlated market stress 
 - stress scenarios (historical + model-derived hypotheticals)
 - unwind cost estimates (10/25/50/100% position)
 - APY/rate forecasts and risk decomposition
+- a walk-forward-validated touch-probability model (Brier-gated against
+  climatology on 2 years of Deribit history), empirical fractional-Kelly /
+  CVaR-budget position sizing, and an HF-triggered deleveraging ladder
+  evaluated against a do-nothing baseline on the same simulated paths
 
 Two debt-leg modes are supported:
 
