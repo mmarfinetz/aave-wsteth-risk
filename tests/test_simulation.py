@@ -3,7 +3,11 @@
 import numpy as np
 import pytest
 
-from models.price_simulation import GBMSimulator, VolatilityEstimator
+from models.price_simulation import (
+    GBMSimulator,
+    MeanRevertingLogPriceSimulator,
+    VolatilityEstimator,
+)
 from models.liquidation_cascade import LiquidationCascade
 from models.aave_model import PoolState
 from config.params import SimulationConfig
@@ -97,6 +101,43 @@ class TestGBMSimulator:
 
         assert abs(np.mean(log_finals) - expected_mean) < 0.05
         assert abs(np.std(log_finals) - expected_std) < 0.05
+
+
+class TestMeanRevertingLogPriceSimulator:
+    def test_zero_vol_reverts_toward_log_target(self):
+        config = SimulationConfig.legacy_profile(
+            n_simulations=4,
+            horizon_days=7,
+            seed=42,
+        )
+        kappa = np.log(2.0) / (7.0 / 365.0)
+        sim = MeanRevertingLogPriceSimulator(
+            target=200.0,
+            kappa=kappa,
+            sigma=0.0,
+            config=config,
+        )
+        paths = sim.simulate(s0=100.0)
+
+        expected = np.exp(0.5 * (np.log(100.0) + np.log(200.0)))
+        assert np.allclose(paths[:, -1], expected, rtol=1e-10)
+
+    def test_positive_prices(self):
+        config = SimulationConfig.legacy_profile(
+            n_simulations=100,
+            horizon_days=30,
+            seed=42,
+        )
+        sim = MeanRevertingLogPriceSimulator(
+            target=2.0,
+            kappa=12.0,
+            sigma=0.60,
+            config=config,
+        )
+        paths = sim.simulate(s0=1.0)
+
+        assert paths.shape == (100, 31)
+        assert np.all(paths > 0.0)
 
 
 class TestLiquidationCascade:

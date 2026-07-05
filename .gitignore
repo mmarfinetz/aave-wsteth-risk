@@ -16,13 +16,16 @@ CLAUDE.md
 .venv/
 venv/
 out.json
+output.json
 frontend/node_modules/
 frontend/dist/
 .vercel
 docs/ETHSKILLS.md
+docs/API_HANDOFF.md
 scripts/fetch_ethskills.py
 tests/test_fetch_ethskills.py
 chaos_aave_risk_param_methodology (1).pdf
 Unwind_Mitchell_version.ipynb
 simulation.svg
 simulation1.svg
+err.log

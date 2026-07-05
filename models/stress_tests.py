@@ -176,6 +176,13 @@ class StressTestEngine:
             ms.get("current_borrow_rate", self.rate_model.borrow_rate(current_util))
         )
         ms["steth_eth_price"] = float(ms.get("steth_eth_price", MARKET.steth_eth_price))
+        ms["eth_usd_price"] = float(ms.get("eth_usd_price", MARKET.eth_usd_price))
+        ms["debt_mode"] = str(ms.get("debt_mode", "weth")).strip().lower()
+        ms["debt_asset"] = str(ms.get("debt_asset", "WETH")).strip().upper() or "WETH"
+        stable_rate = ms.get("stablecoin_borrow_apy")
+        ms["stablecoin_borrow_apy"] = (
+            float(stable_rate) if stable_rate is not None else None
+        )
         ms["gas_price_gwei"] = self._resolve_gas_price_gwei(
             ms.get("gas_price_gwei", MARKET.gas_price_gwei)
         )
@@ -223,6 +230,25 @@ class StressTestEngine:
         if gas > 0.0:
             return gas
         return DEFAULT_GAS_PRICE_GWEI
+
+    def _borrow_rate_for_utilization(self, utilization: float) -> float:
+        if self.market_state.get("debt_mode") == "stablecoin":
+            rate = self.market_state.get("stablecoin_borrow_apy")
+            if rate is None:
+                raise ValueError("stablecoin debt stress tests require stablecoin_borrow_apy")
+            return max(float(rate), 0.0)
+        return float(self.rate_model.borrow_rate(utilization))
+
+    def _eth_usd_stress_path(
+        self,
+        eth_price_change: float,
+        n_cols: int,
+    ) -> np.ndarray:
+        base = max(float(self.market_state.get("eth_usd_price", MARKET.eth_usd_price)), np.finfo(float).eps)
+        terminal = max(base * (1.0 + float(eth_price_change)), np.finfo(float).eps)
+        path = np.full((1, n_cols), terminal, dtype=float)
+        path[:, 0] = base
+        return path
 
     @staticmethod
     def _sanitize_drop_values(values: list[float]) -> list[float]:
@@ -447,7 +473,7 @@ class StressTestEngine:
     def _build_baseline(self) -> list[StressScenario]:
         """Build baseline scenario from current market state."""
         ms = self.market_state
-        borrow_rate = float(self.rate_model.borrow_rate(ms["current_utilization"]))
+        borrow_rate = self._borrow_rate_for_utilization(ms["current_utilization"])
         return [
             StressScenario(
                 name="Baseline",
@@ -482,7 +508,7 @@ class StressTestEngine:
                 eth_drop = 0.0
 
             stressed_util = self._estimate_stressed_utilization(eth_drop)
-            borrow_rate = float(self.rate_model.borrow_rate(stressed_util))
+            borrow_rate = self._borrow_rate_for_utilization(stressed_util)
             gas_price = self._stressed_gas_price(abs(eth_drop))
 
             scenarios.append(
@@ -605,7 +631,7 @@ class StressTestEngine:
         for drop in eth_drops:
             abs_drop = abs(drop)
             stressed_util = self._estimate_stressed_utilization(drop)
-            borrow_rate = float(self.rate_model.borrow_rate(stressed_util))
+            borrow_rate = self._borrow_rate_for_utilization(stressed_util)
             steth_eth = self._execution_depeg(stressed_util, borrow_rate)
             gas_price = self._stressed_gas_price(abs_drop)
 
@@ -630,7 +656,7 @@ class StressTestEngine:
 
         target_util_spike = self.target_utilization_spike
         anchor_drop = float(np.median(np.abs(eth_drops)))
-        spike_rate = float(self.rate_model.borrow_rate(target_util_spike))
+        spike_rate = self._borrow_rate_for_utilization(target_util_spike)
         spike_depeg = self._execution_depeg(target_util_spike, spike_rate)
         scenarios.append(
             StressScenario(
@@ -651,7 +677,7 @@ class StressTestEngine:
 
         extreme_drop = min(eth_drops)
         extreme_util = max(target_util_spike, self._estimate_stressed_utilization(extreme_drop))
-        extreme_rate = float(self.rate_model.borrow_rate(extreme_util))
+        extreme_rate = self._borrow_rate_for_utilization(extreme_util)
         extreme_depeg = self._execution_depeg(
             extreme_util,
             extreme_rate,
@@ -685,7 +711,7 @@ class StressTestEngine:
         Simple exchange-rate mode omits the slashing-tail scenario.
         """
         util = self.target_utilization_spike
-        rate = float(self.rate_model.borrow_rate(util))
+        rate = self._borrow_rate_for_utilization(util)
         slash_severity = float(np.clip(self.market_state.get("slashing_severity", 0.08), 0.0, 0.50))
         lt_haircut = float(np.clip(self.market_state.get("governance_lt_haircut", 0.02), 0.0, 0.20))
         ir_spread = max(float(self.market_state.get("governance_ir_spread", 0.04)), 0.0)
@@ -794,10 +820,15 @@ class StressTestEngine:
             one_off_multiplier = 1.0 - np.clip(slash_prob * slash_severity, 0.0, 0.95)
             exchange_rate_paths[:, 1:] *= one_off_multiplier
 
+        eth_usd_paths = self._eth_usd_stress_path(
+            scenario.eth_price_change,
+            n_cols,
+        )
         hf_path = self.position.health_factor_paths(
             borrow_path,
             dt=dt,
             exchange_rate_paths=exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
             lt_paths=lt_paths,
         )
         hf_min = float(np.min(hf_path[0]))
@@ -815,6 +846,7 @@ class StressTestEngine:
                 borrow_rate_paths=borrow_path,
                 steth_eth_paths=np.ones((1, n_cols)),
                 exchange_rate_paths=exchange_rate_paths,
+                eth_usd_paths=eth_usd_paths,
                 dt=dt,
             )[0, -1]
         )
@@ -883,7 +915,9 @@ class StressTestEngine:
         """
         results = []
         base_hf = float(self.position.health_factor())
-        current_borrow = float(self.rate_model.borrow_rate(self.market_state["current_utilization"]))
+        current_borrow = self._borrow_rate_for_utilization(
+            self.market_state["current_utilization"]
+        )
 
         for v in values:
             if param == "steth_eth_price":

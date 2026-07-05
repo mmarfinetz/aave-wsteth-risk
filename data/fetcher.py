@@ -48,6 +48,20 @@ AAVE_V3_POOL = "0x87870Bca3F3fD6335C3f4ce8392D69350B4fa4E2"
 AAVE_V3_ADDRESSES_PROVIDER = "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e"
 WETH_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 WSTETH_ADDRESS = "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+STABLECOIN_RESERVES = {
+    "USDC": {
+        "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "decimals": 6,
+    },
+    "USDT": {
+        "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "decimals": 6,
+    },
+    "DAI": {
+        "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+        "decimals": 18,
+    },
+}
 ETH_CORRELATED_EMODE_CATEGORY = 1
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4d"
@@ -152,6 +166,7 @@ class FetchedData:
     steth_eth_price_history: list[float] = field(default_factory=list)
     weth_borrow_apy_history: list[float] = field(default_factory=list)
     weth_borrow_apy_timestamps: list[int] = field(default_factory=list)
+    stablecoin_reserves: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Metadata
     last_updated: str = ""
@@ -944,6 +959,204 @@ def _fetch_weth_reserve_data_onchain(data: FetchedData) -> bool:
     return True
 
 
+def _fetch_asset_rate_strategy(
+    asset_address: str,
+    symbol: str,
+) -> tuple[dict[str, float], str | None]:
+    """Fetch Aave variable-rate strategy parameters for one reserve."""
+    strategy_addr_call = (
+        "0x"
+        + SEL_GET_INTEREST_RATE_STRATEGY_ADDRESS
+        + _abi_encode_address(asset_address)
+    )
+    strategy_addr_raw = _eth_call(AAVE_V3_POOL_DATA_PROVIDER, strategy_addr_call)
+    strategy_addr = _decode_address_word(strategy_addr_raw)
+    if not strategy_addr:
+        return {}, None
+
+    def _read_strategy_rate(selector_with_asset: str,
+                            selector_no_arg: str) -> float | None:
+        raw = _eth_call(
+            strategy_addr,
+            "0x" + selector_with_asset + _abi_encode_address(asset_address),
+        )
+        value = _decode_first_word(raw)
+        if value is None:
+            raw = _eth_call(strategy_addr, "0x" + selector_no_arg)
+            value = _decode_first_word(raw)
+        return _ray_to_float(value)
+
+    params = {
+        "base_rate": _read_strategy_rate(
+            SEL_GET_BASE_VARIABLE_BORROW_RATE_BY_ASSET,
+            SEL_GET_BASE_VARIABLE_BORROW_RATE,
+        ),
+        "slope1": _read_strategy_rate(
+            SEL_GET_VARIABLE_RATE_SLOPE1_BY_ASSET,
+            SEL_GET_VARIABLE_RATE_SLOPE1,
+        ),
+        "slope2": _read_strategy_rate(
+            SEL_GET_VARIABLE_RATE_SLOPE2_BY_ASSET,
+            SEL_GET_VARIABLE_RATE_SLOPE2,
+        ),
+    }
+
+    optimal_raw = _eth_call(
+        strategy_addr,
+        "0x" + SEL_OPTIMAL_USAGE_RATIO_BY_ASSET + _abi_encode_address(asset_address),
+    )
+    optimal_u = _ray_to_float(_decode_first_word(optimal_raw))
+    if optimal_u is None:
+        optimal_raw = _eth_call(strategy_addr, "0x" + SEL_OPTIMAL_USAGE_RATIO)
+        optimal_u = _ray_to_float(_decode_first_word(optimal_raw))
+    if optimal_u is None:
+        optimal_raw = _eth_call(
+            strategy_addr,
+            "0x" + SEL_GET_OPTIMAL_USAGE_RATIO + _abi_encode_address(asset_address),
+        )
+        optimal_u = _ray_to_float(_decode_first_word(optimal_raw))
+    params["optimal_utilization"] = optimal_u
+
+    finite_params = {
+        key: float(value)
+        for key, value in params.items()
+        if value is not None and np.isfinite(float(value))
+    }
+    if "optimal_utilization" in finite_params:
+        if not 0.0 < finite_params["optimal_utilization"] < 1.0:
+            finite_params.pop("optimal_utilization")
+    return finite_params, strategy_addr
+
+
+def _fetch_stablecoin_reserve_onchain(
+    data: FetchedData,
+    symbol: str,
+    asset_address: str,
+    decimals: int,
+) -> bool:
+    """
+    Fetch an Aave stablecoin reserve snapshot and its variable-rate strategy.
+
+    The dashboard uses this for stablecoin debt paths instead of requiring a
+    manually supplied constant borrow APY.
+    """
+    reserve_call = "0x" + SEL_GET_RESERVE_DATA + _abi_encode_address(asset_address)
+    reserve_raw = _eth_call(AAVE_V3_POOL, reserve_call)
+    reserve_words = _decode_abi_words(reserve_raw)
+    if len(reserve_words) < 11:
+        return False
+
+    current_variable_borrow_rate = _ray_to_float(reserve_words[4])
+    atoken_addr = f"0x{reserve_words[8]:040x}"
+    debt_token_addr = f"0x{reserve_words[10]:040x}"
+    if (
+        current_variable_borrow_rate is None
+        or reserve_words[8] == 0
+        or reserve_words[10] == 0
+    ):
+        return False
+
+    supply_raw = _eth_call(atoken_addr, "0x" + SEL_TOTAL_SUPPLY)
+    borrow_raw = _eth_call(debt_token_addr, "0x" + SEL_TOTAL_SUPPLY)
+    supply_units = _decode_first_word(supply_raw)
+    borrow_units = _decode_first_word(borrow_raw)
+    if supply_units is None or borrow_units is None or supply_units <= 0:
+        return False
+
+    scale = 10 ** int(decimals)
+    supply = supply_units / scale
+    borrows = borrow_units / scale
+    utilization = borrows / supply
+
+    reserve_cfg_call = (
+        "0x"
+        + SEL_GET_RESERVE_CONFIGURATION_DATA
+        + _abi_encode_address(asset_address)
+    )
+    reserve_cfg_raw = _eth_call(AAVE_V3_POOL_DATA_PROVIDER, reserve_cfg_call)
+    reserve_cfg_words = _decode_abi_words(reserve_cfg_raw)
+    reserve_factor = None
+    if len(reserve_cfg_words) >= 5:
+        reserve_factor_bps = reserve_cfg_words[4]
+        if _valid_bps(reserve_factor_bps, 0, 10000):
+            reserve_factor = reserve_factor_bps / 10_000.0
+
+    strategy_params, strategy_addr = _fetch_asset_rate_strategy(asset_address, symbol)
+    required = {"base_rate", "slope1", "slope2", "optimal_utilization"}
+    if not required.issubset(strategy_params) or reserve_factor is None:
+        return False
+
+    symbol_lower = symbol.lower()
+    source = f"Aave V3 on-chain {symbol} reserve + variable rate strategy"
+    data.stablecoin_reserves[symbol] = {
+        "symbol": symbol,
+        "address": asset_address,
+        "decimals": int(decimals),
+        "current_utilization": round(float(np.clip(utilization, 0.0, 1.0)), 6),
+        "current_variable_borrow_rate": float(current_variable_borrow_rate),
+        "total_supply": round(float(supply), 6),
+        "total_borrows": round(float(borrows), 6),
+        "base_rate": float(strategy_params["base_rate"]),
+        "slope1": float(strategy_params["slope1"]),
+        "slope2": float(strategy_params["slope2"]),
+        "optimal_utilization": float(strategy_params["optimal_utilization"]),
+        "reserve_factor": float(reserve_factor),
+        "interest_rate_strategy": strategy_addr,
+        "source": source,
+    }
+
+    data.log_param(
+        f"{symbol_lower}_current_utilization",
+        data.stablecoin_reserves[symbol]["current_utilization"],
+        source,
+    )
+    data.log_param(
+        f"{symbol_lower}_current_variable_borrow_rate",
+        round(float(current_variable_borrow_rate), 6),
+        source,
+    )
+    data.log_param(
+        f"{symbol_lower}_total_supply",
+        data.stablecoin_reserves[symbol]["total_supply"],
+        f"Aave V3 Pool getReserveData({symbol}) → aToken.totalSupply()",
+    )
+    data.log_param(
+        f"{symbol_lower}_total_borrows",
+        data.stablecoin_reserves[symbol]["total_borrows"],
+        f"Aave V3 Pool getReserveData({symbol}) → variableDebtToken.totalSupply()",
+    )
+    data.log_param(
+        f"{symbol_lower}_interest_rate_strategy",
+        strategy_addr,
+        f"Aave V3 PoolDataProvider getInterestRateStrategyAddress({symbol})",
+    )
+    for key in ["base_rate", "slope1", "slope2", "optimal_utilization", "reserve_factor"]:
+        data.log_param(
+            f"{symbol_lower}_{key}",
+            round(float(data.stablecoin_reserves[symbol][key]), 6),
+            source,
+        )
+    return True
+
+
+def fetch_aave_stablecoin_params(data: FetchedData) -> bool:
+    """Fetch Aave stablecoin reserve state used by stablecoin debt simulations."""
+    fetched_any = False
+    for symbol, meta in STABLECOIN_RESERVES.items():
+        ok = _fetch_stablecoin_reserve_onchain(
+            data,
+            symbol=symbol,
+            asset_address=str(meta["address"]),
+            decimals=int(meta["decimals"]),
+        )
+        fetched_any = fetched_any or ok
+    if fetched_any:
+        suffix = " + on-chain stablecoin APIs"
+        if data.data_source and suffix not in data.data_source:
+            data.data_source = f"{data.data_source}{suffix}"
+    return fetched_any
+
+
 def fetch_aave_weth_params(data: FetchedData) -> bool:
     """
     Fetch Aave WETH market state + core risk params.
@@ -1372,6 +1585,7 @@ def _save_cache(data: FetchedData) -> None:
         "steth_eth_price_history": data.steth_eth_price_history,
         "weth_borrow_apy_history": data.weth_borrow_apy_history,
         "weth_borrow_apy_timestamps": data.weth_borrow_apy_timestamps,
+        "stablecoin_reserves": data.stablecoin_reserves,
         "last_updated": data.last_updated,
         "data_source": data.data_source,
         "params_log": data.params_log,
@@ -1650,6 +1864,7 @@ def fetch_all(
         ("ETH price history", fetch_eth_price_history),
         ("stETH/ETH price history", fetch_steth_eth_price_history),
         ("Aave WETH params", fetch_aave_weth_params),
+        ("Aave stablecoin params", fetch_aave_stablecoin_params),
         ("WETH ADV (on-chain)", fetch_weth_adv_onchain),
         ("ETH gas price", fetch_eth_gas_price),
         ("wstETH exchange rate", fetch_wsteth_exchange_rate),

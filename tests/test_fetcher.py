@@ -21,10 +21,12 @@ from data.fetcher import (
     SEL_OPTIMAL_USAGE_RATIO_BY_ASSET,
     SEL_TOTAL_SUPPLY,
     STRICT_AAVE_REQUIRED_PARAMS,
+    STABLECOIN_RESERVES,
     WETH_ADDRESS,
     _eth_call,
     _fetch_aave_onchain_pool_params,
     _fetch_curve_pool_onchain,
+    _fetch_stablecoin_reserve_onchain,
     _fetch_weth_reserve_data_onchain,
     _needs_refresh,
     _parse_gas_hex,
@@ -149,6 +151,73 @@ class TestFetcherOnchainParams:
         assert sources["liquidation_threshold"] == "Aave V3 Pool getEModeCategoryData(1)"
         assert sources["liquidation_bonus"] == "Aave V3 Pool getEModeCategoryData(1)"
 
+    def test_fetches_stablecoin_reserve_and_rate_strategy(self, monkeypatch):
+        data = FetchedData()
+        usdc = STABLECOIN_RESERVES["USDC"]
+        atoken_addr = "0x3333333333333333333333333333333333333333"
+        debt_token_addr = "0x4444444444444444444444444444444444444444"
+        strategy_addr = "0x5555555555555555555555555555555555555555"
+
+        supply_units = 100_000_000 * 10**6
+        borrow_units = 85_000_000 * 10**6
+        current_rate_ray = int(0.0725 * 1e27)
+        base_ray = int(0.001 * 1e27)
+        slope1_ray = int(0.045 * 1e27)
+        slope2_ray = int(0.75 * 1e27)
+        optimal_ray = int(0.90 * 1e27)
+
+        reserve_words = [0] * 15
+        reserve_words[4] = current_rate_ray
+        reserve_words[8] = int(atoken_addr, 16)
+        reserve_words[10] = int(debt_token_addr, 16)
+
+        def fake_eth_call(to_address: str, call_data: str, timeout: int = 15):
+            selector = call_data[2:10]
+            if selector == SEL_GET_RESERVE_DATA:
+                return _encode_words(*reserve_words)
+            if to_address.lower() == atoken_addr.lower() and selector == SEL_TOTAL_SUPPLY:
+                return _encode_words(supply_units)
+            if to_address.lower() == debt_token_addr.lower() and selector == SEL_TOTAL_SUPPLY:
+                return _encode_words(borrow_units)
+            if selector == SEL_GET_RESERVE_CONFIGURATION_DATA:
+                return _encode_words(6, 8000, 8500, 10500, 1000)
+            if selector == SEL_GET_INTEREST_RATE_STRATEGY_ADDRESS:
+                return _encode_words(int(strategy_addr, 16))
+            if to_address.lower() == strategy_addr.lower():
+                if selector == SEL_GET_BASE_VARIABLE_BORROW_RATE_BY_ASSET:
+                    return _encode_words(base_ray)
+                if selector == SEL_GET_VARIABLE_RATE_SLOPE1_BY_ASSET:
+                    return _encode_words(slope1_ray)
+                if selector == SEL_GET_VARIABLE_RATE_SLOPE2_BY_ASSET:
+                    return _encode_words(slope2_ray)
+                if selector == SEL_OPTIMAL_USAGE_RATIO_BY_ASSET:
+                    return _encode_words(optimal_ray)
+            return None
+
+        monkeypatch.setattr("data.fetcher._eth_call", fake_eth_call)
+
+        ok = _fetch_stablecoin_reserve_onchain(
+            data,
+            symbol="USDC",
+            asset_address=str(usdc["address"]),
+            decimals=int(usdc["decimals"]),
+        )
+
+        assert ok
+        reserve = data.stablecoin_reserves["USDC"]
+        assert reserve["current_utilization"] == pytest.approx(0.85, rel=1e-9)
+        assert reserve["current_variable_borrow_rate"] == pytest.approx(0.0725, rel=1e-9)
+        assert reserve["total_supply"] == pytest.approx(100_000_000.0, rel=1e-9)
+        assert reserve["total_borrows"] == pytest.approx(85_000_000.0, rel=1e-9)
+        assert reserve["base_rate"] == pytest.approx(0.001, rel=1e-9)
+        assert reserve["slope1"] == pytest.approx(0.045, rel=1e-9)
+        assert reserve["slope2"] == pytest.approx(0.75, rel=1e-9)
+        assert reserve["optimal_utilization"] == pytest.approx(0.90, rel=1e-9)
+        assert reserve["reserve_factor"] == pytest.approx(0.10, rel=1e-9)
+        names = {entry["name"] for entry in data.params_log}
+        assert "usdc_current_variable_borrow_rate" in names
+        assert "usdc_current_utilization" in names
+
 
 class TestOnchainWethAdv:
     def test_fetch_weth_adv_onchain_computes_trailing_average(self, monkeypatch):
@@ -267,6 +336,7 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_aave_weth_params", lambda _d: False)
+        monkeypatch.setattr("data.fetcher.fetch_aave_stablecoin_params", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_eth_gas_price", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_wsteth_exchange_rate", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price", lambda _d: False)
@@ -297,6 +367,7 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_aave_weth_params", lambda _d: True)
+        monkeypatch.setattr("data.fetcher.fetch_aave_stablecoin_params", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_weth_adv_onchain", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_eth_gas_price", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_wsteth_exchange_rate", lambda _d: False)
@@ -334,6 +405,7 @@ class TestStrictAaveSourcing:
         monkeypatch.setattr("data.fetcher.fetch_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_steth_eth_price_history", lambda _d: False)
         monkeypatch.setattr("data.fetcher.fetch_aave_weth_params", lambda _d: True)
+        monkeypatch.setattr("data.fetcher.fetch_aave_stablecoin_params", lambda _d: False)
         monkeypatch.setattr(
             "data.fetcher.fetch_weth_adv_onchain",
             lambda _d: (_ for _ in ()).throw(AssertionError("live ADV fetch should be skipped")),

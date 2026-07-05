@@ -24,11 +24,15 @@ class PositionSnapshot:
     """Static snapshot of a looped position."""
     capital_eth: float
     n_loops: int
+    debt_mode: str
+    debt_asset: str
     ltv: float
     leverage: float
     total_collateral_eth: float
     total_collateral_wsteth: float
     total_debt_weth: float
+    total_debt_stable: float | None
+    initial_eth_usd_price: float
     net_apy: float
     health_factor: float
     break_even_rate: float
@@ -50,9 +54,21 @@ class LoopedPosition:
 
     def __init__(self, capital_eth: float, n_loops: int,
                  emode: AaveEModeParams = EMODE,
-                 wsteth_params: WstETHParams = WSTETH):
+                 wsteth_params: WstETHParams = WSTETH,
+                 debt_mode: str = "weth",
+                 debt_asset: str = "WETH",
+                 initial_eth_usd_price: float = 1.0):
         self.capital_eth = capital_eth
         self.n_loops = n_loops
+        self.debt_mode = str(debt_mode).strip().lower()
+        if self.debt_mode not in {"weth", "stablecoin"}:
+            raise ValueError("debt_mode must be one of: 'weth', 'stablecoin'")
+        self.debt_asset = str(debt_asset).strip().upper() or (
+            "USDC" if self.debt_mode == "stablecoin" else "WETH"
+        )
+        self.initial_eth_usd_price = float(initial_eth_usd_price)
+        if self.debt_mode == "stablecoin" and self.initial_eth_usd_price <= 0.0:
+            raise ValueError("stablecoin debt mode requires initial_eth_usd_price > 0")
         self.ltv = emode.ltv
         self.lt = emode.liquidation_threshold
         self.bonus = emode.liquidation_bonus
@@ -64,6 +80,11 @@ class LoopedPosition:
         self.total_collateral_eth = capital_eth * self.leverage
         self.total_collateral_wsteth = self.total_collateral_eth / self.wsteth_steth_rate
         self.total_debt_weth = self.total_collateral_eth - capital_eth
+        self.total_debt_stable = (
+            self.total_debt_weth * self.initial_eth_usd_price
+            if self.debt_mode == "stablecoin"
+            else None
+        )
 
     def _compute_leverage(self) -> float:
         """L = (1 - LTV^(N+1)) / (1 - LTV)"""
@@ -89,17 +110,28 @@ class LoopedPosition:
 
     def health_factor(self) -> float:
         """
-        Health factor for wstETH/WETH position using Aave oracle.
+        Health factor for the looped position using Aave oracle semantics.
 
-        The Aave oracle uses the wstETH contract exchange rate (stEthPerToken()),
-        NOT the market stETH/ETH price. This rate only increases over time.
+        In WETH debt mode, ETH/USD cancels from the single-position HF
+        equation. In stablecoin debt mode, debt is USD-denominated, so the
+        current ETH/USD price is part of the collateral value.
 
         HF = (collateral_wsteth * exchange_rate * LT) / debt_weth
+        HF_stable = (collateral_wsteth * exchange_rate * ETH/USD * LT) / debt_usd
 
-        For this pair, HF is essentially constant (slowly improving as
-        exchange rate accrues staking yield).
+        WETH debt HF is essentially constant, slowly improving as exchange
+        rate accrues staking yield. Stablecoin debt HF additionally moves with
+        ETH/USD because collateral is ETH-priced while debt is USD-priced.
         """
         collateral_eth = self.total_collateral_wsteth * self.wsteth_steth_rate
+        if self.debt_mode == "stablecoin":
+            debt_stable = float(self.total_debt_stable or 0.0)
+            if debt_stable <= 0.0:
+                return float('inf')
+            collateral_usd = collateral_eth * self.initial_eth_usd_price
+            return (collateral_usd * self.lt) / debt_stable
+        if self.total_debt_weth <= 0.0:
+            return float('inf')
         return (collateral_eth * self.lt) / self.total_debt_weth
 
     def snapshot(self, borrow_rate: float) -> PositionSnapshot:
@@ -107,11 +139,15 @@ class LoopedPosition:
         return PositionSnapshot(
             capital_eth=self.capital_eth,
             n_loops=self.n_loops,
+            debt_mode=self.debt_mode,
+            debt_asset=self.debt_asset,
             ltv=self.ltv,
             leverage=self.leverage,
             total_collateral_eth=self.total_collateral_eth,
             total_collateral_wsteth=self.total_collateral_wsteth,
             total_debt_weth=self.total_debt_weth,
+            total_debt_stable=self.total_debt_stable,
+            initial_eth_usd_price=self.initial_eth_usd_price,
             net_apy=float(self.net_apy(borrow_rate)),
             health_factor=float(self.health_factor()),
             break_even_rate=self.break_even_rate(),
@@ -133,6 +169,7 @@ class LoopedPosition:
     def pnl_paths(self, borrow_rate_paths: np.ndarray,
                   steth_eth_paths: np.ndarray,
                   exchange_rate_paths: np.ndarray | None = None,
+                  eth_usd_paths: np.ndarray | None = None,
                   dt: float = 1.0 / 365.0) -> np.ndarray:
         """
         Compute P&L paths for the position.
@@ -168,9 +205,6 @@ class LoopedPosition:
                 "exchange_rate_paths must have same shape as borrow_rate_paths"
             )
 
-        # Borrow cost cashflow
-        borrow_cost = self.total_debt_weth * borrow_rate_paths[:, :-1] * dt
-
         # Collateral value path captures exchange-rate accrual + market depeg.
         collateral_eth_t = (self.total_collateral_wsteth
                             * exchange_rate_paths
@@ -178,6 +212,36 @@ class LoopedPosition:
 
         # stETH supply income accrues on collateral value (separate from exchange-rate growth)
         supply_income = collateral_eth_t[:, :-1] * self.steth_supply_apy * dt
+
+        if self.debt_mode == "stablecoin":
+            if eth_usd_paths is None:
+                raise ValueError("stablecoin debt mode requires eth_usd_paths")
+            eth_usd = np.asarray(eth_usd_paths, dtype=float)
+            if eth_usd.shape != (n_paths, n_cols):
+                raise ValueError(
+                    "eth_usd_paths must have same shape as borrow_rate_paths"
+                )
+            if np.any(eth_usd <= 0.0):
+                raise ValueError("eth_usd_paths must be strictly positive")
+
+            debt_usd = np.full((n_paths, n_cols), float(self.total_debt_stable or 0.0))
+            for t in range(1, n_cols):
+                interest = debt_usd[:, t - 1] * borrow_rate_paths[:, t - 1] * dt
+                debt_usd[:, t] = debt_usd[:, t - 1] + interest
+
+            debt_eth_t = debt_usd / eth_usd
+            net_value_eth = collateral_eth_t - debt_eth_t
+            supply_income_cum = np.concatenate(
+                [
+                    np.zeros((n_paths, 1)),
+                    np.cumsum(supply_income, axis=1),
+                ],
+                axis=1,
+            )
+            return net_value_eth - net_value_eth[:, [0]] + supply_income_cum
+
+        # Borrow cost cashflow
+        borrow_cost = self.total_debt_weth * borrow_rate_paths[:, :-1] * dt
 
         mtm_change = np.diff(collateral_eth_t, axis=1)
 
@@ -192,6 +256,7 @@ class LoopedPosition:
     def health_factor_paths(self, borrow_rate_paths: np.ndarray,
                             dt: float = 1.0 / 365.0,
                             exchange_rate_paths: np.ndarray | None = None,
+                            eth_usd_paths: np.ndarray | None = None,
                             lt_paths: np.ndarray | None = None) -> np.ndarray:
         """
         Compute health factor evolution over time.
@@ -205,8 +270,6 @@ class LoopedPosition:
         Returns: (n_paths, n_steps + 1) health factor paths
         """
         n_paths, n_cols = borrow_rate_paths.shape
-        debt = np.full((n_paths, n_cols), self.total_debt_weth)
-
         if exchange_rate_paths is None:
             exchange_rate = self._oracle_exchange_rate_paths(n_paths, n_cols, dt)
         else:
@@ -223,15 +286,34 @@ class LoopedPosition:
                 raise ValueError("lt_paths must have same shape as borrow_rate_paths")
             lt = lt_paths
 
-        for t in range(1, n_cols):
-            # Interest accrual adds to debt
-            daily_interest = debt[:, t - 1] * borrow_rate_paths[:, t - 1] * dt
-            debt[:, t] = debt[:, t - 1] + daily_interest
-
-        # HF at each step using oracle exchange rate (NOT market price)
         collateral_eth = self.total_collateral_wsteth * exchange_rate
-        with np.errstate(divide='ignore', invalid='ignore'):
-            hf = (collateral_eth * lt) / debt
-        hf = np.where(debt <= 0, np.inf, hf)
+        if self.debt_mode == "stablecoin":
+            if eth_usd_paths is None:
+                raise ValueError("stablecoin debt mode requires eth_usd_paths")
+            eth_usd = np.asarray(eth_usd_paths, dtype=float)
+            if eth_usd.shape != (n_paths, n_cols):
+                raise ValueError(
+                    "eth_usd_paths must have same shape as borrow_rate_paths"
+                )
+            if np.any(eth_usd <= 0.0):
+                raise ValueError("eth_usd_paths must be strictly positive")
+            debt = np.full((n_paths, n_cols), float(self.total_debt_stable or 0.0))
+            for t in range(1, n_cols):
+                daily_interest = debt[:, t - 1] * borrow_rate_paths[:, t - 1] * dt
+                debt[:, t] = debt[:, t - 1] + daily_interest
+            with np.errstate(divide='ignore', invalid='ignore'):
+                hf = (collateral_eth * eth_usd * lt) / debt
+            hf = np.where(debt <= 0, np.inf, hf)
+        else:
+            debt = np.full((n_paths, n_cols), self.total_debt_weth)
+            for t in range(1, n_cols):
+                # Interest accrual adds to debt
+                daily_interest = debt[:, t - 1] * borrow_rate_paths[:, t - 1] * dt
+                debt[:, t] = debt[:, t - 1] + daily_interest
+
+            # HF at each step using oracle exchange rate (NOT market price)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                hf = (collateral_eth * lt) / debt
+            hf = np.where(debt <= 0, np.inf, hf)
 
         return hf

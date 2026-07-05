@@ -4,7 +4,7 @@ All values sourced from real protocol data with citations.
 Uses data/fetcher.py for live data with cache fallback.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
 
@@ -58,6 +58,22 @@ class WETHRateParams:
     # Source: Aave V3 rate strategy
     reserve_factor: float = 0.15
     # Source: Aave governance (current 15%, proposed → 20%)
+
+
+@dataclass(frozen=True)
+class StablecoinReserveParams:
+    """Aave V3 stablecoin reserve snapshot and variable-rate strategy."""
+
+    symbol: str = "USDC"
+    address: str = ""
+    decimals: int = 6
+    current_utilization: float = 0.0
+    current_variable_borrow_rate: float = 0.0
+    total_supply: float = 0.0
+    total_borrows: float = 0.0
+    rate_params: WETHRateParams = field(default_factory=WETHRateParams)
+    source: str = "unavailable"
+    available: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +141,16 @@ class DepegParams:
     # Jump size standard deviation
     vol_threshold: float = 0.80
     # Annualized ETH vol above which stress regime activates
+
+
+@dataclass(frozen=True)
+class DepegFeedbackParams:
+    """Configuration for rate-driven reflexive unwind pressure."""
+
+    unwind_sensitivity: float = 2.0
+    max_daily_unwind_frac: float = 0.05
+    total_looped_tvl_eth: float = 500_000.0
+    available_liquidity_eth: float = 100_000.0
 
 
 @dataclass(frozen=True)
@@ -602,6 +628,145 @@ def _calibrate_governance_and_slashing(
     }
 
 
+def _infer_utilization_from_borrow_rates(
+    borrow_rates: list[float] | np.ndarray | None,
+    rate_params: WETHRateParams,
+) -> np.ndarray:
+    """Invert Aave's two-slope variable-borrow curve into utilization samples."""
+    rates = _clean_series(borrow_rates, min_points=1)
+    if rates.size == 0:
+        return np.array([], dtype=float)
+
+    base = float(rate_params.base_rate)
+    slope1 = max(float(rate_params.slope1), 0.0)
+    slope2 = max(float(rate_params.slope2), 0.0)
+    u_opt = float(np.clip(rate_params.optimal_utilization, np.finfo(float).eps, 0.999999))
+    kink_rate = base + slope1
+
+    inferred = np.zeros_like(rates, dtype=float)
+    below = rates <= kink_rate
+    if slope1 > np.finfo(float).eps:
+        inferred[below] = (rates[below] - base) * u_opt / slope1
+    else:
+        inferred[below] = 0.0
+
+    if slope2 > np.finfo(float).eps:
+        inferred[~below] = u_opt + (rates[~below] - kink_rate) * (1.0 - u_opt) / slope2
+    else:
+        inferred[~below] = u_opt
+
+    return np.clip(inferred, 0.0, 0.99)
+
+
+def _median_timestep_years(timestamps: list[int] | list[float] | np.ndarray | None) -> float:
+    """Resolve a representative timestep from Unix timestamps, falling back to daily."""
+    ts = _clean_series(timestamps, min_points=2)
+    if ts.size < 2:
+        return 1.0 / 365.0
+    diffs = np.diff(np.sort(ts))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+    if diffs.size == 0:
+        return 1.0 / 365.0
+    return float(np.clip(np.median(diffs) / (365.0 * 86400.0), 1.0 / (24.0 * 365.0), 30.0 / 365.0))
+
+
+def _calibrate_utilization_params(
+    weth_borrow_apy_history: list[float] | None,
+    weth_borrow_apy_timestamps: list[int] | None,
+    rate_params: WETHRateParams,
+    current_utilization: float,
+    defaults: UtilizationParams | None = None,
+) -> tuple[UtilizationParams, dict]:
+    """
+    Calibrate WETH utilization dynamics from historical Aave borrow rates.
+
+    The fetcher already collects WETH variable-borrow APY history. Because the
+    Aave rate curve is deterministic for a given strategy, we invert that curve
+    into utilization observations, then fit an AR(1)/OU process.
+    """
+    base = defaults or UtilizationParams(base_target=float(current_utilization))
+    inferred = _infer_utilization_from_borrow_rates(weth_borrow_apy_history, rate_params)
+    if inferred.size < 30:
+        return base, {
+            "method": "fallback (insufficient WETH borrow APY history)",
+            "n_rate_obs": int(inferred.size),
+            "base_target": float(base.base_target),
+        }
+
+    dt_years = _median_timestep_years(weth_borrow_apy_timestamps)
+    x = inferred[:-1]
+    y = inferred[1:]
+    if x.size < 2 or float(np.std(x)) <= np.finfo(float).eps:
+        target = float(np.clip(np.mean(inferred), base.clip_min, base.clip_max))
+        calibrated = UtilizationParams(
+            mean_reversion_speed=base.mean_reversion_speed,
+            base_target=target,
+            vol=base.vol,
+            beta_vol=base.beta_vol,
+            beta_price=base.beta_price,
+            clip_min=base.clip_min,
+            clip_max=base.clip_max,
+        )
+        return calibrated, {
+            "method": "fallback (flat inferred utilization history)",
+            "n_rate_obs": int(inferred.size),
+            "dt_years": dt_years,
+            "inferred_utilization_mean": float(np.mean(inferred)),
+        }
+
+    design = np.column_stack([np.ones_like(x), x])
+    intercept, phi = np.linalg.lstsq(design, y, rcond=None)[0]
+    phi = float(np.clip(phi, 0.01, 0.999))
+    target = float(intercept / max(1.0 - phi, np.finfo(float).eps))
+    target = float(np.clip(target, base.clip_min, base.clip_max))
+    kappa = float(np.clip(-np.log(phi) / max(dt_years, np.finfo(float).eps), 0.25, 50.0))
+
+    fitted = intercept + phi * x
+    residuals = y - fitted
+    resid_std = float(np.std(residuals))
+    sigma = float(np.clip(resid_std / np.sqrt(max(dt_years, np.finfo(float).eps)), 0.005, 0.50))
+    rmse = float(np.sqrt(np.mean(np.square(residuals))))
+
+    calibrated = UtilizationParams(
+        mean_reversion_speed=kappa,
+        base_target=target,
+        vol=sigma,
+        beta_vol=base.beta_vol,
+        beta_price=base.beta_price,
+        clip_min=base.clip_min,
+        clip_max=base.clip_max,
+    )
+    return calibrated, {
+        "method": "borrow-rate inverse + OU(AR1) calibration",
+        "n_rate_obs": int(inferred.size),
+        "dt_years": dt_years,
+        "rate_curve": {
+            "base_rate": float(rate_params.base_rate),
+            "slope1": float(rate_params.slope1),
+            "slope2": float(rate_params.slope2),
+            "optimal_utilization": float(rate_params.optimal_utilization),
+        },
+        "inferred_utilization": {
+            "mean": float(np.mean(inferred)),
+            "p5": float(np.percentile(inferred, 5.0)),
+            "p50": float(np.percentile(inferred, 50.0)),
+            "p95": float(np.percentile(inferred, 95.0)),
+            "latest": float(inferred[-1]),
+            "current_onchain": float(current_utilization),
+        },
+        "ar1_phi": phi,
+        "residual_rmse": rmse,
+        "residual_std": resid_std,
+        "calibrated": {
+            "mean_reversion_speed": float(calibrated.mean_reversion_speed),
+            "base_target": float(calibrated.base_target),
+            "vol": float(calibrated.vol),
+            "clip_min": float(calibrated.clip_min),
+            "clip_max": float(calibrated.clip_max),
+        },
+    }
+
+
 def _normalize_staking_apy_method(method: str) -> str:
     """Validate and normalize staking APY method selection."""
     normalized = str(method).strip().lower()
@@ -674,6 +839,45 @@ def _resolve_staking_apy_metadata(
         "source_type": "unavailable",
         "source_timestamp": None,
     }
+
+
+def _stablecoin_reserves_from_fetched(fetched: object) -> dict[str, StablecoinReserveParams]:
+    """Convert fetched stablecoin reserve payloads into typed params."""
+    raw_reserves = getattr(fetched, "stablecoin_reserves", {})
+    if not isinstance(raw_reserves, dict):
+        return {}
+
+    reserves: dict[str, StablecoinReserveParams] = {}
+    for raw_symbol, row in raw_reserves.items():
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or raw_symbol).strip().upper()
+        if not symbol:
+            continue
+        try:
+            rate_params = WETHRateParams(
+                base_rate=float(row["base_rate"]),
+                slope1=float(row["slope1"]),
+                slope2=float(row["slope2"]),
+                optimal_utilization=float(row["optimal_utilization"]),
+                reserve_factor=float(row["reserve_factor"]),
+            )
+            reserve = StablecoinReserveParams(
+                symbol=symbol,
+                address=str(row.get("address", "")),
+                decimals=int(row.get("decimals", 6)),
+                current_utilization=float(row["current_utilization"]),
+                current_variable_borrow_rate=float(row["current_variable_borrow_rate"]),
+                total_supply=float(row["total_supply"]),
+                total_borrows=float(row["total_borrows"]),
+                rate_params=rate_params,
+                source=str(row.get("source", "Aave V3 on-chain stablecoin reserve")),
+                available=True,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        reserves[symbol] = reserve
+    return reserves
 
 
 def load_params(
@@ -825,6 +1029,7 @@ def load_params(
             amplification_factor=fetched.curve_amp_factor,
             pool_depth_eth=fetched.curve_pool_depth_eth,
         )
+        stablecoin_reserves = _stablecoin_reserves_from_fetched(fetched)
         depeg_params, depeg_calibration = _calibrate_depeg_params(
             steth_eth_price_history=getattr(fetched, "steth_eth_price_history", []),
             eth_price_history=fetched.eth_price_history,
@@ -835,6 +1040,12 @@ def load_params(
             weth_borrow_apy_timestamps=getattr(fetched, "weth_borrow_apy_timestamps", []),
             steth_eth_price_history=getattr(fetched, "steth_eth_price_history", []),
             historical_stress_data=historical_stress_data,
+        )
+        utilization_params, utilization_calibration = _calibrate_utilization_params(
+            weth_borrow_apy_history=getattr(fetched, "weth_borrow_apy_history", []),
+            weth_borrow_apy_timestamps=getattr(fetched, "weth_borrow_apy_timestamps", []),
+            rate_params=weth_rates,
+            current_utilization=fetched.current_weth_utilization,
         )
         staking_apy_metadata = _resolve_staking_apy_metadata(
             fetched,
@@ -869,17 +1080,17 @@ def load_params(
             "wsteth": wsteth,
             "market": market,
             "curve_pool": curve_pool,
+            "stablecoin_reserves": stablecoin_reserves,
             "weth_execution": WETHExecutionParams(adv_weth=resolved_adv_weth),
             "spread_model": SpreadModelParams(),
+            "depeg_feedback": DepegFeedbackParams(),
             "abm": ABMConfig(),
             "weth_total_supply": fetched.weth_total_supply,
             "weth_total_borrows": fetched.weth_total_borrows,
             "aave_oracle_address": fetched.aave_oracle_address,
             "volatility": VolatilityParams(),
             "depeg": depeg_params,
-            "utilization": UtilizationParams(
-                base_target=fetched.current_weth_utilization,
-            ),
+            "utilization": utilization_params,
             "sim_config": SimulationConfig(),
             "eth_price_history": fetched.eth_price_history,
             "steth_eth_price_history": getattr(fetched, "steth_eth_price_history", []),
@@ -888,6 +1099,7 @@ def load_params(
             "historical_stress_data": historical_stress_data,
             "depeg_calibration": depeg_calibration,
             "tail_risk_calibration": tail_calibration,
+            "utilization_calibration": utilization_calibration,
             "cohort_source": cohort_source,
             "cohort_analytics": cohort_analytics,
             "cascade_avg_ltv": cohort_analytics.get("avg_ltv_weighted"),
@@ -911,6 +1123,7 @@ MARKET = MarketParams()
 CURVE_POOL = CurvePoolParams()
 VOLATILITY = VolatilityParams()
 DEPEG = DepegParams()
+DEPEG_FEEDBACK = DepegFeedbackParams()
 UTILIZATION = UtilizationParams()
 WETH_EXECUTION = WETHExecutionParams()
 SPREAD_MODEL = SpreadModelParams()

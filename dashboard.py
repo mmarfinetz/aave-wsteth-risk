@@ -19,20 +19,38 @@ Pipeline:
 import json
 import os
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
 from config.params import (
     DEFAULT_GAS_PRICE_GWEI, EMODE, WETH_RATES, WSTETH, MARKET, CURVE_POOL, SIM_CONFIG,
-    VOLATILITY, DEPEG, UTILIZATION, WETH_EXECUTION, SPREAD_MODEL, ABM,
+    VOLATILITY, DEPEG, DEPEG_FEEDBACK, UTILIZATION, WETH_EXECUTION, SPREAD_MODEL, ABM,
     ABMConfig,
+    DepegFeedbackParams,
     SpreadModelParams,
-    SimulationConfig, load_params,
+    StablecoinReserveParams,
+    SimulationConfig, UtilizationParams, WETHRateParams, load_params,
 )
 from config.time_grid import build_simulation_grid
 from models.aave_model import InterestRateModel, LiquidationEngine
-from models.price_simulation import GBMSimulator, VolatilityEstimator
+from models.price_simulation import (
+    GBMSimulator,
+    MeanRevertingLogPriceSimulator,
+    VolatilityEstimator,
+)
+from models.market_regime import (
+    AttentionMarkovRegimeModel,
+    MarketRegimeConfig,
+    MarketRegimeFeatures,
+    PriceActionFeatures,
+)
+from models.touch_model import (
+    load_touch_model,
+    predict_touch_probabilities,
+)
+from models.position_sizing import expected_log_growth, position_sizing_report
+from models.exit_policy import evaluate_exit_ladder, parse_exit_ladder
 from models.depeg_model import DepegModel
 from models.liquidation_cascade import LiquidationCascade
 from models.account_liquidation_replay import (
@@ -60,11 +78,30 @@ from src.oracle_dynamics.exchange_rate import (
 DEFAULT_CASCADE_AVG_LTV = 0.70
 DEFAULT_CASCADE_AVG_LT = 0.80
 OUTPUT_SCHEMA_VERSION = "2.0.0"
+DEFAULT_OPT_MAX_PROB_HF_LT_1_PCT = 0.25
+DEFAULT_OPT_MIN_START_HF = 1.25
+DEFAULT_OPT_MAX_ENTRY_COST_BPS = 25.0
+DEFAULT_OPT_MAX_UNWIND_COST_BPS = 50.0
+DEFAULT_OPT_UNWIND_STRESS_MULTIPLIER = 0.50
+DEFAULT_ENTRY_SWEEP_POINTS = 7
+DEFAULT_ENTRY_SWEEP_MIN_MULTIPLIER = 0.85
+DEFAULT_ENTRY_SWEEP_MAX_MULTIPLIER = 1.15
+DEFAULT_ENTRY_SWEEP_MAX_PATHS = 2_000
+DEFAULT_LIQUIDATION_LADDER_HF_LEVELS = (1.30, 1.20, 1.10, 1.05, 1.00, 0.95)
+DEFAULT_TRADE_REGIME_NAMES = (
+    "bull_mean_reversion",
+    "sideways_chop",
+    "failed_breakout",
+    "fast_liquidation_wick",
+    "slow_bleed",
+    "rally_then_retrace",
+)
 DEFAULT_COLLATERAL_BUCKET_ASSUMPTIONS = {
     "weth": {"beta": 1.0, "haircut": 0.0},
     "steth_like": {"beta": 1.0, "haircut": 0.0},
     "other": {"beta": 0.5, "haircut": 0.25},
 }
+STABLECOIN_DEBT_ASSETS = {"USDC", "USDT", "DAI"}
 
 
 @dataclass
@@ -88,6 +125,7 @@ class DashboardOutput:
     liquidation_diagnostics: dict
     spread_forecast: dict
     time_series_diagnostics: dict
+    professional_modeling: dict
     simulation_config: dict
 
     def to_dict(self) -> dict[str, Any]:
@@ -150,6 +188,161 @@ class Dashboard:
         borrows = float(weth_total_borrows) if weth_total_borrows is not None else supply * util
         borrows = float(np.clip(borrows, 0.0, supply))
         return supply, borrows
+
+    @staticmethod
+    def _normalize_debt_mode(raw_mode: Any, raw_asset: Any) -> tuple[str, str]:
+        asset = str(raw_asset or "").strip().upper()
+        mode = str(raw_mode or "").strip().lower()
+        if not mode:
+            mode = "stablecoin" if asset in STABLECOIN_DEBT_ASSETS else "weth"
+        if mode not in {"weth", "stablecoin"}:
+            raise ValueError("debt_mode must be one of: 'weth', 'stablecoin'")
+        if mode == "weth":
+            return mode, "WETH"
+        if not asset or asset == "WETH":
+            asset = "USDC"
+        if asset not in STABLECOIN_DEBT_ASSETS:
+            raise ValueError(
+                "stablecoin debt mode supports debt_asset values: "
+                f"{', '.join(sorted(STABLECOIN_DEBT_ASSETS))}"
+            )
+        return mode, asset
+
+    @staticmethod
+    def _resolve_optional_rate(value: Any, *, name: str) -> float | None:
+        if value is None:
+            return None
+        try:
+            rate = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite non-negative decimal APY") from exc
+        if not np.isfinite(rate) or rate < 0.0:
+            raise ValueError(f"{name} must be a finite non-negative decimal APY")
+        return rate
+
+    @staticmethod
+    def _coerce_stablecoin_reserve(
+        raw: Any,
+        *,
+        symbol: str,
+    ) -> StablecoinReserveParams | None:
+        if raw is None:
+            return None
+        if isinstance(raw, StablecoinReserveParams):
+            return raw if raw.available else None
+        if not isinstance(raw, dict):
+            return None
+
+        rate_raw = raw.get("rate_params")
+        if isinstance(rate_raw, WETHRateParams):
+            rate_params = rate_raw
+        elif isinstance(rate_raw, dict):
+            try:
+                rate_params = WETHRateParams(
+                    base_rate=float(rate_raw["base_rate"]),
+                    slope1=float(rate_raw["slope1"]),
+                    slope2=float(rate_raw["slope2"]),
+                    optimal_utilization=float(rate_raw["optimal_utilization"]),
+                    reserve_factor=float(rate_raw["reserve_factor"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+        else:
+            try:
+                rate_params = WETHRateParams(
+                    base_rate=float(raw["base_rate"]),
+                    slope1=float(raw["slope1"]),
+                    slope2=float(raw["slope2"]),
+                    optimal_utilization=float(raw["optimal_utilization"]),
+                    reserve_factor=float(raw["reserve_factor"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        try:
+            reserve = StablecoinReserveParams(
+                symbol=str(raw.get("symbol", symbol)).strip().upper(),
+                address=str(raw.get("address", "")),
+                decimals=int(raw.get("decimals", 6)),
+                current_utilization=float(raw["current_utilization"]),
+                current_variable_borrow_rate=float(raw["current_variable_borrow_rate"]),
+                total_supply=float(raw["total_supply"]),
+                total_borrows=float(raw["total_borrows"]),
+                rate_params=rate_params,
+                source=str(raw.get("source", "Aave V3 stablecoin reserve")),
+                available=bool(raw.get("available", True)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if not reserve.available:
+            return None
+        if (
+            reserve.symbol != symbol
+            or not np.isfinite(reserve.current_utilization)
+            or not np.isfinite(reserve.current_variable_borrow_rate)
+            or not np.isfinite(reserve.total_supply)
+            or reserve.total_supply <= 0.0
+        ):
+            return None
+        return reserve
+
+    def _resolve_stablecoin_reserve(self, asset: str) -> StablecoinReserveParams | None:
+        raw_direct = self.params.get("stablecoin_reserve")
+        direct = self._coerce_stablecoin_reserve(raw_direct, symbol=asset)
+        if direct is not None:
+            return direct
+
+        reserves = self.params.get("stablecoin_reserves")
+        if not isinstance(reserves, dict):
+            return None
+        raw = reserves.get(asset) or reserves.get(asset.lower()) or reserves.get(asset.upper())
+        return self._coerce_stablecoin_reserve(raw, symbol=asset)
+
+    @staticmethod
+    def _coerce_depeg_feedback(raw: Any) -> DepegFeedbackParams:
+        if isinstance(raw, DepegFeedbackParams):
+            return raw
+        if not isinstance(raw, dict):
+            raw = {}
+        return DepegFeedbackParams(
+            unwind_sensitivity=float(
+                raw.get("unwind_sensitivity", DEPEG_FEEDBACK.unwind_sensitivity)
+            ),
+            max_daily_unwind_frac=float(
+                raw.get("max_daily_unwind_frac", DEPEG_FEEDBACK.max_daily_unwind_frac)
+            ),
+            total_looped_tvl_eth=float(
+                raw.get("total_looped_tvl_eth", DEPEG_FEEDBACK.total_looped_tvl_eth)
+            ),
+            available_liquidity_eth=float(
+                raw.get("available_liquidity_eth", DEPEG_FEEDBACK.available_liquidity_eth)
+            ),
+        )
+
+    @staticmethod
+    def _resolve_optional_return(value: Any, *, name: str) -> float | None:
+        if value is None:
+            return None
+        try:
+            ret = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite decimal return greater than -100%") from exc
+        if not np.isfinite(ret) or ret <= -1.0:
+            raise ValueError(f"{name} must be a finite decimal return greater than -100%")
+        return ret
+
+    @staticmethod
+    def _resolve_optional_positive(value: Any, *, name: str) -> float | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite positive number") from exc
+        if not np.isfinite(numeric) or numeric <= 0.0:
+            raise ValueError(f"{name} must be a finite positive number")
+        return numeric
 
     @staticmethod
     def _coerce_account_states(raw_accounts) -> list[AccountState]:
@@ -988,10 +1181,104 @@ class Dashboard:
         self.weth_rates = self.params.get("weth_rates", WETH_RATES)
         self.wsteth = self.params.get("wsteth", WSTETH)
         self.market = self.params.get("market", MARKET)
+        self.eth_entry_price_usd = self._resolve_optional_positive(
+            self.params.get("eth_entry_price_usd"),
+            name="eth_entry_price_usd",
+        )
+        if self.eth_entry_price_usd is not None:
+            self.market = replace(self.market, eth_usd_price=self.eth_entry_price_usd)
         self.curve_pool = self.params.get("curve_pool", CURVE_POOL)
         self.vol_params = self.params.get("volatility", VOLATILITY)
         self.depeg_params = self.params.get("depeg", DEPEG)
+        self.depeg_feedback = self._coerce_depeg_feedback(
+            self.params.get("depeg_feedback", DEPEG_FEEDBACK)
+        )
         self.util_params = self.params.get("utilization", UTILIZATION)
+        self.debt_mode, self.debt_asset = self._normalize_debt_mode(
+            self.params.get("debt_mode"),
+            self.params.get("debt_asset"),
+        )
+        self.stablecoin_reserve = self._resolve_stablecoin_reserve(self.debt_asset)
+        self.stablecoin_manual_borrow_apy = self._resolve_optional_rate(
+            self.params.get("stablecoin_borrow_apy"),
+            name="stablecoin_borrow_apy",
+        )
+        if self.stablecoin_manual_borrow_apy is not None:
+            self.stablecoin_borrow_apy = self.stablecoin_manual_borrow_apy
+            self.stablecoin_borrow_apy_source = str(
+                self.params.get("stablecoin_borrow_apy_source", "user_supplied")
+            )
+        elif self.stablecoin_reserve is not None:
+            self.stablecoin_borrow_apy = float(
+                self.stablecoin_reserve.current_variable_borrow_rate
+            )
+            self.stablecoin_borrow_apy_source = self.stablecoin_reserve.source
+        else:
+            self.stablecoin_borrow_apy = None
+            self.stablecoin_borrow_apy_source = str(
+                self.params.get("stablecoin_borrow_apy_source", "unavailable")
+            )
+        if self.debt_mode == "stablecoin" and self.stablecoin_borrow_apy is None:
+            raise ValueError(
+                "stablecoin debt mode requires either live Aave stablecoin reserve "
+                "params or stablecoin_borrow_apy as a decimal annualized rate, "
+                "e.g. 0.065 for 6.5%"
+            )
+        self.eth_expected_return = self._resolve_optional_return(
+            self.params.get("eth_expected_return"),
+            name="eth_expected_return",
+        )
+        self.eth_expected_return_source = str(
+            self.params.get(
+                "eth_expected_return_source",
+                "user_supplied" if self.eth_expected_return is not None else "zero_drift_default",
+            )
+        )
+        raw_price_model = str(self.params.get("eth_price_model", "gbm")).strip().lower()
+        self.eth_price_model = raw_price_model.replace("-", "_")
+        if self.eth_price_model not in {"gbm", "mean_reverting"}:
+            raise ValueError("eth_price_model must be one of: 'gbm', 'mean_reverting'")
+        self.eth_mean_reversion_target_usd = self._resolve_optional_positive(
+            self.params.get("eth_mean_reversion_target_usd"),
+            name="eth_mean_reversion_target_usd",
+        )
+        self.eth_mean_reversion_half_life_days = self._resolve_optional_positive(
+            self.params.get("eth_mean_reversion_half_life_days"),
+            name="eth_mean_reversion_half_life_days",
+        )
+        self.eth_mean_reversion_speed_annual = self._resolve_optional_positive(
+            self.params.get("eth_mean_reversion_speed_annual"),
+            name="eth_mean_reversion_speed_annual",
+        )
+        if self.eth_price_model == "mean_reverting":
+            if self.eth_mean_reversion_target_usd is None:
+                if self.eth_expected_return is None:
+                    raise ValueError(
+                        "mean_reverting ETH price model requires "
+                        "eth_mean_reversion_target_usd or eth_expected_return"
+                    )
+                self.eth_mean_reversion_target_usd = (
+                    float(self.market.eth_usd_price) * (1.0 + self.eth_expected_return)
+                )
+            if self.eth_mean_reversion_speed_annual is None:
+                half_life_days = self.eth_mean_reversion_half_life_days or 7.0
+                self.eth_mean_reversion_half_life_days = half_life_days
+                self.eth_mean_reversion_speed_annual = float(
+                    np.log(2.0) / (half_life_days / 365.0)
+                )
+        self.market_regime_features = self.params.get("market_regime_features")
+        self.market_regime_targets_usd = self.params.get("market_regime_targets_usd")
+        self.price_action_features = self.params.get("price_action_features")
+        initial_config = config or self.params.get("sim_config", SIM_CONFIG)
+        self.market_regime_n_paths = int(
+            self.params.get(
+                "market_regime_n_paths",
+                min(int(initial_config.n_simulations), 20_000),
+            )
+        )
+        self.market_regime_seed = int(
+            self.params.get("market_regime_seed", int(initial_config.seed) + 30_001)
+        )
         exec_params = self.params.get("weth_execution", WETH_EXECUTION)
         spread_params = self.params.get("spread_model", SPREAD_MODEL)
         raw_weth_total_supply = self.params.get("weth_total_supply")
@@ -1003,6 +1290,11 @@ class Dashboard:
         if self.unwind_cost_model not in {"curve", "live_0x"}:
             raise ValueError(
                 "unwind_cost_model must be one of: 'curve', 'live_0x'"
+            )
+        if self.debt_mode == "stablecoin" and self.unwind_cost_model == "live_0x":
+            raise ValueError(
+                "stablecoin debt mode currently supports curve unwind costs only; "
+                "live_0x mode is WETH-debt specific"
             )
         self.zerox_slippage_bps = int(
             np.clip(self.params.get("zerox_slippage_bps", 50), 0, 10_000)
@@ -1044,6 +1336,12 @@ class Dashboard:
         self.depeg_calibration = depeg_calibration if isinstance(depeg_calibration, dict) else {}
         tail_calibration = self.params.get("tail_risk_calibration")
         self.tail_risk_calibration = tail_calibration if isinstance(tail_calibration, dict) else {}
+        utilization_calibration = self.params.get("utilization_calibration")
+        self.utilization_calibration = (
+            utilization_calibration
+            if isinstance(utilization_calibration, dict)
+            else {}
+        )
         self.capo_max_growth_annual = float(self.params.get("capo_max_growth_annual", 0.0968))
         self.exec_depeg_alpha = float(self.params.get("execution_depeg_alpha", 0.55))
         self.exec_depeg_exponent = float(self.params.get("execution_depeg_exponent", 0.75))
@@ -1435,15 +1733,45 @@ class Dashboard:
                 getattr(self.config, "allow_step_cap_override", False)
             ),
         )
+        if self.eth_expected_return is None:
+            self.eth_drift_mu = 0.0
+        else:
+            horizon_years = max(float(self.grid.horizon_days) / 365.0, np.finfo(float).eps)
+            self.eth_drift_mu = float(np.log1p(self.eth_expected_return) / horizon_years)
 
-        self.position = LoopedPosition(capital_eth, n_loops,
-                                       emode=self.emode,
-                                       wsteth_params=self.wsteth)
+        self.position = LoopedPosition(
+            capital_eth,
+            n_loops,
+            emode=self.emode,
+            wsteth_params=self.wsteth,
+            debt_mode=self.debt_mode,
+            debt_asset=self.debt_asset,
+            initial_eth_usd_price=float(self.market.eth_usd_price),
+        )
         self.weth_total_supply, self.weth_total_borrows = self._resolve_weth_pool_state(
             raw_weth_total_supply,
             raw_weth_total_borrows,
         )
         self.rate_model = InterestRateModel(self.weth_rates)
+        self.stablecoin_rate_model: InterestRateModel | None = None
+        self.stablecoin_util_params: UtilizationParams | None = None
+        self.stablecoin_util_model: UtilizationModel | None = None
+        if (
+            self.debt_mode == "stablecoin"
+            and self.stablecoin_reserve is not None
+            and self.stablecoin_manual_borrow_apy is None
+        ):
+            self.stablecoin_rate_model = InterestRateModel(self.stablecoin_reserve.rate_params)
+            self.stablecoin_util_params = UtilizationParams(
+                mean_reversion_speed=self.util_params.mean_reversion_speed,
+                base_target=float(self.stablecoin_reserve.current_utilization),
+                vol=self.util_params.vol,
+                beta_vol=self.util_params.beta_vol,
+                beta_price=self.util_params.beta_price,
+                clip_min=0.0,
+                clip_max=self.util_params.clip_max,
+            )
+            self.stablecoin_util_model = UtilizationModel(params=self.stablecoin_util_params)
         self.cascade_model = LiquidationCascade(
             rate_model=self.rate_model,
             liq_engine=LiquidationEngine(self.emode, self.wsteth, price_mode="market"),
@@ -1537,11 +1865,33 @@ class Dashboard:
             execution_cost_model=self.weth_execution_cost_model,
         )
 
-        self.gbm = GBMSimulator(mu=0.0, sigma=self.calibrated_sigma,
-                                config=self.config)
+        self.eth_mean_reversion_target_ratio = None
+        if self.eth_price_model == "mean_reverting":
+            self.eth_mean_reversion_target_ratio = (
+                float(self.eth_mean_reversion_target_usd)
+                / max(float(self.market.eth_usd_price), np.finfo(float).eps)
+            )
+            self.price_simulator = MeanRevertingLogPriceSimulator(
+                target=self.eth_mean_reversion_target_ratio,
+                kappa=float(self.eth_mean_reversion_speed_annual),
+                sigma=self.calibrated_sigma,
+                config=self.config,
+            )
+            self.gbm = None
+        else:
+            self.price_simulator = GBMSimulator(
+                mu=self.eth_drift_mu,
+                sigma=self.calibrated_sigma,
+                config=self.config,
+            )
+            self.gbm = self.price_simulator
         self.depeg_model = DepegModel(
             params=self.depeg_params,
             staking_apy=self.wsteth.staking_apy,
+            unwind_sensitivity=self.depeg_feedback.unwind_sensitivity,
+            max_daily_unwind_frac=self.depeg_feedback.max_daily_unwind_frac,
+            total_looped_tvl_eth=self.depeg_feedback.total_looped_tvl_eth,
+            available_liquidity_eth=self.depeg_feedback.available_liquidity_eth,
             reference_leverage_state=max(
                 float(self.market.current_weth_utilization),
                 np.finfo(float).eps,
@@ -1577,15 +1927,25 @@ class Dashboard:
                     use_min_buy_amount=self.zerox_use_min_buy_amount,
                 ),
             )
-        current_borrow = float(self.rate_model.borrow_rate(self.market.current_weth_utilization))
+        current_borrow = self._current_position_borrow_rate()
+        current_position_utilization = (
+            float(self.stablecoin_reserve.current_utilization)
+            if self.debt_mode == "stablecoin" and self.stablecoin_reserve is not None
+            else float(self.market.current_weth_utilization)
+        )
         market_state = {
-            "current_utilization": self.market.current_weth_utilization,
+            "current_utilization": current_position_utilization,
             "current_borrow_rate": current_borrow,
             "steth_eth_price": self.market.steth_eth_price,
+            "eth_usd_price": self.market.eth_usd_price,
             "gas_price_gwei": self.base_gas_price_gwei,
             "curve_pool_depth": self.curve_pool.pool_depth_eth,
             "weth_total_supply": self.weth_total_supply,
             "weth_total_borrows": self.weth_total_borrows,
+            "debt_mode": self.debt_mode,
+            "debt_asset": self.debt_asset,
+            "stablecoin_borrow_apy": self.stablecoin_borrow_apy,
+            "stablecoin_borrow_apy_source": self.stablecoin_borrow_apy_source,
             "eth_collateral_fraction": self.market.eth_collateral_fraction,
             "avg_ltv": self.cascade_avg_ltv,
             "avg_lt": self.cascade_avg_lt,
@@ -1644,6 +2004,95 @@ class Dashboard:
         lt_paths = np.where(shock_active, base_lt * (1.0 - lt_haircut), base_lt)
 
         return rate_spread_paths, lt_paths, has_event, first_event_step
+
+    def _current_position_borrow_rate(self) -> float:
+        if self.debt_mode == "stablecoin":
+            return float(self.stablecoin_borrow_apy or 0.0)
+        return float(self.rate_model.borrow_rate(self.market.current_weth_utilization))
+
+    def _position_base_borrow_rate_paths(
+        self,
+        reference_paths: np.ndarray,
+        *,
+        stablecoin_rate_paths: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if self.debt_mode == "stablecoin":
+            if (
+                stablecoin_rate_paths is not None
+                and self.stablecoin_manual_borrow_apy is None
+            ):
+                return np.asarray(stablecoin_rate_paths, dtype=float)
+            return np.full_like(
+                np.asarray(reference_paths, dtype=float),
+                float(self.stablecoin_borrow_apy or 0.0),
+                dtype=float,
+            )
+        return np.asarray(reference_paths, dtype=float)
+
+    def _stablecoin_liquidation_step_shocks(
+        self,
+        replay_diag_projected: dict[str, np.ndarray],
+        *,
+        n_paths: int,
+        n_steps: int,
+    ) -> np.ndarray:
+        if self.stablecoin_reserve is None:
+            return np.zeros((n_paths, n_steps), dtype=float)
+
+        key = {
+            "USDC": "repaid_usdc_usd",
+            "USDT": "repaid_usdt_usd",
+        }.get(self.debt_asset, "v_stables_usd")
+        repaid = replay_diag_projected.get(key)
+        if repaid is None:
+            return np.zeros((n_paths, n_steps), dtype=float)
+
+        repaid_arr = np.asarray(repaid, dtype=float)
+        if repaid_arr.shape[0] != n_paths:
+            return np.zeros((n_paths, n_steps), dtype=float)
+        repaid_steps = repaid_arr[:, :n_steps]
+        if repaid_steps.shape != (n_paths, n_steps):
+            return np.zeros((n_paths, n_steps), dtype=float)
+
+        reserve_supply = max(float(self.stablecoin_reserve.total_supply), np.finfo(float).eps)
+        shocks = -repaid_steps / reserve_supply
+        return np.clip(shocks, -0.20, 0.05)
+
+    def _simulate_stablecoin_rate_paths(
+        self,
+        *,
+        n_paths: int,
+        n_steps: int,
+        dt: float,
+        step_shocks: np.ndarray,
+        util_seed: int,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if self.stablecoin_rate_model is None or self.stablecoin_util_model is None:
+            return None, None
+        if self.stablecoin_reserve is None or self.stablecoin_util_params is None:
+            return None, None
+
+        shocks = self._require_finite_matrix(
+            step_shocks,
+            name="stablecoin_step_shocks",
+            shape=(n_paths, n_steps),
+        )
+        util_paths = self.stablecoin_util_model.simulate(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            u0=float(self.stablecoin_reserve.current_utilization),
+            cascade_shock_paths=shocks,
+            rng=np.random.default_rng(util_seed),
+        )
+        util_paths = np.clip(
+            util_paths,
+            self.stablecoin_util_params.clip_min,
+            self.stablecoin_util_params.clip_max,
+        )
+        rate_paths = self.stablecoin_rate_model.borrow_rate(util_paths)
+        rate_paths[:, 0] = float(self.stablecoin_reserve.current_variable_borrow_rate)
+        return util_paths, rate_paths
 
     def _simulate_exchange_rate_paths(
         self,
@@ -1709,7 +2158,25 @@ class Dashboard:
         exit_mask: np.ndarray,
     ) -> np.ndarray:
         """Approximate per-path unwind costs under execution stress."""
-        position_size = float(self.position.total_debt_weth)
+        return self._path_unwind_costs_for_position(
+            total_debt_weth=float(self.position.total_debt_weth),
+            n_loops=int(self.position.n_loops),
+            terminal_depeg=terminal_depeg,
+            terminal_vol=terminal_vol,
+            exit_mask=exit_mask,
+        )
+
+    def _path_unwind_costs_for_position(
+        self,
+        *,
+        total_debt_weth: float,
+        n_loops: int,
+        terminal_depeg: np.ndarray,
+        terminal_vol: np.ndarray,
+        exit_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Approximate per-path unwind costs for a candidate loop position."""
+        position_size = float(total_debt_weth)
         liq_depth = np.maximum(
             float(self.curve_pool.pool_depth_eth)
             * np.clip(terminal_depeg, 0.10, 1.0)
@@ -1718,7 +2185,7 @@ class Dashboard:
         )
         slippage_cost = (position_size * position_size) / (2.0 * liq_depth)
 
-        tx_count = max(int(np.ceil(self.position.n_loops / 2.0)), 1)
+        tx_count = max(int(np.ceil(int(n_loops) / 2.0)), 1)
         gas_cost = (
             self.base_gas_price_gwei
             * (1.0 + terminal_vol)
@@ -1728,6 +2195,2360 @@ class Dashboard:
         )
         total = slippage_cost + gas_cost
         return np.where(exit_mask, total, 0.0)
+
+    @staticmethod
+    def _compound_debt_paths(initial_debt: float, borrow_rate_paths: np.ndarray, dt: float) -> np.ndarray:
+        """Compound variable-rate debt using the same discrete accrual as HF paths."""
+        rates = np.asarray(borrow_rate_paths, dtype=float)
+        debt = np.full_like(rates, float(initial_debt), dtype=float)
+        for col in range(1, rates.shape[1]):
+            debt[:, col] = debt[:, col - 1] * (1.0 + np.maximum(rates[:, col - 1], 0.0) * dt)
+        return debt
+
+    @staticmethod
+    def _conditional_summary(values: np.ndarray) -> dict[str, float | int | None]:
+        """Summary stats for possibly empty conditional samples."""
+        arr = np.asarray(values, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return {
+                "count": 0,
+                "mean": None,
+                "p50": None,
+                "p95": None,
+                "max": None,
+            }
+        return {
+            "count": int(arr.size),
+            "mean": float(np.mean(arr)),
+            "p50": float(np.percentile(arr, 50.0)),
+            "p95": float(np.percentile(arr, 95.0)),
+            "max": float(np.max(arr)),
+        }
+
+    @staticmethod
+    def _piecewise_relative_path(points: list[tuple[float, float]], n_cols: int) -> np.ndarray:
+        """Build a deterministic relative price path from fractional-time anchors."""
+        if n_cols <= 1:
+            return np.array([float(points[-1][1])], dtype=float)
+        ordered = sorted((float(x), float(y)) for x, y in points)
+        xp = np.array([np.clip(x, 0.0, 1.0) for x, _ in ordered], dtype=float)
+        yp = np.array([max(y, np.finfo(float).eps) for _, y in ordered], dtype=float)
+        # Deduplicate x anchors by keeping the last supplied value.
+        unique_x = []
+        unique_y = []
+        for x, y in zip(xp, yp):
+            if unique_x and abs(x - unique_x[-1]) <= 1e-12:
+                unique_y[-1] = y
+            else:
+                unique_x.append(float(x))
+                unique_y.append(float(y))
+        grid = np.linspace(0.0, 1.0, n_cols)
+        return np.interp(grid, unique_x, unique_y)
+
+    def _liquidation_close_factor_array(
+        self,
+        hf_values: np.ndarray,
+        *,
+        debt_value_usd: np.ndarray | None = None,
+        collateral_value_usd: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """
+        Aave-style close factor tiering for the loop position.
+
+        The HF tier uses the configured eMode close factors. The optional dust
+        check follows the public Aave app/help rule for small collateral/debt
+        values and is surfaced in the output as a modeling assumption.
+        """
+        hf = np.asarray(hf_values, dtype=float)
+        eligible = hf < 1.0
+        close = np.zeros_like(hf, dtype=float)
+        threshold = float(self.params.get("close_factor_hf_threshold", 0.95))
+        full = eligible & (hf <= threshold)
+        if debt_value_usd is not None and collateral_value_usd is not None:
+            min_usd = float(self.params.get("liquidation_dust_full_close_usd", 2_000.0))
+            debt_usd = np.asarray(debt_value_usd, dtype=float)
+            coll_usd = np.asarray(collateral_value_usd, dtype=float)
+            full = full | (eligible & ((debt_usd < min_usd) | (coll_usd < min_usd)))
+        normal = eligible & ~full
+        close[normal] = float(self.emode.close_factor_normal)
+        close[full] = float(self.emode.close_factor_full)
+        return close
+
+    def _liquidation_price_ladder(
+        self,
+        *,
+        debt_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        eth_usd_paths: np.ndarray,
+    ) -> dict[str, Any]:
+        """Current and terminal ETH/USD prices where the position reaches HF levels."""
+        levels = tuple(
+            float(v)
+            for v in self.params.get(
+                "liquidation_ladder_hf_levels",
+                DEFAULT_LIQUIDATION_LADDER_HF_LEVELS,
+            )
+        )
+        entry_price = float(self.market.eth_usd_price)
+        collateral_units = float(self.position.total_collateral_wsteth)
+        lt = float(self.position.lt)
+        current_exchange_rate = float(self.wsteth.wsteth_steth_rate)
+
+        rows = []
+        if self.debt_mode == "stablecoin":
+            debt_now = float(self.position.total_debt_stable or 0.0)
+            denominator_now = max(collateral_units * current_exchange_rate * lt, np.finfo(float).eps)
+            terminal_debt = np.asarray(debt_paths[:, -1], dtype=float)
+            terminal_exchange = np.asarray(exchange_rate_paths[:, -1], dtype=float)
+            denominator_terminal = np.maximum(
+                collateral_units * terminal_exchange * lt,
+                np.finfo(float).eps,
+            )
+            for level in levels:
+                price_now = level * debt_now / denominator_now
+                terminal_thresholds = level * terminal_debt / denominator_terminal
+                close_factor = (
+                    0.0
+                    if level >= 1.0
+                    else (
+                        float(self.emode.close_factor_full)
+                        if level <= float(self.params.get("close_factor_hf_threshold", 0.95))
+                        else float(self.emode.close_factor_normal)
+                    )
+                )
+                rows.append(
+                    {
+                        "hf": level,
+                        "eth_usd_now": float(price_now),
+                        "move_from_entry_pct": float((price_now / entry_price - 1.0) * 100.0),
+                        "terminal_threshold_eth_usd_p50": float(np.percentile(terminal_thresholds, 50.0)),
+                        "terminal_threshold_eth_usd_p95": float(np.percentile(terminal_thresholds, 95.0)),
+                        "aave_close_factor_if_below": close_factor,
+                    }
+                )
+            status = "available"
+            driver = "ETH/USD collateral value, wstETH exchange rate, debt accrual, LT"
+        else:
+            debt_now = float(self.position.total_debt_weth)
+            denominator_now = max(collateral_units * lt, np.finfo(float).eps)
+            terminal_debt = np.asarray(debt_paths[:, -1], dtype=float)
+            denominator_terminal = np.maximum(collateral_units * lt, np.finfo(float).eps)
+            for level in levels:
+                exchange_rate_now = level * debt_now / denominator_now
+                terminal_thresholds = level * terminal_debt / denominator_terminal
+                rows.append(
+                    {
+                        "hf": level,
+                        "eth_usd_now": None,
+                        "move_from_entry_pct": None,
+                        "required_wsteth_exchange_rate_now": float(exchange_rate_now),
+                        "terminal_required_wsteth_exchange_rate_p50": float(
+                            np.percentile(terminal_thresholds, 50.0)
+                        ),
+                        "terminal_required_wsteth_exchange_rate_p95": float(
+                            np.percentile(terminal_thresholds, 95.0)
+                        ),
+                        "aave_close_factor_if_below": (
+                            0.0
+                            if level >= 1.0
+                            else (
+                                float(self.emode.close_factor_full)
+                                if level <= float(self.params.get("close_factor_hf_threshold", 0.95))
+                                else float(self.emode.close_factor_normal)
+                            )
+                        ),
+                    }
+                )
+            status = "eth_usd_not_applicable"
+            driver = "wstETH exchange rate, debt accrual, LT; ETH/USD cancels for WETH debt"
+
+        current_price = float(eth_usd_paths[0, 0])
+        current_hf = float(self.position.health_factor())
+        return {
+            "status": status,
+            "driver": driver,
+            "entry_eth_usd": entry_price,
+            "current_path_eth_usd": current_price,
+            "current_health_factor": current_hf,
+            "levels": rows,
+            "assumptions": {
+                "close_factor_hf_threshold": float(self.params.get("close_factor_hf_threshold", 0.95)),
+                "normal_close_factor": float(self.emode.close_factor_normal),
+                "full_close_factor": float(self.emode.close_factor_full),
+                "dust_full_close_usd": float(self.params.get("liquidation_dust_full_close_usd", 2_000.0)),
+            },
+        }
+
+    def _liquidation_loss_report(
+        self,
+        *,
+        hf_paths: np.ndarray,
+        debt_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        eth_usd_paths: np.ndarray,
+        first_hf_breach: np.ndarray,
+    ) -> dict[str, Any]:
+        """Protocol-faithful first-liquidation approximation for the loop position."""
+        first = np.asarray(first_hf_breach, dtype=int)
+        breached = first >= 0
+        n_paths = int(first.shape[0])
+        if n_paths == 0:
+            return {"status": "unavailable", "reason": "no paths"}
+
+        path_idx = np.arange(n_paths)
+        safe_step = np.clip(np.where(breached, first, 0), 0, hf_paths.shape[1] - 1)
+        hf_at = np.asarray(hf_paths[path_idx, safe_step], dtype=float)
+        debt_at = np.asarray(debt_paths[path_idx, safe_step], dtype=float)
+        exchange_at = np.asarray(exchange_rate_paths[path_idx, safe_step], dtype=float)
+        eth_usd_at = np.asarray(eth_usd_paths[path_idx, safe_step], dtype=float)
+        collateral_units_before = float(self.position.total_collateral_wsteth)
+        bonus = float(max(self.position.bonus, 0.0))
+
+        collateral_value_eth = collateral_units_before * exchange_at
+        collateral_value_usd = collateral_value_eth * eth_usd_at
+        if self.debt_mode == "stablecoin":
+            debt_value_usd = debt_at
+            debt_value_eth = debt_at / np.maximum(eth_usd_at, np.finfo(float).eps)
+            collateral_price_debt = exchange_at * eth_usd_at
+        else:
+            debt_value_eth = debt_at
+            debt_value_usd = debt_at * eth_usd_at
+            collateral_price_debt = exchange_at
+
+        close_factor = self._liquidation_close_factor_array(
+            hf_at,
+            debt_value_usd=debt_value_usd,
+            collateral_value_usd=collateral_value_usd,
+        )
+        requested_repay = debt_at * close_factor
+        max_repay = collateral_units_before * collateral_price_debt / max(1.0 + bonus, np.finfo(float).eps)
+        debt_repaid = np.where(breached, np.minimum(requested_repay, max_repay), 0.0)
+        collateral_seized_wsteth = np.divide(
+            debt_repaid * (1.0 + bonus),
+            np.maximum(collateral_price_debt, np.finfo(float).eps),
+        )
+        collateral_seized_wsteth = np.where(
+            breached,
+            np.minimum(collateral_seized_wsteth, collateral_units_before),
+            0.0,
+        )
+        remaining_collateral = np.maximum(collateral_units_before - collateral_seized_wsteth, 0.0)
+        remaining_debt = np.maximum(debt_at - debt_repaid, 0.0)
+        if self.debt_mode == "stablecoin":
+            hf_after = (
+                remaining_collateral
+                * exchange_at
+                * eth_usd_at
+                * float(self.position.lt)
+                / np.maximum(remaining_debt, np.finfo(float).eps)
+            )
+            debt_repaid_eth = debt_repaid / np.maximum(eth_usd_at, np.finfo(float).eps)
+            bonus_loss_eth = debt_repaid_eth * bonus
+            debt_repaid_native_key = "debt_repaid_usd"
+        else:
+            hf_after = (
+                remaining_collateral
+                * exchange_at
+                * float(self.position.lt)
+                / np.maximum(remaining_debt, np.finfo(float).eps)
+            )
+            debt_repaid_eth = debt_repaid
+            bonus_loss_eth = debt_repaid * bonus
+            debt_repaid_native_key = "debt_repaid_weth"
+        hf_after = np.where(remaining_debt <= 0.0, np.inf, hf_after)
+
+        conditional = breached
+        return {
+            "status": "available",
+            "breach_count": int(np.sum(breached)),
+            "breach_probability_pct": float(np.mean(breached) * 100.0),
+            "close_factor_usage": {
+                "normal_50pct_count": int(
+                    np.sum(conditional & np.isclose(close_factor, float(self.emode.close_factor_normal)))
+                ),
+                "full_100pct_count": int(
+                    np.sum(conditional & np.isclose(close_factor, float(self.emode.close_factor_full)))
+                ),
+            },
+            "time_to_liquidation_days": self._conditional_summary(
+                self.grid.time_grid_days[safe_step[conditional]]
+            ),
+            debt_repaid_native_key: self._conditional_summary(debt_repaid[conditional]),
+            "debt_repaid_eth_equivalent": self._conditional_summary(debt_repaid_eth[conditional]),
+            "collateral_seized_wsteth": self._conditional_summary(
+                collateral_seized_wsteth[conditional]
+            ),
+            "protocol_bonus_loss_eth": self._conditional_summary(bonus_loss_eth[conditional]),
+            "remaining_hf_after_first_liquidation": self._conditional_summary(
+                hf_after[conditional & np.isfinite(hf_after)]
+            ),
+            "assumptions": {
+                "liquidation_bonus": bonus,
+                "close_factor_hf_threshold": float(self.params.get("close_factor_hf_threshold", 0.95)),
+                "normal_close_factor": float(self.emode.close_factor_normal),
+                "full_close_factor": float(self.emode.close_factor_full),
+                "dust_full_close_usd": float(self.params.get("liquidation_dust_full_close_usd", 2_000.0)),
+                "modeled_event": "first_liquidation_only",
+            },
+        }
+
+    def _evaluate_deterministic_position(
+        self,
+        *,
+        position: LoopedPosition,
+        relative_eth_path: np.ndarray,
+        borrow_rate: float,
+        dt: float,
+    ) -> dict[str, Any]:
+        """Evaluate a deterministic ETH path against a candidate position."""
+        rel = np.asarray(relative_eth_path, dtype=float).reshape(1, -1)
+        n_cols = rel.shape[1]
+        borrow = np.full((1, n_cols), max(float(borrow_rate), 0.0), dtype=float)
+        exchange = position._oracle_exchange_rate_paths(1, n_cols, dt)
+        steth = np.ones((1, n_cols), dtype=float)
+        eth_usd = rel * max(float(self.market.eth_usd_price), np.finfo(float).eps)
+        pnl = position.pnl_paths(
+            borrow,
+            steth,
+            exchange_rate_paths=exchange,
+            eth_usd_paths=eth_usd,
+            dt=dt,
+        )
+        hf = position.health_factor_paths(
+            borrow,
+            dt=dt,
+            exchange_rate_paths=exchange,
+            eth_usd_paths=eth_usd,
+        )
+        return {
+            "terminal_eth_return_pct": float((rel[0, -1] - 1.0) * 100.0),
+            "min_eth_return_pct": float((np.min(rel[0]) - 1.0) * 100.0),
+            "max_eth_return_pct": float((np.max(rel[0]) - 1.0) * 100.0),
+            "terminal_pnl_eth": float(pnl[0, -1]),
+            "min_health_factor": float(np.min(hf[0])),
+            "terminal_health_factor": float(hf[0, -1]),
+            "liquidated": bool(np.any(hf[0] < 1.0)),
+        }
+
+    def _historical_replay_report(self, *, borrow_rate: float) -> dict[str, Any]:
+        """Replay the candidate position through rolling historical ETH windows."""
+        prices = np.asarray(self.eth_price_history or [], dtype=float)
+        prices = prices[np.isfinite(prices) & (prices > 0.0)]
+        horizon_steps = max(int(round(float(self.grid.horizon_days))), 1)
+        if prices.size < horizon_steps + 2:
+            return {
+                "status": "unavailable",
+                "reason": "insufficient_eth_price_history",
+                "observations": int(prices.size),
+                "required_observations": int(horizon_steps + 2),
+            }
+
+        windows = []
+        for start in range(0, int(prices.size) - horizon_steps):
+            window = prices[start:start + horizon_steps + 1]
+            if window.size != horizon_steps + 1 or window[0] <= 0.0:
+                continue
+            windows.append(window / window[0])
+        if not windows:
+            return {
+                "status": "unavailable",
+                "reason": "no_valid_rolling_windows",
+                "observations": int(prices.size),
+            }
+
+        rel = np.asarray(windows, dtype=float)
+        n_windows, n_cols = rel.shape
+        borrow = np.full((n_windows, n_cols), max(float(borrow_rate), 0.0), dtype=float)
+        exchange = self.position._oracle_exchange_rate_paths(n_windows, n_cols, 1.0 / 365.0)
+        steth = np.ones((n_windows, n_cols), dtype=float)
+        eth_usd = rel * max(float(self.market.eth_usd_price), np.finfo(float).eps)
+        pnl = self.position.pnl_paths(
+            borrow,
+            steth,
+            exchange_rate_paths=exchange,
+            eth_usd_paths=eth_usd,
+            dt=1.0 / 365.0,
+        )
+        hf = self.position.health_factor_paths(
+            borrow,
+            dt=1.0 / 365.0,
+            exchange_rate_paths=exchange,
+            eth_usd_paths=eth_usd,
+        )
+        terminal_pnl = pnl[:, -1]
+        min_hf = np.min(hf, axis=1)
+        terminal_return = rel[:, -1] - 1.0
+        min_return = np.min(rel, axis=1) - 1.0
+        worst_idx = np.argsort(terminal_pnl)[: min(5, n_windows)]
+        return {
+            "status": "available",
+            "window_count": int(n_windows),
+            "window_days": int(horizon_steps),
+            "terminal_pnl_eth": {
+                k: float(v) for k, v in self._summary_stats(terminal_pnl).items()
+            },
+            "empirical_var_95_eth": float(self.risk_metrics.var(terminal_pnl, 0.95)),
+            "empirical_cvar_95_eth": float(self.risk_metrics.cvar(terminal_pnl, 0.95)),
+            "empirical_var_99_eth": float(self.risk_metrics.var(terminal_pnl, 0.99)),
+            "empirical_cvar_99_eth": float(self.risk_metrics.cvar(terminal_pnl, 0.99)),
+            "terminal_return_pct": {
+                k: float(v * 100.0) for k, v in self._summary_stats(terminal_return).items()
+            },
+            "max_drawdown_return_pct": {
+                k: float(v * 100.0) for k, v in self._summary_stats(min_return).items()
+            },
+            "min_health_factor": {
+                k: float(v) for k, v in self._summary_stats(min_hf).items()
+            },
+            "prob_hf_lt_1_pct": float(np.mean(min_hf < 1.0) * 100.0),
+            "worst_windows": [
+                {
+                    "start_index": int(idx),
+                    "terminal_return_pct": float(terminal_return[idx] * 100.0),
+                    "min_return_pct": float(min_return[idx] * 100.0),
+                    "terminal_pnl_eth": float(terminal_pnl[idx]),
+                    "min_health_factor": float(min_hf[idx]),
+                }
+                for idx in worst_idx
+            ],
+            "assumptions": {
+                "borrow_rate": float(borrow_rate),
+                "steth_eth_ratio": 1.0,
+                "window_spacing": "daily_price_history",
+            },
+        }
+
+    def _regime_scenario_report(self, *, borrow_rate: float) -> dict[str, Any]:
+        """Evaluate named deterministic regimes for pre-trade review."""
+        n_cols = int(self.grid.n_cols)
+        target_ratio = (
+            float(self.eth_mean_reversion_target_ratio)
+            if self.eth_mean_reversion_target_ratio is not None
+            else (1.0 + float(self.eth_expected_return or 0.20))
+        )
+        target_ratio = max(target_ratio, 1.01)
+        hf1_price = None
+        if self.debt_mode == "stablecoin":
+            denom = max(
+                float(self.position.total_collateral_wsteth)
+                * float(self.wsteth.wsteth_steth_rate)
+                * float(self.position.lt),
+                np.finfo(float).eps,
+            )
+            hf1_price = float(self.position.total_debt_stable or 0.0) / denom
+        wick_ratio = (
+            max(hf1_price / max(float(self.market.eth_usd_price), np.finfo(float).eps) * 0.98, 0.35)
+            if hf1_price is not None
+            else 0.75
+        )
+        regimes = {
+            "bull_mean_reversion": [(0.0, 1.0), (1.0, target_ratio)],
+            "sideways_chop": [(0.0, 1.0), (0.25, 0.95), (0.50, 1.04), (0.75, 0.97), (1.0, 1.01)],
+            "failed_breakout": [(0.0, 1.0), (0.35, min(target_ratio, 1.15)), (1.0, 0.90)],
+            "fast_liquidation_wick": [(0.0, 1.0), (0.12, wick_ratio), (1.0, max(wick_ratio * 1.08, 0.80))],
+            "slow_bleed": [(0.0, 1.0), (1.0, 0.80)],
+            "rally_then_retrace": [(0.0, 1.0), (0.55, target_ratio), (1.0, 1.05)],
+        }
+        return {
+            "status": "available",
+            "scenarios": [
+                {
+                    "name": name,
+                    **self._evaluate_deterministic_position(
+                        position=self.position,
+                        relative_eth_path=self._piecewise_relative_path(points, n_cols),
+                        borrow_rate=borrow_rate,
+                        dt=float(self.grid.dt_years),
+                    ),
+                }
+                for name, points in regimes.items()
+            ],
+            "assumptions": {
+                "scenario_set": list(DEFAULT_TRADE_REGIME_NAMES),
+                "target_ratio": float(target_ratio),
+                "fast_wick_uses_hf1_price": hf1_price is not None,
+            },
+        }
+
+    def _estimate_entry_execution_for_position(self, position: LoopedPosition) -> dict[str, Any]:
+        """Reduced-form entry execution model for recursive supply/borrow/swap loops."""
+        base_slippage_bps = float(self.params.get("entry_swap_base_slippage_bps", 8.0))
+        supply_gas = int(self.params.get("entry_supply_gas_units", 180_000))
+        borrow_gas = int(self.params.get("entry_borrow_gas_units", 260_000))
+        swap_gas = int(self.params.get("entry_swap_gas_units", 350_000))
+        approval_gas = int(self.params.get("entry_approval_gas_units", 80_000))
+        route = str(self.params.get("entry_swap_route", "aggregator_reduced_form"))
+
+        per_loop = []
+        total_slippage_eth = 0.0
+        total_notional_eth = 0.0
+        for idx in range(1, int(position.n_loops) + 1):
+            borrow_eth_equiv = float(position.capital_eth) * (float(position.ltv) ** idx)
+            slippage_bps = max(
+                base_slippage_bps,
+                float(self.unwind_estimator.slippage_model.small_trade_slippage(borrow_eth_equiv)) * 10_000.0,
+            )
+            slippage_eth = borrow_eth_equiv * slippage_bps / 10_000.0
+            total_slippage_eth += slippage_eth
+            total_notional_eth += borrow_eth_equiv
+            per_loop.append(
+                {
+                    "loop": idx,
+                    "borrow_eth_equivalent": borrow_eth_equiv,
+                    "borrow_usd": borrow_eth_equiv * float(self.market.eth_usd_price)
+                    if position.debt_mode == "stablecoin"
+                    else None,
+                    "swap_slippage_bps": slippage_bps,
+                    "swap_slippage_eth": slippage_eth,
+                }
+            )
+
+        gas_units = int(position.n_loops) * (supply_gas + borrow_gas + swap_gas) + approval_gas
+        gas_eth = gas_units * float(self.base_gas_price_gwei) / 1e9
+        total_cost_eth = total_slippage_eth + gas_eth
+        total_cost_bps = (
+            total_cost_eth / max(total_notional_eth, np.finfo(float).eps) * 10_000.0
+            if total_notional_eth > 0.0
+            else 0.0
+        )
+        return {
+            "status": "available",
+            "route_model": route,
+            "quote_freshness": "not_live_quoted",
+            "total_loop_notional_eth": total_notional_eth,
+            "swap_slippage_eth": total_slippage_eth,
+            "gas_eth": gas_eth,
+            "total_entry_cost_eth": total_cost_eth,
+            "total_entry_cost_bps": total_cost_bps,
+            "per_loop": per_loop,
+            "assumptions": {
+                "entry_swap_base_slippage_bps": base_slippage_bps,
+                "gas_price_gwei": float(self.base_gas_price_gwei),
+                "supply_gas_units": supply_gas,
+                "borrow_gas_units": borrow_gas,
+                "swap_gas_units": swap_gas,
+                "approval_gas_units": approval_gas,
+                "slippage_tolerance_bps": int(self.zerox_slippage_bps),
+            },
+        }
+
+    def _estimate_unwind_execution_for_position(
+        self,
+        position: LoopedPosition,
+        *,
+        stress_multiplier: float,
+    ) -> dict[str, Any]:
+        """Reduced-form full-exit cost for optimizer constraints."""
+        debt_eth_equivalent = float(position.total_debt_weth)
+        stress = float(np.clip(stress_multiplier, 0.05, 1.0))
+        cost = self.unwind_estimator.slippage_model.total_unwind_cost(
+            portfolio_pct=1.0,
+            position_size_eth=debt_eth_equivalent,
+            gas_price_gwei=float(self.base_gas_price_gwei),
+            stress_multiplier=stress,
+        )
+        total_eth = float(cost.get("total_eth", 0.0))
+        total_bps = (
+            total_eth / max(debt_eth_equivalent, np.finfo(float).eps) * 10_000.0
+            if debt_eth_equivalent > 0.0
+            else 0.0
+        )
+        return {
+            "status": "available",
+            "route_model": "curve_reduced_form_full_exit",
+            "quote_freshness": "not_live_quoted",
+            "debt_eth_equivalent": debt_eth_equivalent,
+            "stress_multiplier": stress,
+            "slippage_eth": float(cost.get("slippage_eth", 0.0)),
+            "gas_eth": float(cost.get("gas_eth", 0.0)),
+            "total_unwind_cost_eth": total_eth,
+            "total_unwind_cost_bps": total_bps,
+            "swap_slippage_bps": float(cost.get("slippage_bps", 0.0)),
+            "assumptions": {
+                "gas_price_gwei": float(self.base_gas_price_gwei),
+                "stress_multiplier": stress,
+                "portfolio_pct": 1.0,
+            },
+        }
+
+    def _exit_unwind_report(
+        self,
+        *,
+        debt_paths: np.ndarray,
+        borrow_rate: float,
+    ) -> dict[str, Any]:
+        """Model current and target-price protocol exits for the loop."""
+        current_price = float(self.market.eth_usd_price)
+        target_price = (
+            float(self.eth_mean_reversion_target_usd)
+            if self.eth_mean_reversion_target_usd is not None
+            else current_price * (1.0 + float(self.eth_expected_return or 0.0))
+        )
+        target_price = max(target_price, np.finfo(float).eps)
+        debt_now = (
+            float(self.position.total_debt_stable or 0.0)
+            if self.debt_mode == "stablecoin"
+            else float(self.position.total_debt_weth)
+        )
+        debt_terminal_p50 = float(np.percentile(debt_paths[:, -1], 50.0))
+        flash_premium_bps = float(self.params.get("flashloan_premium_bps", 5.0))
+        iterative_gas_units = int(self.params.get("exit_iterative_gas_units_per_loop", 820_000))
+        flash_gas_units = int(self.params.get("exit_flashloan_gas_units", 1_100_000))
+
+        def _snapshot(label: str, eth_usd: float, debt_amount: float) -> dict[str, Any]:
+            debt_eth = (
+                debt_amount / max(eth_usd, np.finfo(float).eps)
+                if self.debt_mode == "stablecoin"
+                else debt_amount
+            )
+            wsteth_price_eth = max(
+                float(self.wsteth.wsteth_steth_rate) * float(self.market.steth_eth_price),
+                np.finfo(float).eps,
+            )
+            slippage_frac = float(self.unwind_estimator.slippage_model.estimate_slippage(debt_eth))
+            wsteth_to_sell = debt_eth / max(wsteth_price_eth * (1.0 - slippage_frac), np.finfo(float).eps)
+            iterative_gas_eth = (
+                iterative_gas_units * max(int(self.position.n_loops), 1) * float(self.base_gas_price_gwei) / 1e9
+            )
+            flash_gas_eth = flash_gas_units * float(self.base_gas_price_gwei) / 1e9
+            flash_premium_eth = debt_eth * flash_premium_bps / 10_000.0
+            remaining_wsteth = max(float(self.position.total_collateral_wsteth) - wsteth_to_sell, 0.0)
+            remaining_eth = remaining_wsteth * float(self.wsteth.wsteth_steth_rate)
+            return {
+                "label": label,
+                "eth_usd": eth_usd,
+                "debt_amount": debt_amount,
+                "debt_asset": self.debt_asset,
+                "debt_eth_equivalent": debt_eth,
+                "estimated_wsteth_to_sell": wsteth_to_sell,
+                "estimated_swap_slippage_bps": slippage_frac * 10_000.0,
+                "iterative_unwind_gas_eth": iterative_gas_eth,
+                "flashloan_unwind_gas_eth": flash_gas_eth,
+                "flashloan_premium_eth": flash_premium_eth,
+                "remaining_collateral_wsteth_after_repay": remaining_wsteth,
+                "remaining_collateral_eth_after_repay": remaining_eth,
+            }
+
+        return {
+            "status": "available",
+            "protocol_sequence": [
+                "sell/route enough wstETH collateral value to obtain the debt asset",
+                "repay debt on Aave",
+                "withdraw freed wstETH collateral",
+                "repeat iteratively or use flash liquidity to collapse the loop atomically",
+            ],
+            "current_close": _snapshot("current_close", current_price, debt_now),
+            "target_close": _snapshot("target_close", target_price, debt_terminal_p50),
+            "assumptions": {
+                "borrow_rate_for_terminal_debt": float(borrow_rate),
+                "flashloan_premium_bps": flash_premium_bps,
+                "exit_iterative_gas_units_per_loop": iterative_gas_units,
+                "exit_flashloan_gas_units": flash_gas_units,
+                "gas_price_gwei": float(self.base_gas_price_gwei),
+            },
+        }
+
+    def _borrow_rate_stress_report(self, *, debt_paths: np.ndarray) -> dict[str, Any]:
+        """Stress borrow APY and quantify ETH-denominated PnL drag."""
+        current = float(self._current_position_borrow_rate())
+        horizon_years = max(float(self.grid.horizon_days) / 365.0, np.finfo(float).eps)
+        terminal_eth_p50 = (
+            float(self.eth_mean_reversion_target_usd)
+            if self.eth_mean_reversion_target_usd is not None
+            else float(self.market.eth_usd_price)
+        )
+        terminal_eth_p50 = max(terminal_eth_p50, np.finfo(float).eps)
+        initial_debt = (
+            float(self.position.total_debt_stable or 0.0)
+            if self.debt_mode == "stablecoin"
+            else float(self.position.total_debt_weth)
+        )
+        stresses = []
+        if self.debt_mode == "stablecoin" and self.stablecoin_rate_model is not None:
+            util_levels = sorted(
+                set(
+                    round(float(v), 6)
+                    for v in [
+                        float(self.stablecoin_reserve.current_utilization),
+                        float(self.stablecoin_reserve.rate_params.optimal_utilization),
+                        0.95,
+                        0.99,
+                    ]
+                    if 0.0 <= float(v) <= 0.999
+                )
+            )
+            for util in util_levels:
+                rate = float(self.stablecoin_rate_model.borrow_rate(util))
+                debt_stressed = initial_debt * np.exp(rate * horizon_years)
+                debt_base = initial_debt * np.exp(current * horizon_years)
+                extra_native = debt_stressed - debt_base
+                stresses.append(
+                    {
+                        "label": f"util_{util:.3f}",
+                        "utilization": util,
+                        "borrow_apy_pct": rate * 100.0,
+                        "extra_debt_asset": extra_native,
+                        "extra_cost_eth": extra_native / terminal_eth_p50,
+                    }
+                )
+            method = "aave_two_slope_utilization_grid"
+        else:
+            rates = sorted(
+                set(
+                    round(float(v), 8)
+                    for v in [
+                        current,
+                        current + 0.05,
+                        current + 0.10,
+                        max(current * 2.0, current + 0.15),
+                    ]
+                )
+            )
+            for rate in rates:
+                debt_stressed = initial_debt * np.exp(rate * horizon_years)
+                debt_base = initial_debt * np.exp(current * horizon_years)
+                extra_native = debt_stressed - debt_base
+                stresses.append(
+                    {
+                        "label": f"apy_{rate * 100.0:.2f}pct",
+                        "utilization": None,
+                        "borrow_apy_pct": rate * 100.0,
+                        "extra_debt_asset": extra_native,
+                        "extra_cost_eth": (
+                            extra_native / terminal_eth_p50
+                            if self.debt_mode == "stablecoin"
+                            else extra_native
+                        ),
+                    }
+                )
+            method = "manual_rate_grid"
+        return {
+            "status": "available",
+            "method": method,
+            "current_borrow_apy_pct": current * 100.0,
+            "path_terminal_debt": {
+                k: float(v) for k, v in self._summary_stats(debt_paths[:, -1]).items()
+            },
+            "stresses": stresses,
+        }
+
+    def _oracle_risk_report(
+        self,
+        *,
+        hf_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        eth_usd_paths: np.ndarray,
+        steth_market_paths: np.ndarray,
+    ) -> dict[str, Any]:
+        """Compare Aave oracle collateral valuation to market-exit valuation."""
+        oracle_collateral_usd = (
+            float(self.position.total_collateral_wsteth)
+            * exchange_rate_paths
+            * eth_usd_paths
+        )
+        market_collateral_usd = oracle_collateral_usd * steth_market_paths
+        gap_pct = np.divide(
+            oracle_collateral_usd - market_collateral_usd,
+            np.maximum(oracle_collateral_usd, np.finfo(float).eps),
+        )
+        market_shadow_hf = hf_paths * steth_market_paths
+        return {
+            "status": "available",
+            "aave_hf_driver": (
+                "ETH/USD oracle plus wstETH exchange rate for stablecoin debt"
+                if self.debt_mode == "stablecoin"
+                else "wstETH exchange rate and debt accrual; ETH/USD cancels for WETH debt"
+            ),
+            "steth_market_depeg_affects": "PnL and exit liquidity, not Aave HF for wstETH oracle pricing",
+            "terminal_oracle_vs_market_gap_pct": {
+                k: float(v * 100.0) for k, v in self._summary_stats(gap_pct[:, -1]).items()
+            },
+            "max_oracle_vs_market_gap_pct": {
+                k: float(v * 100.0) for k, v in self._summary_stats(np.max(gap_pct, axis=1)).items()
+            },
+            "market_shadow_min_hf": {
+                k: float(v) for k, v in self._summary_stats(np.min(market_shadow_hf, axis=1)).items()
+            },
+            "oracle_min_hf": {
+                k: float(v) for k, v in self._summary_stats(np.min(hf_paths, axis=1)).items()
+            },
+            "not_modeled": [
+                "oracle outage or stale-feed halt",
+                "governance replacement of oracle source",
+            ],
+        }
+
+    def _optimizer_constraints(self) -> dict[str, float]:
+        """Resolve shared pre-trade optimizer constraints."""
+        return {
+            "max_prob_hf_lt_1_pct": float(
+                self.params.get(
+                    "opt_max_prob_hf_lt_1_pct",
+                    DEFAULT_OPT_MAX_PROB_HF_LT_1_PCT,
+                )
+            ),
+            "min_start_health_factor": float(
+                self.params.get("opt_min_start_hf", DEFAULT_OPT_MIN_START_HF)
+            ),
+            "max_entry_cost_bps": float(
+                self.params.get("opt_max_entry_cost_bps", DEFAULT_OPT_MAX_ENTRY_COST_BPS)
+            ),
+            "max_unwind_cost_bps": float(
+                self.params.get("opt_max_unwind_cost_bps", DEFAULT_OPT_MAX_UNWIND_COST_BPS)
+            ),
+            "unwind_stress_multiplier": float(
+                np.clip(
+                    self.params.get(
+                        "opt_unwind_stress_multiplier",
+                        DEFAULT_OPT_UNWIND_STRESS_MULTIPLIER,
+                    ),
+                    0.05,
+                    1.0,
+                )
+            ),
+        }
+
+    def _optimization_loop_bounds(self) -> tuple[int, int]:
+        """Resolve loop-count range used by loop and entry optimizers."""
+        max_loops = int(self.params.get("optimization_max_loops", max(8, int(self.position.n_loops))))
+        min_loops = int(self.params.get("optimization_min_loops", 1))
+        min_loops = max(min_loops, 1)
+        max_loops = max(max_loops, min_loops)
+        return min_loops, max_loops
+
+    def _loop_optimization_report(
+        self,
+        *,
+        borrow_rate_paths: np.ndarray,
+        steth_market_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        eth_usd_paths: np.ndarray,
+        terminal_execution_depeg: np.ndarray,
+        terminal_vol: np.ndarray,
+        dt: float,
+    ) -> dict[str, Any]:
+        """Evaluate loop counts under explicit risk constraints."""
+        min_loops, max_loops = self._optimization_loop_bounds()
+        constraints = self._optimizer_constraints()
+        candidate_rows = []
+        for loops in range(min_loops, max_loops + 1):
+            candidate = LoopedPosition(
+                self.position.capital_eth,
+                loops,
+                emode=self.emode,
+                wsteth_params=self.wsteth,
+                debt_mode=self.debt_mode,
+                debt_asset=self.debt_asset,
+                initial_eth_usd_price=float(self.market.eth_usd_price),
+            )
+            pnl = candidate.pnl_paths(
+                borrow_rate_paths,
+                steth_market_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                eth_usd_paths=eth_usd_paths,
+                dt=dt,
+            )
+            hf = candidate.health_factor_paths(
+                borrow_rate_paths,
+                dt=dt,
+                exchange_rate_paths=exchange_rate_paths,
+                eth_usd_paths=eth_usd_paths,
+            )
+            first = self.risk_metrics.first_breach_step(hf, threshold=1.0)
+            liq_mask = first >= 0
+            unwind = self._path_unwind_costs_for_position(
+                total_debt_weth=float(candidate.total_debt_weth),
+                n_loops=int(candidate.n_loops),
+                terminal_depeg=terminal_execution_depeg,
+                terminal_vol=terminal_vol,
+                exit_mask=liq_mask,
+            )
+            pnl_net = pnl - liq_mask[:, None] * unwind[:, None]
+            terminal = pnl_net[:, -1]
+            entry_execution = self._estimate_entry_execution_for_position(candidate)
+            unwind_execution = self._estimate_unwind_execution_for_position(
+                candidate,
+                stress_multiplier=constraints["unwind_stress_multiplier"],
+            )
+            var95 = self.risk_metrics.var(terminal, 0.95)
+            cvar95 = self.risk_metrics.cvar(terminal, 0.95)
+            prob_hf = float(np.mean(np.min(hf, axis=1) < 1.0) * 100.0)
+            start_hf = float(candidate.health_factor())
+            entry_cost_bps = float(entry_execution["total_entry_cost_bps"])
+            unwind_cost_bps = float(unwind_execution["total_unwind_cost_bps"])
+            passes = (
+                prob_hf <= constraints["max_prob_hf_lt_1_pct"]
+                and start_hf >= constraints["min_start_health_factor"]
+                and entry_cost_bps <= constraints["max_entry_cost_bps"]
+                and unwind_cost_bps <= constraints["max_unwind_cost_bps"]
+            )
+            candidate_rows.append(
+                {
+                    "loops": loops,
+                    "leverage": float(candidate.leverage),
+                    "start_health_factor": start_hf,
+                    "total_debt_eth_equivalent": float(candidate.total_debt_weth),
+                    "total_debt_stable": (
+                        float(candidate.total_debt_stable)
+                        if candidate.total_debt_stable is not None
+                        else None
+                    ),
+                    "mean_pnl_eth": float(np.mean(terminal)),
+                    "p5_pnl_eth": float(np.percentile(terminal, 5.0)),
+                    "p50_pnl_eth": float(np.percentile(terminal, 50.0)),
+                    "p95_pnl_eth": float(np.percentile(terminal, 95.0)),
+                    "var95_eth": float(var95),
+                    "cvar95_eth": float(cvar95),
+                    "expected_log_growth": expected_log_growth(
+                        terminal, float(candidate.capital_eth)
+                    ),
+                    "prob_hf_lt_1_pct": prob_hf,
+                    "prob_profit_pct": float(np.mean(terminal > 0.0) * 100.0),
+                    "entry_cost_bps": entry_cost_bps,
+                    "entry_cost_eth": float(entry_execution["total_entry_cost_eth"]),
+                    "unwind_cost_bps": unwind_cost_bps,
+                    "unwind_cost_eth": float(unwind_execution["total_unwind_cost_eth"]),
+                    "passes_constraints": bool(passes),
+                }
+            )
+
+        passing = [row for row in candidate_rows if row["passes_constraints"]]
+        if passing:
+            best = max(passing, key=lambda row: row["mean_pnl_eth"])
+            recommendation_status = "constraints_satisfied"
+        else:
+            best = max(
+                candidate_rows,
+                key=lambda row: row["mean_pnl_eth"] - row["cvar95_eth"],
+            )
+            recommendation_status = "no_candidate_satisfied_all_constraints"
+        return {
+            "status": "available",
+            "objective": "maximize_mean_pnl_eth_subject_to_constraints",
+            "constraint_profile": "pre_trade_conservative",
+            "constraints": constraints,
+            "recommended_loops": int(best["loops"]),
+            "recommendation_status": recommendation_status,
+            "candidates": candidate_rows,
+        }
+
+    def _entry_sweep_target_price(self) -> float | None:
+        """Resolve the ETH/USD target used to rank entry candidates."""
+        explicit = self._resolve_optional_positive(
+            self.params.get("entry_sweep_target_usd"),
+            name="entry_sweep_target_usd",
+        )
+        if explicit is not None:
+            return explicit
+        if self.eth_mean_reversion_target_usd is not None:
+            return float(self.eth_mean_reversion_target_usd)
+        if self.eth_expected_return is not None:
+            return float(self.market.eth_usd_price) * (1.0 + float(self.eth_expected_return))
+        return None
+
+    def _price_action_raw_payload(self) -> Any:
+        """Resolve user-supplied or Deribit-derived price-action payload."""
+        if self.price_action_features is not None:
+            return self.price_action_features
+        if isinstance(self.market_regime_features, dict):
+            return self.market_regime_features.get("price_action")
+        return None
+
+    def _coerce_price_action_features(self) -> PriceActionFeatures | None:
+        raw = self._price_action_raw_payload()
+        if raw is None:
+            return None
+        if isinstance(raw, PriceActionFeatures):
+            return raw
+        if not isinstance(raw, dict):
+            return None
+        payload = dict(raw)
+        payload.setdefault("mark_price", float(self.market.eth_usd_price))
+        return PriceActionFeatures.from_mapping(payload)
+
+    def _price_action_report(self) -> dict[str, Any]:
+        """Summarize technical price action and generated levels when available."""
+        raw = self._price_action_raw_payload()
+        if raw is None:
+            return {
+                "status": "unavailable",
+                "reason": "price_action_ohlcv_not_provided",
+                "required_input": (
+                    "market_regime_features.price_action from Deribit OHLCV "
+                    "or params.price_action_features"
+                ),
+            }
+        try:
+            features = self._coerce_price_action_features()
+            if features is None:
+                raise ValueError("price action payload must be a dict or PriceActionFeatures")
+            return features.to_report()
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": str(exc),
+            }
+
+    def _price_action_entry_prices(self) -> list[float]:
+        """Candidate entry prices from price-action support/resistance levels."""
+        try:
+            features = self._coerce_price_action_features()
+        except Exception:
+            return []
+        if features is None:
+            return []
+        candidates = []
+        for row in features.entry_candidates():
+            price = self._resolve_optional_positive(
+                row.get("entry_eth_usd"),
+                name="price_action_entry_eth_usd",
+            )
+            if price is not None:
+                candidates.append(price)
+        return candidates
+
+    def _entry_sweep_prices(self) -> list[float]:
+        """Resolve candidate ETH/USD entry prices."""
+        raw_prices = self.params.get("entry_sweep_prices_usd")
+        if raw_prices is not None:
+            if isinstance(raw_prices, str):
+                raw_iter = [part.strip() for part in raw_prices.split(",") if part.strip()]
+            elif isinstance(raw_prices, (list, tuple, np.ndarray)):
+                raw_iter = list(raw_prices)
+            else:
+                raise ValueError("entry_sweep_prices_usd must be a comma string or list")
+            prices = [float(v) for v in raw_iter]
+        else:
+            min_price = self._resolve_optional_positive(
+                self.params.get("entry_sweep_min_usd"),
+                name="entry_sweep_min_usd",
+            )
+            max_price = self._resolve_optional_positive(
+                self.params.get("entry_sweep_max_usd"),
+                name="entry_sweep_max_usd",
+            )
+            step = self._resolve_optional_positive(
+                self.params.get("entry_sweep_step_usd"),
+                name="entry_sweep_step_usd",
+            )
+            current = float(self.market.eth_usd_price)
+            if min_price is None:
+                min_price = current * float(
+                    self.params.get(
+                        "entry_sweep_min_multiplier",
+                        DEFAULT_ENTRY_SWEEP_MIN_MULTIPLIER,
+                    )
+                )
+            if max_price is None:
+                max_price = current * float(
+                    self.params.get(
+                        "entry_sweep_max_multiplier",
+                        DEFAULT_ENTRY_SWEEP_MAX_MULTIPLIER,
+                    )
+                )
+            if max_price < min_price:
+                raise ValueError("entry_sweep_max_usd must be >= entry_sweep_min_usd")
+            if step is not None:
+                count = int(np.floor((max_price - min_price) / step)) + 1
+                prices = [min_price + idx * step for idx in range(max(count, 1))]
+                if prices[-1] < max_price - step * 1e-9:
+                    prices.append(max_price)
+            else:
+                points = int(self.params.get("entry_sweep_points", DEFAULT_ENTRY_SWEEP_POINTS))
+                points = int(np.clip(points, 2, 101))
+                prices = list(np.linspace(min_price, max_price, points))
+            if bool(self.params.get("entry_sweep_include_price_action_candidates", True)):
+                prices.extend(self._price_action_entry_prices())
+
+        cleaned = sorted(
+            {
+                round(float(price), 8)
+                for price in prices
+                if np.isfinite(float(price)) and float(price) > 0.0
+            }
+        )
+        if not cleaned:
+            raise ValueError("entry sweep requires at least one positive entry price")
+        max_prices = int(self.params.get("entry_sweep_max_prices", 101))
+        if len(cleaned) > max_prices:
+            raise ValueError(
+                f"entry sweep has {len(cleaned)} prices, above max {max_prices}"
+            )
+        return cleaned
+
+    def _entry_sweep_eth_usd_paths(
+        self,
+        *,
+        entry_price: float,
+        target_price: float | None,
+        n_paths: int,
+        n_steps: int,
+        seed: int,
+    ) -> np.ndarray:
+        """Generate entry-specific ETH/USD paths for the sweep."""
+        rng = np.random.default_rng(seed)
+        if self.eth_price_model == "mean_reverting" and target_price is not None:
+            target_ratio = max(
+                float(target_price) / max(float(entry_price), np.finfo(float).eps),
+                np.finfo(float).eps,
+            )
+            simulator = MeanRevertingLogPriceSimulator(
+                target=target_ratio,
+                kappa=float(self.eth_mean_reversion_speed_annual),
+                sigma=self.calibrated_sigma,
+                config=self.config,
+            )
+        else:
+            simulator = GBMSimulator(
+                mu=float(self.eth_drift_mu),
+                sigma=self.calibrated_sigma,
+                config=self.config,
+            )
+        rel = simulator.simulate(
+            s0=1.0,
+            n_paths=n_paths,
+            n_steps=n_steps,
+            rng=rng,
+        )
+        return np.maximum(rel * float(entry_price), np.finfo(float).eps)
+
+    @staticmethod
+    def _entry_sweep_first_touch_steps(
+        paths: np.ndarray,
+        *,
+        level: float,
+        start_price: float,
+    ) -> np.ndarray:
+        """Return first step each path touches a level, or -1 if never touched."""
+        arr = np.asarray(paths, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError("entry sweep touch paths must be a 2D array")
+        if arr.shape[0] == 0:
+            return np.array([], dtype=int)
+
+        level = float(level)
+        start_price = float(start_price)
+        tol = max(abs(level), abs(start_price), 1.0) * 1e-12
+        if abs(level - start_price) <= tol:
+            return np.zeros(arr.shape[0], dtype=int)
+
+        touched = arr <= level if level < start_price else arr >= level
+        has_touch = np.any(touched, axis=1)
+        first = np.argmax(touched, axis=1)
+        return np.where(has_touch, first, -1).astype(int)
+
+    def _entry_sweep_close_values_eth(
+        self,
+        *,
+        position: LoopedPosition,
+        eth_usd_terminal: np.ndarray,
+        debt_terminal: np.ndarray,
+        exchange_terminal: np.ndarray,
+        steth_market_terminal: np.ndarray,
+        entry_cost_eth: float,
+    ) -> np.ndarray:
+        """Estimate closeable ETH value after repaying debt and paying execution costs."""
+        eth_usd = np.maximum(np.asarray(eth_usd_terminal, dtype=float), np.finfo(float).eps)
+        debt = np.maximum(np.asarray(debt_terminal, dtype=float), 0.0)
+        exchange = np.maximum(np.asarray(exchange_terminal, dtype=float), np.finfo(float).eps)
+        steth_market = np.maximum(np.asarray(steth_market_terminal, dtype=float), np.finfo(float).eps)
+        debt_eth = debt / eth_usd if position.debt_mode == "stablecoin" else debt
+        wsteth_market_price_eth = np.maximum(exchange * steth_market, np.finfo(float).eps)
+        slippage = np.array(
+            [
+                float(self.unwind_estimator.slippage_model.estimate_slippage(float(amount)))
+                for amount in debt_eth
+            ],
+            dtype=float,
+        )
+        slippage = np.clip(slippage, 0.0, 0.95)
+        wsteth_to_sell = debt_eth / np.maximum(
+            wsteth_market_price_eth * (1.0 - slippage),
+            np.finfo(float).eps,
+        )
+        remaining_wsteth = np.maximum(float(position.total_collateral_wsteth) - wsteth_to_sell, 0.0)
+        remaining_eth = remaining_wsteth * wsteth_market_price_eth
+        iterative_gas_units = int(self.params.get("exit_iterative_gas_units_per_loop", 820_000))
+        exit_gas_eth = (
+            iterative_gas_units
+            * max(int(position.n_loops), 1)
+            * float(self.base_gas_price_gwei)
+            / 1e9
+        )
+        return remaining_eth - float(entry_cost_eth) - exit_gas_eth
+
+    def _entry_sweep_liquidation_penalty_eth(
+        self, *, position, hf_paths, debt_paths, exchange_rate_paths, eth_usd_paths
+    ) -> tuple[np.ndarray, np.ndarray]:
+        first = self.risk_metrics.first_breach_step(hf_paths, threshold=1.0)
+        breached = first >= 0
+        penalty = np.zeros(int(hf_paths.shape[0]), dtype=float)
+        if not np.any(breached):
+            return penalty, first
+
+        idx = np.arange(int(hf_paths.shape[0]))
+        step = np.clip(np.where(breached, first, 0), 0, hf_paths.shape[1] - 1)
+        hf_at = np.asarray(hf_paths[idx, step], dtype=float)
+        debt_at = np.asarray(debt_paths[idx, step], dtype=float)
+        exchange_at = np.asarray(exchange_rate_paths[idx, step], dtype=float)
+        eth_usd_at = np.asarray(eth_usd_paths[idx, step], dtype=float)
+        collateral_units = float(position.total_collateral_wsteth)
+        bonus = float(max(position.bonus, 0.0))
+        price_debt = exchange_at * eth_usd_at
+        close_factor = self._liquidation_close_factor_array(
+            hf_at,
+            debt_value_usd=debt_at,
+            collateral_value_usd=collateral_units * price_debt,
+        )
+        max_repay = collateral_units * price_debt / max(1.0 + bonus, np.finfo(float).eps)
+        repaid = np.where(breached, np.minimum(debt_at * close_factor, max_repay), 0.0)
+        return repaid / np.maximum(eth_usd_at, np.finfo(float).eps) * bonus, first
+
+    def _entry_sweep_breakeven_exit_price(
+        self,
+        *,
+        position: LoopedPosition,
+        entry_price: float,
+        debt_at_exit: float,
+        entry_cost_eth: float,
+        lower_bound: float,
+        upper_hint: float,
+    ) -> float | None:
+        """Solve the ETH/USD exit price where closed USD value equals initial USD capital."""
+        initial_usd = float(position.capital_eth) * float(entry_price)
+        exchange = float(self.wsteth.wsteth_steth_rate)
+        steth_market = float(self.market.steth_eth_price)
+
+        def value_usd(exit_price: float) -> float:
+            final_eth = float(
+                self._entry_sweep_close_values_eth(
+                    position=position,
+                    eth_usd_terminal=np.array([exit_price], dtype=float),
+                    debt_terminal=np.array([debt_at_exit], dtype=float),
+                    exchange_terminal=np.array([exchange], dtype=float),
+                    steth_market_terminal=np.array([steth_market], dtype=float),
+                    entry_cost_eth=entry_cost_eth,
+                )[0]
+            )
+            return final_eth * exit_price
+
+        low = max(float(lower_bound), np.finfo(float).eps)
+        high = max(float(upper_hint), low * 1.5, float(entry_price) * 1.5)
+        for _ in range(20):
+            if value_usd(high) >= initial_usd:
+                break
+            high *= 1.5
+        else:
+            return None
+        for _ in range(60):
+            mid = (low + high) / 2.0
+            if value_usd(mid) >= initial_usd:
+                high = mid
+            else:
+                low = mid
+        return float(high)
+
+    def _entry_sweep_report(
+        self,
+        *,
+        borrow_rate_paths: np.ndarray,
+        steth_market_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        dt: float,
+    ) -> dict[str, Any]:
+        """Evaluate entry-price/loop-count pairs for directional stablecoin debt."""
+        if self.debt_mode != "stablecoin":
+            return {
+                "status": "not_applicable",
+                "reason": "entry sweep currently targets stablecoin-debt directional trades",
+            }
+
+        target_price = self._entry_sweep_target_price()
+        entry_prices = self._entry_sweep_prices()
+        min_loops, max_loops = self._optimization_loop_bounds()
+        constraints = self._optimizer_constraints()
+        n_paths_total = int(borrow_rate_paths.shape[0])
+        max_paths = int(self.params.get("entry_sweep_max_paths", DEFAULT_ENTRY_SWEEP_MAX_PATHS))
+        n_paths = min(n_paths_total, max(max_paths, 1))
+        n_steps = int(borrow_rate_paths.shape[1] - 1)
+        borrow = np.asarray(borrow_rate_paths[:n_paths], dtype=float)
+        steth_market = np.asarray(steth_market_paths[:n_paths], dtype=float)
+        exchange = np.asarray(exchange_rate_paths[:n_paths], dtype=float)
+        seed_base = int(self.params.get("entry_sweep_seed", int(self.config.seed) + 20_027))
+        horizon_years = max(float(self.grid.horizon_days) / 365.0, np.finfo(float).eps)
+        current_spot = max(float(self.market.eth_usd_price), np.finfo(float).eps)
+        fill_seed = int(self.params.get("entry_sweep_fill_seed", seed_base + 1_000_003))
+        fill_eth_usd = self._entry_sweep_eth_usd_paths(
+            entry_price=current_spot,
+            target_price=target_price,
+            n_paths=n_paths,
+            n_steps=n_steps,
+            seed=fill_seed,
+        )
+
+        rows: list[dict[str, Any]] = []
+        for price_index, entry_price in enumerate(entry_prices):
+            fill_steps = self._entry_sweep_first_touch_steps(
+                fill_eth_usd,
+                level=float(entry_price),
+                start_price=current_spot,
+            )
+            filled = fill_steps >= 0
+            fill_count = int(np.sum(filled))
+            prob_entry_fill_pct = float(np.mean(filled) * 100.0)
+            fill_probability = prob_entry_fill_pct / 100.0
+            eth_usd = self._entry_sweep_eth_usd_paths(
+                entry_price=entry_price,
+                target_price=target_price,
+                n_paths=n_paths,
+                n_steps=n_steps,
+                seed=seed_base + price_index,
+            )
+            for loops in range(min_loops, max_loops + 1):
+                position = LoopedPosition(
+                    self.position.capital_eth,
+                    loops,
+                    emode=self.emode,
+                    wsteth_params=self.wsteth,
+                    debt_mode=self.debt_mode,
+                    debt_asset=self.debt_asset,
+                    initial_eth_usd_price=float(entry_price),
+                )
+                debt_initial = float(position.total_debt_stable or 0.0)
+                debt_paths = self._compound_debt_paths(debt_initial, borrow, dt)
+                hf = position.health_factor_paths(
+                    borrow,
+                    dt=dt,
+                    exchange_rate_paths=exchange,
+                    eth_usd_paths=eth_usd,
+                )
+                entry_exec = self._estimate_entry_execution_for_position(position)
+                unwind_exec = self._estimate_unwind_execution_for_position(
+                    position,
+                    stress_multiplier=constraints["unwind_stress_multiplier"],
+                )
+                close_values = self._entry_sweep_close_values_eth(
+                    position=position,
+                    eth_usd_terminal=eth_usd[:, -1],
+                    debt_terminal=debt_paths[:, -1],
+                    exchange_terminal=exchange[:, -1],
+                    steth_market_terminal=steth_market[:, -1],
+                    entry_cost_eth=float(entry_exec["total_entry_cost_eth"]),
+                )
+                liquidation_penalty, first_hf_breach = self._entry_sweep_liquidation_penalty_eth(
+                    position=position,
+                    hf_paths=hf,
+                    debt_paths=debt_paths,
+                    exchange_rate_paths=exchange,
+                    eth_usd_paths=eth_usd,
+                )
+                close_values = close_values - liquidation_penalty
+                pnl = close_values - float(position.capital_eth)
+                p5 = float(np.percentile(pnl, 5.0))
+                mean = float(np.mean(pnl))
+                probability_weighted_mean = float(fill_probability * mean)
+                target_debt = debt_initial * np.exp(float(self._current_position_borrow_rate()) * horizon_years)
+                target_profit_eth = None
+                target_profit_usd = None
+                target_roi_pct = None
+                prob_target_touch_after_fill_pct = None
+                prob_target_before_liquidation_after_fill_pct = None
+                prob_fill_and_target_before_liquidation_pct = None
+                probability_weighted_target_profit_eth = None
+                if target_price is not None:
+                    target_steps = self._entry_sweep_first_touch_steps(
+                        eth_usd,
+                        level=float(target_price),
+                        start_price=float(entry_price),
+                    )
+                    target_touched = target_steps >= 0
+                    target_before_liquidation = target_touched & (
+                        (first_hf_breach < 0) | (target_steps < first_hf_breach)
+                    )
+                    prob_target_touch_after_fill_pct = float(np.mean(target_touched) * 100.0)
+                    prob_target_before_liquidation_after_fill_pct = float(
+                        np.mean(target_before_liquidation) * 100.0
+                    )
+                    prob_fill_and_target_before_liquidation_pct = float(
+                        fill_probability
+                        * (prob_target_before_liquidation_after_fill_pct / 100.0)
+                        * 100.0
+                    )
+                    target_close = float(
+                        self._entry_sweep_close_values_eth(
+                            position=position,
+                            eth_usd_terminal=np.array([float(target_price)], dtype=float),
+                            debt_terminal=np.array([target_debt], dtype=float),
+                            exchange_terminal=np.array([float(self.wsteth.wsteth_steth_rate)], dtype=float),
+                            steth_market_terminal=np.array([float(self.market.steth_eth_price)], dtype=float),
+                            entry_cost_eth=float(entry_exec["total_entry_cost_eth"]),
+                        )[0]
+                    )
+                    target_profit_eth = target_close - float(position.capital_eth)
+                    target_profit_usd = (
+                        target_close * float(target_price)
+                        - float(position.capital_eth) * float(entry_price)
+                    )
+                    target_roi_pct = (
+                        target_profit_usd
+                        / max(float(position.capital_eth) * float(entry_price), np.finfo(float).eps)
+                        * 100.0
+                    )
+                    probability_weighted_target_profit_eth = float(
+                        fill_probability
+                        * (prob_target_before_liquidation_after_fill_pct / 100.0)
+                        * target_profit_eth
+                    )
+
+                start_hf = float(position.health_factor())
+                liquidation_price = float(entry_price) / max(start_hf, np.finfo(float).eps)
+                breakeven = self._entry_sweep_breakeven_exit_price(
+                    position=position,
+                    entry_price=float(entry_price),
+                    debt_at_exit=target_debt,
+                    entry_cost_eth=float(entry_exec["total_entry_cost_eth"]),
+                    lower_bound=liquidation_price,
+                    upper_hint=float(target_price or entry_price),
+                )
+                breached = first_hf_breach >= 0
+                prob_hf = float(np.mean(breached) * 100.0)
+                entry_cost_bps = float(entry_exec["total_entry_cost_bps"])
+                unwind_cost_bps = float(unwind_exec["total_unwind_cost_bps"])
+                passes = (
+                    prob_hf <= constraints["max_prob_hf_lt_1_pct"]
+                    and start_hf >= constraints["min_start_health_factor"]
+                    and entry_cost_bps <= constraints["max_entry_cost_bps"]
+                    and unwind_cost_bps <= constraints["max_unwind_cost_bps"]
+                )
+                downside_floor = max(float(position.capital_eth) * 0.01, -p5, np.finfo(float).eps)
+                reward_source = probability_weighted_mean
+                rows.append(
+                    {
+                        "entry_eth_usd": float(entry_price),
+                        "target_eth_usd": float(target_price) if target_price is not None else None,
+                        "loops": int(loops),
+                        "leverage": float(position.leverage),
+                        "start_health_factor": start_hf,
+                        "liquidation_eth_usd": liquidation_price,
+                        "drop_to_liquidation_pct": float((liquidation_price / entry_price - 1.0) * 100.0),
+                        "breakeven_exit_eth_usd": breakeven,
+                        "mean_pnl_after_costs_eth": mean,
+                        "probability_weighted_mean_pnl_after_costs_eth": probability_weighted_mean,
+                        "p5_pnl_after_costs_eth": p5,
+                        "p50_pnl_after_costs_eth": float(np.percentile(pnl, 50.0)),
+                        "p95_pnl_after_costs_eth": float(np.percentile(pnl, 95.0)),
+                        "prob_profit_after_costs_pct": float(np.mean(pnl > 0.0) * 100.0),
+                        "prob_entry_fill_pct": prob_entry_fill_pct,
+                        "entry_fill_count": fill_count,
+                        "prob_target_touch_after_fill_pct": prob_target_touch_after_fill_pct,
+                        "prob_target_before_liquidation_after_fill_pct": (
+                            prob_target_before_liquidation_after_fill_pct
+                        ),
+                        "prob_fill_and_target_before_liquidation_pct": (
+                            prob_fill_and_target_before_liquidation_pct
+                        ),
+                        "prob_hf_lt_1_pct": prob_hf,
+                        "liquidation_breach_count": int(np.sum(breached)),
+                        "target_profit_eth": target_profit_eth,
+                        "target_profit_usd": target_profit_usd,
+                        "target_roi_pct": target_roi_pct,
+                        "probability_weighted_target_profit_eth": (
+                            probability_weighted_target_profit_eth
+                        ),
+                        "entry_cost_bps": entry_cost_bps,
+                        "entry_cost_eth": float(entry_exec["total_entry_cost_eth"]),
+                        "unwind_cost_bps": unwind_cost_bps,
+                        "unwind_cost_eth": float(unwind_exec["total_unwind_cost_eth"]),
+                        "reward_risk_score": float(reward_source / downside_floor),
+                        "passes_constraints": bool(passes),
+                    }
+                )
+
+        passing = [row for row in rows if row["passes_constraints"]]
+        if passing:
+            best = max(
+                passing,
+                key=lambda row: (
+                    row["reward_risk_score"],
+                    row["probability_weighted_mean_pnl_after_costs_eth"],
+                    row["prob_fill_and_target_before_liquidation_pct"] or 0.0,
+                    row["mean_pnl_after_costs_eth"],
+                ),
+            )
+            recommendation_status = "constraints_satisfied"
+        else:
+            best = max(
+                rows,
+                key=lambda row: (
+                    row["reward_risk_score"],
+                    row["probability_weighted_mean_pnl_after_costs_eth"],
+                    row["mean_pnl_after_costs_eth"],
+                ),
+            )
+            recommendation_status = "no_candidate_satisfied_all_constraints"
+
+        return {
+            "status": "available",
+            "objective": "rank_entry_and_loop_pairs_by_probability_weighted_expected_value_subject_to_constraints",
+            "constraint_profile": "pre_trade_conservative",
+            "target_eth_usd": float(target_price) if target_price is not None else None,
+            "entry_prices_usd": entry_prices,
+            "loop_range": {"min": int(min_loops), "max": int(max_loops)},
+            "path_count_used": int(n_paths),
+            "constraints": constraints,
+            "recommended": {
+                "entry_eth_usd": float(best["entry_eth_usd"]),
+                "loops": int(best["loops"]),
+                "recommendation_status": recommendation_status,
+                "reward_risk_score": float(best["reward_risk_score"]),
+                "probability_weighted_mean_pnl_after_costs_eth": float(
+                    best["probability_weighted_mean_pnl_after_costs_eth"]
+                ),
+                "prob_entry_fill_pct": float(best["prob_entry_fill_pct"]),
+                "prob_target_before_liquidation_after_fill_pct": (
+                    best["prob_target_before_liquidation_after_fill_pct"]
+                ),
+                "prob_fill_and_target_before_liquidation_pct": (
+                    best["prob_fill_and_target_before_liquidation_pct"]
+                ),
+                "target_profit_eth": best["target_profit_eth"],
+                "probability_weighted_target_profit_eth": best[
+                    "probability_weighted_target_profit_eth"
+                ],
+                "target_roi_pct": best["target_roi_pct"],
+                "start_health_factor": float(best["start_health_factor"]),
+                "liquidation_eth_usd": float(best["liquidation_eth_usd"]),
+                "breakeven_exit_eth_usd": best["breakeven_exit_eth_usd"],
+            },
+            "candidates": rows,
+            "assumptions": {
+                "pnl_basis": "closeable_value_after_costs_borrow_interest_and_liquidation_loss",
+                "borrow_rate_paths": "reused_from_main_simulation",
+                "eth_paths": "resimulated_per_entry_price_with_current_price_model",
+                "fill_probability_basis": "first_touch_from_current_spot_using_calibrated_price_model",
+                "score_basis": "expected_pnl_weighted_by_entry_fill_probability",
+                "exit_route_model": "iterative_repay_with_reduced_form_slippage",
+                "gas_price_gwei": float(self.base_gas_price_gwei),
+            },
+        }
+
+    def _validation_scorecard_report(
+        self,
+        *,
+        historical_replay: dict[str, Any],
+        pnl_paths: np.ndarray,
+        hf_paths: np.ndarray,
+        borrow_rate_paths: np.ndarray,
+        util_paths: np.ndarray,
+    ) -> dict[str, Any]:
+        """Compare modeled distributions with available historical replay checks."""
+        if historical_replay.get("status") != "available":
+            return {
+                "status": "unavailable",
+                "reason": historical_replay.get("reason", "historical_replay_unavailable"),
+                "method": "requires historical replay windows",
+                "utilization_calibration": self.utilization_calibration or {
+                    "method": "unavailable"
+                },
+            }
+
+        terminal_pnl = np.asarray(pnl_paths[:, -1], dtype=float)
+        min_hf = np.min(np.asarray(hf_paths, dtype=float), axis=1)
+        terminal_borrow = np.asarray(borrow_rate_paths[:, -1], dtype=float)
+        terminal_util = np.asarray(util_paths[:, -1], dtype=float)
+
+        model_pnl_p5, model_pnl_p50, model_pnl_p95 = np.percentile(
+            terminal_pnl,
+            [5.0, 50.0, 95.0],
+        )
+        historical_pnl_stats = historical_replay.get("terminal_pnl_eth", {})
+        historical_hf_stats = historical_replay.get("min_health_factor", {})
+        historical_pnl_p50 = historical_pnl_stats.get("p50")
+        historical_min_hf_p50 = historical_hf_stats.get("p50")
+        historical_prob_hf = float(historical_replay.get("prob_hf_lt_1_pct", 0.0))
+        model_prob_hf = float(np.mean(min_hf < 1.0) * 100.0)
+
+        interval_contains_hist_p50 = None
+        if historical_pnl_p50 is not None:
+            hist_p50 = float(historical_pnl_p50)
+            interval_contains_hist_p50 = bool(model_pnl_p5 <= hist_p50 <= model_pnl_p95)
+
+        utilization_method = str(
+            (self.utilization_calibration or {}).get("method", "default")
+        )
+        calibration_available = "fallback" not in utilization_method.lower()
+
+        checks = {
+            "historical_p50_pnl_inside_model_p5_p95": interval_contains_hist_p50,
+            "liquidation_probability_abs_error_pct": abs(model_prob_hf - historical_prob_hf),
+            "utilization_calibration_available": calibration_available,
+        }
+        passed_values = [v for v in checks.values() if isinstance(v, bool)]
+        passed = (
+            interval_contains_hist_p50 is not False
+            and checks["liquidation_probability_abs_error_pct"] <= 5.0
+        )
+
+        return {
+            "status": "available",
+            "method": "historical_window_replay_vs_current_mc_distribution",
+            "window_count": int(historical_replay.get("window_count", 0)),
+            "window_days": int(historical_replay.get("window_days", 0)),
+            "overall_passed": bool(passed),
+            "checks_passed": int(sum(bool(v) for v in passed_values)),
+            "checks_total": int(len(passed_values)),
+            "checks": checks,
+            "terminal_pnl_eth": {
+                "model_p5": float(model_pnl_p5),
+                "model_p50": float(model_pnl_p50),
+                "model_p95": float(model_pnl_p95),
+                "historical_p50": (
+                    float(historical_pnl_p50)
+                    if historical_pnl_p50 is not None
+                    else None
+                ),
+                "historical_mean": historical_pnl_stats.get("mean"),
+            },
+            "min_health_factor": {
+                "model_p5": float(np.percentile(min_hf, 5.0)),
+                "model_p50": float(np.percentile(min_hf, 50.0)),
+                "model_p95": float(np.percentile(min_hf, 95.0)),
+                "historical_p50": (
+                    float(historical_min_hf_p50)
+                    if historical_min_hf_p50 is not None
+                    else None
+                ),
+                "historical_mean": historical_hf_stats.get("mean"),
+            },
+            "liquidation_probability_pct": {
+                "model": model_prob_hf,
+                "historical_replay": historical_prob_hf,
+                "absolute_error": abs(model_prob_hf - historical_prob_hf),
+            },
+            "terminal_borrow_rate_pct": {
+                k: float(v * 100.0)
+                for k, v in self._summary_stats(terminal_borrow).items()
+            },
+            "terminal_utilization": {
+                k: float(v) for k, v in self._summary_stats(terminal_util).items()
+            },
+            "utilization_calibration": self.utilization_calibration or {
+                "method": "default_or_user_supplied_params"
+            },
+            "limitations": [
+                "Historical replay currently reuses current borrow-rate assumptions.",
+                "Scorecard compares distribution coverage, not timestamped out-of-sample forecasts.",
+                "Utilization validation depends on historical borrow-rate provenance when available.",
+            ],
+        }
+
+    def _market_regime_forecast_report(self) -> dict[str, Any]:
+        """Run optional attention-weighted Markov regime target forecast."""
+        if self.market_regime_features is None:
+            return {
+                "status": "unavailable",
+                "reason": "market_regime_features_not_provided",
+                "model": "attention_markov_v1",
+                "required_inputs": [
+                    "mark_price",
+                    "ewma_vol_annualized or realized_vol_7d_annualized",
+                    "price returns",
+                    "funding/open-interest/basis predictors when available",
+                ],
+            }
+
+        try:
+            features = (
+                self.market_regime_features
+                if isinstance(self.market_regime_features, MarketRegimeFeatures)
+                else MarketRegimeFeatures.from_mapping(self.market_regime_features)
+            )
+            raw_targets = self.market_regime_targets_usd
+            targets = None
+            if raw_targets is not None:
+                if isinstance(raw_targets, str):
+                    raw_iter = [
+                        part.strip()
+                        for part in raw_targets.split(",")
+                        if part.strip()
+                    ]
+                elif isinstance(raw_targets, (list, tuple, np.ndarray)):
+                    raw_iter = list(raw_targets)
+                else:
+                    raise ValueError("market_regime_targets_usd must be a comma string or list")
+                targets = [
+                    float(value)
+                    for value in raw_iter
+                    if np.isfinite(float(value)) and float(value) > 0.0
+                ]
+            from pathlib import Path
+
+            from models.regime_backtest import load_calibration
+
+            calibration_file = self.params.get("market_regime_calibration_file")
+            if calibration_file is None:
+                calibration = load_calibration()
+            elif str(calibration_file).strip() in ("", "none", "disabled"):
+                calibration = None
+            else:
+                calibration = load_calibration(Path(str(calibration_file)))
+            model = AttentionMarkovRegimeModel(
+                MarketRegimeConfig(
+                    horizon_days=float(self.grid.horizon_days),
+                    n_paths=max(int(self.market_regime_n_paths), 100),
+                    seed=int(self.market_regime_seed),
+                    baseline_vol_annualized=max(
+                        float(self.calibrated_sigma),
+                        np.finfo(float).eps,
+                    ),
+                ),
+                calibration=calibration,
+            )
+            return model.forecast(features, targets=targets)
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": str(exc),
+                "model": "attention_markov_v1",
+            }
+
+    TOUCH_MODEL_HORIZONS_HOURS = (48, 168)
+
+    def _touch_model_forecast_report(self) -> dict[str, Any]:
+        """Predict first-touch probabilities with the gated supervised model.
+
+        Only models persisted by ``run_touch_backtest.py --save-model`` are
+        loadable, and persisting requires the walk-forward Brier gate to
+        pass, so any row this report emits carries confirmed out-of-sample
+        edge over pooled climatology.
+        """
+        history = self.params.get("touch_model_history")
+        enabled = bool(
+            self.params.get(
+                "touch_model_forecast",
+                history is not None or self.market_regime_features is not None,
+            )
+        )
+        if not enabled:
+            return {
+                "status": "unavailable",
+                "reason": "touch_model_forecast_not_enabled",
+                "model": "logistic_touch_v1",
+            }
+        try:
+            if history is None:
+                from models.touch_model import TOUCH_WARMUP_HOURS
+                from data.regime_history import fetch_regime_history
+
+                history = fetch_regime_history(
+                    lookback_days=TOUCH_WARMUP_HOURS / 24.0 + 30.0,
+                    use_cache=True,
+                )
+            from pathlib import Path
+
+            model_dir = self.params.get("touch_model_dir")
+            mark = float(history.closes[-1])
+            asof_ms = int(history.timestamps_ms[-1])
+            age_hours = (
+                datetime.now(timezone.utc)
+                - datetime.fromtimestamp(asof_ms / 1000.0, tz=timezone.utc)
+            ).total_seconds() / 3600.0
+
+            user_multipliers: list[float] = []
+            raw_targets = self.market_regime_targets_usd
+            if raw_targets is not None:
+                raw_iter = (
+                    [part.strip() for part in raw_targets.split(",") if part.strip()]
+                    if isinstance(raw_targets, str)
+                    else list(raw_targets)
+                )
+                for value in raw_iter:
+                    multiplier = float(value) / mark
+                    if 0.5 <= multiplier <= 2.0 and abs(multiplier - 1.0) > 1e-4:
+                        user_multipliers.append(multiplier)
+
+            horizons = []
+            for horizon_hours in self.TOUCH_MODEL_HORIZONS_HOURS:
+                path = (
+                    Path(str(model_dir)) / f"touch_model_{horizon_hours}h.json"
+                    if model_dir is not None
+                    else None
+                )
+                loaded = load_touch_model(horizon_hours, path=path)
+                if loaded is None:
+                    continue
+                model, payload = loaded
+                trained = [
+                    float(m) for m in payload["settings"]["target_multipliers"]
+                ]
+                multipliers = sorted(set(trained) | set(user_multipliers))
+                rows = predict_touch_probabilities(
+                    history, model, payload, target_multipliers=tuple(multipliers)
+                )
+                for row in rows:
+                    row["first_touch_probability_pct"] = (
+                        float(row["first_touch_probability"]) * 100.0
+                    )
+                    row["trained_multiplier"] = (
+                        float(row["target_multiplier"]) in trained
+                    )
+                gate = payload.get("walk_forward_gate", {})
+                skill = payload.get("walk_forward_skill", {})
+                horizons.append(
+                    {
+                        "horizon_hours": int(horizon_hours),
+                        "targets": rows,
+                        "walk_forward_gate": {
+                            "brier_improvement_pct": gate.get("brier_improvement_pct"),
+                            "calibration_error": gate.get("calibration_error"),
+                            "upgrade_recommended": gate.get("upgrade_recommended"),
+                        },
+                        "strict_skill_vs_target_climatology_pct": skill.get(
+                            "skill_vs_target_climatology_pct"
+                        ),
+                        "fitted_at_utc": payload.get("fitted_at_utc"),
+                        "train_rows": payload.get("train_rows"),
+                    }
+                )
+            if not horizons:
+                return {
+                    "status": "unavailable",
+                    "reason": "no_persisted_touch_model_found",
+                    "model": "logistic_touch_v1",
+                    "expected_cache_files": [
+                        f"touch_model_{h}h.json"
+                        for h in self.TOUCH_MODEL_HORIZONS_HOURS
+                    ],
+                }
+            dashboard_horizon_hours = float(self.grid.horizon_days) * 24.0
+            primary = min(
+                horizons,
+                key=lambda h: abs(float(h["horizon_hours"]) - dashboard_horizon_hours),
+            )["horizon_hours"]
+            return {
+                "status": "available",
+                "model": "logistic_touch_v1",
+                "edge_over_climatology_confirmed": True,
+                "primary_horizon": int(primary),
+                "horizons": horizons,
+                "history": {
+                    "instrument": history.instrument,
+                    "mark_price_usd": mark,
+                    "asof_utc": datetime.fromtimestamp(
+                        asof_ms / 1000.0, tz=timezone.utc
+                    ).isoformat(),
+                    "age_hours": float(age_hours),
+                    "stale": bool(age_hours > 26.0),
+                    "dashboard_mark_usd": float(self.market.eth_usd_price),
+                    "mark_divergence_pct": (
+                        mark / max(float(self.market.eth_usd_price), np.finfo(float).eps)
+                        - 1.0
+                    )
+                    * 100.0,
+                },
+            }
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": str(exc),
+                "model": "logistic_touch_v1",
+            }
+
+    def _position_sizing_report(
+        self,
+        *,
+        optimization: dict[str, Any],
+        touch_forecast: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Fractional-Kelly + CVaR-budget loop-count recommendation."""
+        if not isinstance(optimization, dict) or optimization.get("status") != "available":
+            return {"status": "unavailable", "reason": "loop_optimization_unavailable"}
+        try:
+            # Half-Kelly is the standard discount for estimation error; the
+            # CVaR budget caps the 95% expected shortfall at 20% of capital
+            # over the horizon. Both are overridable policy parameters.
+            kelly_fraction = float(self.params.get("sizing_kelly_fraction", 0.5))
+            cvar_budget_pct = float(self.params.get("sizing_cvar_budget_pct", 20.0))
+            return position_sizing_report(
+                candidates=list(optimization.get("candidates", [])),
+                capital_eth=float(self.position.capital_eth),
+                horizon_days=float(self.grid.horizon_days),
+                kelly_fraction=kelly_fraction,
+                cvar_budget_fraction=cvar_budget_pct / 100.0,
+                touch_forecast=touch_forecast,
+            )
+        except Exception as exc:
+            return {"status": "unavailable", "reason": str(exc)}
+
+    def _exit_policy_report(
+        self,
+        *,
+        borrow_rate_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        steth_market_paths: np.ndarray,
+        eth_usd_paths: np.ndarray,
+        dt: float,
+    ) -> dict[str, Any]:
+        """Evaluate the HF-triggered partial deleveraging ladder on paths."""
+        try:
+            start_hf = float(self.position.health_factor())
+            ladder_spec = self.params.get("exit_ladder")
+            if ladder_spec is None:
+                if start_hf <= 1.001:
+                    return {
+                        "status": "unavailable",
+                        "reason": (
+                            "start health factor "
+                            f"{start_hf:.4f} leaves no room above 1.0 for a "
+                            "default ladder; pass exit_ladder explicitly"
+                        ),
+                    }
+                # Default rungs sit at 60% / 30% of the entry HF buffer with
+                # 25% / 50% deleveraging: policy defaults scaled to the
+                # position rather than fixed HF levels, so high-leverage
+                # entries do not trigger immediately.
+                buffer = start_hf - 1.0
+                ladder_spec = [
+                    (1.0 + 0.6 * buffer, 0.25),
+                    (1.0 + 0.3 * buffer, 0.50),
+                ]
+                ladder_source = "default_scaled_to_entry_hf_buffer"
+            else:
+                ladder_source = "params_exit_ladder"
+            rungs = parse_exit_ladder(ladder_spec)
+            initial_debt = (
+                float(self.position.total_debt_stable or 0.0)
+                if self.debt_mode == "stablecoin"
+                else float(self.position.total_debt_weth)
+            )
+            gas_units = int(
+                self.params.get("exit_iterative_gas_units_per_loop", 820_000)
+            )
+            gas_cost_eth = gas_units * float(self.base_gas_price_gwei) / 1e9
+            report = evaluate_exit_ladder(
+                rungs=rungs,
+                debt_mode=self.debt_mode,
+                initial_debt=initial_debt,
+                initial_collateral_wsteth=float(
+                    self.position.total_collateral_wsteth
+                ),
+                liquidation_threshold=float(self.position.lt),
+                steth_supply_apy=float(self.position.steth_supply_apy),
+                borrow_rate_paths=borrow_rate_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                steth_market_paths=steth_market_paths,
+                eth_usd_paths=(
+                    eth_usd_paths if self.debt_mode == "stablecoin" else None
+                ),
+                dt=dt,
+                slippage_fn=self.unwind_estimator.slippage_model.estimate_slippage,
+                gas_cost_eth_per_event=gas_cost_eth,
+                steps_per_day=1.0 / (float(dt) * 365.0),
+            )
+            report["ladder_source"] = ladder_source
+            report["start_health_factor"] = start_hf
+            return report
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": str(exc),
+                "policy": "hf_triggered_partial_deleverage_ladder",
+            }
+
+    @staticmethod
+    def _decision_display_label(decision: str) -> str:
+        return {
+            "wait": "wait",
+            "small_entry": "small entry",
+            "good_entry": "good entry",
+            "avoid_4_loop": "avoid 4-loop",
+        }.get(decision, decision)
+
+    def _current_entry_candidate(self, entry_sweep: dict[str, Any]) -> dict[str, Any] | None:
+        if not isinstance(entry_sweep, dict) or entry_sweep.get("status") != "available":
+            return None
+        candidates = [
+            row
+            for row in entry_sweep.get("candidates", [])
+            if int(row.get("loops", -1)) == int(self.position.n_loops)
+        ]
+        if not candidates:
+            return None
+        current = max(float(self.market.eth_usd_price), np.finfo(float).eps)
+        return min(
+            candidates,
+            key=lambda row: abs(float(row.get("entry_eth_usd", current)) / current - 1.0),
+        )
+
+    @staticmethod
+    def _nearest_target_probability(
+        market_regime: dict[str, Any],
+        *,
+        mark: float,
+        direction: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(market_regime, dict) or market_regime.get("status") != "available":
+            return None
+        rows = list(market_regime.get("targets", []) or [])
+        if direction == "up":
+            eligible = [row for row in rows if float(row.get("target_eth_usd", 0.0)) > mark]
+        else:
+            eligible = [row for row in rows if float(row.get("target_eth_usd", 0.0)) < mark]
+        if not eligible:
+            return None
+        return min(
+            eligible,
+            key=lambda row: abs(float(row.get("target_eth_usd", mark)) / mark - 1.0),
+        )
+
+    @staticmethod
+    def _touch_forecast_directional_pcts(
+        touch_forecast: dict[str, Any] | None,
+    ) -> tuple[float, float] | None:
+        """Nearest up/down touch percentages from the supervised model."""
+        if not isinstance(touch_forecast, dict):
+            return None
+        if touch_forecast.get("status") != "available":
+            return None
+        primary = touch_forecast.get("primary_horizon")
+        rows = None
+        for horizon in touch_forecast.get("horizons", []):
+            if int(horizon.get("horizon_hours", -1)) == int(primary or -2):
+                rows = horizon.get("targets", [])
+                break
+        if not rows:
+            return None
+
+        def _nearest_pct(direction: str) -> float | None:
+            eligible = [row for row in rows if row.get("direction") == direction]
+            if not eligible:
+                return None
+            nearest = min(
+                eligible,
+                key=lambda row: abs(float(row.get("target_multiplier", 1.0)) - 1.0),
+            )
+            return float(nearest.get("first_touch_probability_pct", 50.0))
+
+        up_pct = _nearest_pct("up")
+        down_pct = _nearest_pct("down")
+        if up_pct is None or down_pct is None:
+            return None
+        return up_pct, down_pct
+
+    def _pre_trade_entry_score_report(
+        self,
+        *,
+        entry_sweep: dict[str, Any],
+        market_regime: dict[str, Any],
+        price_action: dict[str, Any],
+        optimization: dict[str, Any],
+        touch_forecast: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Combine risk, price action, and regime features into an entry label."""
+        if not isinstance(entry_sweep, dict) or entry_sweep.get("status") != "available":
+            return {
+                "status": "unavailable",
+                "reason": "entry_sweep_unavailable",
+            }
+
+        constraints = (
+            entry_sweep.get("constraints")
+            if isinstance(entry_sweep.get("constraints"), dict)
+            else self._optimizer_constraints()
+        )
+        current = self._current_entry_candidate(entry_sweep)
+        if current is None:
+            return {
+                "status": "unavailable",
+                "reason": "current_loop_candidate_not_found",
+            }
+
+        mark = float(self.market.eth_usd_price)
+        capital = max(float(self.position.capital_eth), np.finfo(float).eps)
+        min_hf = float(constraints.get("min_start_health_factor", DEFAULT_OPT_MIN_START_HF))
+        max_prob_hf = float(
+            constraints.get(
+                "max_prob_hf_lt_1_pct",
+                DEFAULT_OPT_MAX_PROB_HF_LT_1_PCT,
+            )
+        )
+        start_hf = float(current.get("start_health_factor", self.position.health_factor()))
+        prob_hf = float(current.get("prob_hf_lt_1_pct", 100.0))
+        drop_to_liq = float(current.get("drop_to_liquidation_pct", 0.0))
+        mean_pnl = float(current.get("mean_pnl_after_costs_eth", 0.0))
+        current_passes = bool(current.get("passes_constraints", False))
+
+        hf_score = float(np.clip((start_hf - 1.0) / 0.35, 0.0, 1.0))
+        liquidation_buffer_score = float(
+            np.clip((abs(min(drop_to_liq, 0.0)) - 10.0) / 25.0, 0.0, 1.0)
+        )
+        hf_prob_score = float(np.clip(1.0 - prob_hf / max(max_prob_hf * 8.0, 1.0), 0.0, 1.0))
+        risk_score = float(
+            np.clip(
+                0.40 * hf_score
+                + 0.35 * liquidation_buffer_score
+                + 0.25 * hf_prob_score,
+                0.0,
+                1.0,
+            )
+        )
+
+        price_action_score = 0.50
+        if isinstance(price_action, dict) and price_action.get("status") == "available":
+            price_action_score = float(
+                np.clip(float(price_action.get("technical_score", 50.0)) / 100.0, 0.0, 1.0)
+            )
+
+        supervised = self._touch_forecast_directional_pcts(touch_forecast)
+        if supervised is not None:
+            up_touch, down_touch = supervised
+            touch_probability_source = "supervised_touch_model"
+        else:
+            up_target = self._nearest_target_probability(
+                market_regime,
+                mark=mark,
+                direction="up",
+            )
+            down_target = self._nearest_target_probability(
+                market_regime,
+                mark=mark,
+                direction="down",
+            )
+            up_touch = (
+                float(up_target.get("first_touch_probability_pct", 50.0))
+                if up_target is not None
+                else 50.0
+            )
+            down_touch = (
+                float(down_target.get("first_touch_probability_pct", 50.0))
+                if down_target is not None
+                else 50.0
+            )
+            touch_probability_source = "attention_markov_heuristic"
+        regime_score = float(np.clip(0.5 + (up_touch - down_touch) / 200.0, 0.0, 1.0))
+        ev_score = float(np.clip(0.5 + (mean_pnl / capital) * 2.0, 0.0, 1.0))
+        current_net_apy = float(
+            self.position.net_apy(self._current_position_borrow_rate())
+        )
+        carry_score = float(np.clip(0.5 + current_net_apy * 5.0, 0.0, 1.0))
+        guardrail_score = 1.0 if current_passes else 0.0
+        score = float(
+            np.clip(
+                100.0
+                * (
+                    0.25 * guardrail_score
+                    + 0.20 * risk_score
+                    + 0.20 * price_action_score
+                    + 0.15 * regime_score
+                    + 0.10 * ev_score
+                    + 0.10 * carry_score
+                ),
+                0.0,
+                100.0,
+            )
+        )
+
+        avoid_current_4_loop = (
+            int(self.position.n_loops) >= 4
+            and (
+                not current_passes
+                or start_hf < min_hf
+                or prob_hf > max_prob_hf
+            )
+        )
+        if avoid_current_4_loop:
+            decision = "avoid_4_loop"
+        elif current_passes and score >= 68.0 and regime_score >= 0.50 and price_action_score >= 0.55:
+            decision = "good_entry"
+        elif current_passes and score >= 50.0:
+            decision = "small_entry"
+        else:
+            decision = "wait"
+
+        reasons = []
+        if start_hf < min_hf:
+            reasons.append(
+                f"start HF {start_hf:.4f} is below guardrail {min_hf:.4f}"
+            )
+        if prob_hf > max_prob_hf:
+            reasons.append(
+                f"P(HF<1) {prob_hf:.2f}% exceeds guardrail {max_prob_hf:.2f}%"
+            )
+        if mean_pnl < 0.0:
+            reasons.append(f"7d expected P&L is negative ({mean_pnl:.4f} ETH)")
+        if price_action_score < 0.45:
+            reasons.append("price-action score is weak")
+        if regime_score < 0.45:
+            reasons.append("nearest downside touch odds exceed upside touch odds")
+        if not reasons:
+            reasons.append("current candidate clears guardrails with acceptable setup score")
+
+        recommended = entry_sweep.get("recommended", {})
+        return {
+            "status": "available",
+            "decision": decision,
+            "display_label": self._decision_display_label(decision),
+            "score": score,
+            "score_scale": "0_100",
+            "current_entry": {
+                "entry_eth_usd": float(current.get("entry_eth_usd", mark)),
+                "loops": int(current.get("loops", self.position.n_loops)),
+                "start_health_factor": start_hf,
+                "liquidation_eth_usd": current.get("liquidation_eth_usd"),
+                "drop_to_liquidation_pct": drop_to_liq,
+                "prob_hf_lt_1_pct": prob_hf,
+                "mean_pnl_after_costs_eth": mean_pnl,
+                "prob_profit_after_costs_pct": current.get("prob_profit_after_costs_pct"),
+                "passes_constraints": current_passes,
+            },
+            "recommended_entry": recommended,
+            "components": {
+                "guardrail_score": guardrail_score,
+                "risk_score": risk_score,
+                "price_action_score": price_action_score,
+                "regime_score": regime_score,
+                "expected_value_score": ev_score,
+                "carry_score": carry_score,
+                "current_net_apy": current_net_apy,
+                "nearest_up_touch_probability_pct": up_touch,
+                "nearest_down_touch_probability_pct": down_touch,
+                "touch_probability_source": touch_probability_source,
+            },
+            "guardrails": {
+                "min_start_health_factor": min_hf,
+                "max_prob_hf_lt_1_pct": max_prob_hf,
+                "current_passes_constraints": current_passes,
+                "optimization_recommended_loops": optimization.get("recommended_loops")
+                if isinstance(optimization, dict)
+                else None,
+            },
+            "support_resistance": (
+                price_action.get("support_resistance")
+                if isinstance(price_action, dict)
+                else None
+            ),
+            "decision_reasons": reasons,
+        }
+
+    def _build_professional_modeling(
+        self,
+        *,
+        borrow_rate_paths: np.ndarray,
+        steth_market_paths: np.ndarray,
+        exchange_rate_paths: np.ndarray,
+        eth_usd_paths: np.ndarray,
+        pnl_paths: np.ndarray,
+        hf_paths: np.ndarray,
+        first_hf_breach: np.ndarray,
+        terminal_execution_depeg: np.ndarray,
+        terminal_vol: np.ndarray,
+        util_paths: np.ndarray,
+        dt: float,
+    ) -> dict[str, Any]:
+        """Build the professional pre-trade model package requested by the user."""
+        initial_debt = (
+            float(self.position.total_debt_stable or 0.0)
+            if self.debt_mode == "stablecoin"
+            else float(self.position.total_debt_weth)
+        )
+        debt_paths = self._compound_debt_paths(initial_debt, borrow_rate_paths, dt)
+        current_borrow = self._current_position_borrow_rate()
+        historical_replay = self._historical_replay_report(
+            borrow_rate=current_borrow,
+        )
+        optimization = self._loop_optimization_report(
+            borrow_rate_paths=borrow_rate_paths,
+            steth_market_paths=steth_market_paths,
+            exchange_rate_paths=exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
+            terminal_execution_depeg=terminal_execution_depeg,
+            terminal_vol=terminal_vol,
+            dt=dt,
+        )
+        entry_sweep = self._entry_sweep_report(
+            borrow_rate_paths=borrow_rate_paths,
+            steth_market_paths=steth_market_paths,
+            exchange_rate_paths=exchange_rate_paths,
+            dt=dt,
+        )
+        market_regime_forecast = self._market_regime_forecast_report()
+        touch_model_forecast = self._touch_model_forecast_report()
+        price_action = self._price_action_report()
+        return {
+            "liquidation_price_ladder": self._liquidation_price_ladder(
+                debt_paths=debt_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                eth_usd_paths=eth_usd_paths,
+            ),
+            "liquidation_loss_model": self._liquidation_loss_report(
+                hf_paths=hf_paths,
+                debt_paths=debt_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                eth_usd_paths=eth_usd_paths,
+                first_hf_breach=first_hf_breach,
+            ),
+            "historical_replay": historical_replay,
+            "model_validation_scorecard": self._validation_scorecard_report(
+                historical_replay=historical_replay,
+                pnl_paths=pnl_paths,
+                hf_paths=hf_paths,
+                borrow_rate_paths=borrow_rate_paths,
+                util_paths=util_paths,
+            ),
+            "regime_scenarios": self._regime_scenario_report(
+                borrow_rate=current_borrow,
+            ),
+            "execution_realism": self._estimate_entry_execution_for_position(self.position),
+            "exit_unwind": self._exit_unwind_report(
+                debt_paths=debt_paths,
+                borrow_rate=current_borrow,
+            ),
+            "borrow_rate_stress": self._borrow_rate_stress_report(
+                debt_paths=debt_paths,
+            ),
+            "oracle_specific_risk": self._oracle_risk_report(
+                hf_paths=hf_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                eth_usd_paths=eth_usd_paths,
+                steth_market_paths=steth_market_paths,
+            ),
+            "optimization": optimization,
+            "entry_sweep": entry_sweep,
+            "market_regime_forecast": market_regime_forecast,
+            "touch_model_forecast": touch_model_forecast,
+            "position_sizing": self._position_sizing_report(
+                optimization=optimization,
+                touch_forecast=touch_model_forecast,
+            ),
+            "exit_policy": self._exit_policy_report(
+                borrow_rate_paths=borrow_rate_paths,
+                exchange_rate_paths=exchange_rate_paths,
+                steth_market_paths=steth_market_paths,
+                eth_usd_paths=eth_usd_paths,
+                dt=dt,
+            ),
+            "price_action": price_action,
+            "pre_trade_entry_score": self._pre_trade_entry_score_report(
+                entry_sweep=entry_sweep,
+                market_regime=market_regime_forecast,
+                price_action=price_action,
+                optimization=optimization,
+                touch_forecast=touch_model_forecast,
+            ),
+            "model_limitations": [
+                "Entry execution uses reduced-form slippage unless live route quotes are explicitly wired for that leg.",
+                "Historical replay uses available ETH price history and holds borrow routing assumptions constant.",
+                "Entry sweep resimulates ETH paths per entry but reuses the main simulation borrow-rate paths.",
+                "Price-action support/resistance uses hourly Deribit OHLCV clusters when provided.",
+                "Heuristic market-regime forecast did not clear its walk-forward gate; touch probabilities defer to the gated supervised touch model when its persisted fit is available.",
+                "Supervised touch-model edge is mostly cross-target discrimination (strict per-target skill is small); treat as scenario weights, not directional alpha.",
+                "Position sizing evaluates discrete loop counts against the simulated P&L distribution; Kelly fraction and CVaR budget are policy parameters.",
+                "Exit-policy ladder assumes partial deleveraging executes at the market stETH/ETH price with Curve slippage in the same step the trigger is observed.",
+                "Oracle outage/staleness is reported but not probabilistically simulated.",
+                "Optimization is scenario-dependent and should be rerun immediately before execution.",
+            ],
+        }
 
     def run(self, seed: int | None = None) -> DashboardOutput:
         """Run the full simulation pipeline."""
@@ -1743,8 +4564,8 @@ class Dashboard:
         dt_days = grid.dt_days
         time_grid_days = grid.time_grid_days
 
-        # === Phase 1: ETH price paths (GBM) ===
-        eth_paths = self.gbm.simulate(
+        # === Phase 1: ETH price paths ===
+        eth_paths = self.price_simulator.simulate(
             s0=1.0,  # Normalized (only relative moves matter)
             n_paths=n_paths,
             n_steps=n_steps,
@@ -2249,10 +5070,47 @@ class Dashboard:
             self.util_params.clip_min,
             self.util_params.clip_max,
         )
+        stablecoin_liquidation_shocks = self._stablecoin_liquidation_step_shocks(
+            replay_diag_projected,
+            n_paths=n_paths,
+            n_steps=n_steps,
+        )
+        (
+            stablecoin_util_paths_without_liq,
+            stablecoin_rate_paths_without_liq_pre,
+        ) = self._simulate_stablecoin_rate_paths(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            step_shocks=np.zeros((n_paths, n_steps), dtype=float),
+            util_seed=util_seed,
+        )
+        (
+            stablecoin_util_paths_pre_spread,
+            stablecoin_rate_paths_pre_spread,
+        ) = self._simulate_stablecoin_rate_paths(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            step_shocks=stablecoin_liquidation_shocks,
+            util_seed=util_seed,
+        )
 
         # === Phase 4: Borrow rate paths + governance IR shocks (pre-feedback pass) ===
-        base_borrow_rate_paths_without_liq_pre = self.rate_model.borrow_rate(util_paths_without_liq)
-        base_borrow_rate_paths_pre_spread = self.rate_model.borrow_rate(util_paths_pre_spread)
+        weth_base_borrow_rate_paths_without_liq_pre = self.rate_model.borrow_rate(
+            util_paths_without_liq
+        )
+        weth_base_borrow_rate_paths_pre_spread = self.rate_model.borrow_rate(
+            util_paths_pre_spread
+        )
+        base_borrow_rate_paths_without_liq_pre = self._position_base_borrow_rate_paths(
+            weth_base_borrow_rate_paths_without_liq_pre,
+            stablecoin_rate_paths=stablecoin_rate_paths_without_liq_pre,
+        )
+        base_borrow_rate_paths_pre_spread = self._position_base_borrow_rate_paths(
+            weth_base_borrow_rate_paths_pre_spread,
+            stablecoin_rate_paths=stablecoin_rate_paths_pre_spread,
+        )
         gov_rng = np.random.default_rng(rng.integers(0, 2**31))
         (
             governance_rate_spread_paths,
@@ -2335,9 +5193,29 @@ class Dashboard:
             rng=np.random.default_rng(util_seed),
         )
         util_paths = np.clip(util_paths, self.util_params.clip_min, self.util_params.clip_max)
+        stablecoin_combined_step_shocks = np.clip(
+            stablecoin_liquidation_shocks + spread_feedback_shocks,
+            -0.20,
+            0.20,
+        )
+        stablecoin_util_paths, stablecoin_rate_paths = self._simulate_stablecoin_rate_paths(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            step_shocks=stablecoin_combined_step_shocks,
+            util_seed=util_seed,
+        )
 
-        base_borrow_rate_paths_no_liq = self.rate_model.borrow_rate(util_paths_without_liq)
-        base_borrow_rate_paths = self.rate_model.borrow_rate(util_paths)
+        weth_base_borrow_rate_paths_no_liq = self.rate_model.borrow_rate(util_paths_without_liq)
+        weth_base_borrow_rate_paths = self.rate_model.borrow_rate(util_paths)
+        base_borrow_rate_paths_no_liq = self._position_base_borrow_rate_paths(
+            weth_base_borrow_rate_paths_no_liq,
+            stablecoin_rate_paths=stablecoin_rate_paths_without_liq_pre,
+        )
+        base_borrow_rate_paths = self._position_base_borrow_rate_paths(
+            weth_base_borrow_rate_paths,
+            stablecoin_rate_paths=stablecoin_rate_paths,
+        )
         borrow_rate_paths_without_liq = np.clip(
             base_borrow_rate_paths_no_liq + governance_rate_spread_paths,
             0.0,
@@ -2349,12 +5227,21 @@ class Dashboard:
             None,
         )
         borrow_rate_liq_delta = borrow_rate_paths - borrow_rate_paths_without_liq
+        position_util_paths = (
+            stablecoin_util_paths
+            if stablecoin_util_paths is not None
+            else util_paths
+        )
 
         utilization_analytics = self._summarize_utilization_dynamics(
-            util_paths=util_paths,
+            util_paths=position_util_paths,
             eth_paths=eth_paths,
             borrow_rate_paths=borrow_rate_paths,
-            cascade_step_shocks=combined_step_shocks,
+            cascade_step_shocks=(
+                stablecoin_combined_step_shocks
+                if stablecoin_util_paths is not None
+                else combined_step_shocks
+            ),
         )
 
         # Market depeg paths drive MTM P&L only (not HF/liquidation trigger logic).
@@ -2364,7 +5251,7 @@ class Dashboard:
             dt=dt,
             eth_price_paths=eth_paths,
             borrow_rate_paths=borrow_rate_paths,
-            leverage_state_paths=util_paths[:, :-1],
+            leverage_state_paths=position_util_paths[:, :-1],
             rng=np.random.default_rng(rng.integers(0, 2**31)),
         )
 
@@ -2529,18 +5416,21 @@ class Dashboard:
             base_borrow_rate_paths,
             steth_market_paths,
             exchange_rate_paths=baseline_exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
             dt=dt,
         )
         carry_no_gov_paths = self.position.pnl_paths(
             base_borrow_rate_paths,
             steth_market_paths,
             exchange_rate_paths=exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
             dt=dt,
         )
         carry_paths = self.position.pnl_paths(
             borrow_rate_paths,
             steth_market_paths,
             exchange_rate_paths=exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
             dt=dt,
         )
 
@@ -2549,6 +5439,7 @@ class Dashboard:
             borrow_rate_paths=borrow_rate_paths,
             dt=dt,
             exchange_rate_paths=exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
             lt_paths=lt_paths,
         )
         first_hf_breach = self.risk_metrics.first_breach_step(hf_paths, threshold=1.0)
@@ -2606,6 +5497,12 @@ class Dashboard:
 
         # === Phase 9: Risk metrics and decomposition ===
         risk_output = self.risk_metrics.compute_all(pnl_paths, hf_paths)
+        terminal_pnl = np.asarray(pnl_paths[:, -1], dtype=float)
+        terminal_pnl_p5, terminal_pnl_p50, terminal_pnl_p95 = np.percentile(
+            terminal_pnl,
+            [5.0, 50.0, 95.0],
+        )
+        terminal_profit_probability = float(np.mean(terminal_pnl > 0.0))
         slashing_losses = np.maximum(carry_baseline_paths[:, -1] - carry_no_gov_paths[:, -1], 0.0)
         governance_losses = np.maximum(carry_no_gov_paths[:, -1] - carry_paths[:, -1], 0.0)
         governance_losses += np.where(governance_has_event & exit_mask, unwind_cost_paths, 0.0)
@@ -2780,6 +5677,8 @@ class Dashboard:
 
         time_series_diagnostics = {
             "time_grid_days": [float(v) for v in time_grid_days],
+            "eth_price_relative": self._time_series_percentiles(eth_paths),
+            "eth_usd_price": self._time_series_percentiles(eth_usd_paths),
             "v_stables_usd": self._time_series_percentiles(replay_v_stables_usd),
             "v_weth": self._time_series_percentiles(replay_v_weth),
             "cost_bps": self._time_series_percentiles(replay_cost_bps),
@@ -2858,8 +5757,22 @@ class Dashboard:
             ),
         }
 
+        professional_modeling_payload = self._build_professional_modeling(
+            borrow_rate_paths=borrow_rate_paths,
+            steth_market_paths=steth_market_paths,
+            exchange_rate_paths=exchange_rate_paths,
+            eth_usd_paths=eth_usd_paths,
+            pnl_paths=pnl_paths,
+            hf_paths=hf_paths,
+            first_hf_breach=first_hf_breach,
+            terminal_execution_depeg=terminal_execution_depeg,
+            terminal_vol=terminal_vol,
+            util_paths=position_util_paths,
+            dt=dt,
+        )
+
         # === Position summary ===
-        current_borrow = float(self.rate_model.borrow_rate(self.market.current_weth_utilization))
+        current_borrow = self._current_position_borrow_rate()
         snap = self.position.snapshot(current_borrow)
 
         # === APY forecast (+24h, or horizon when horizon_days < 1) ===
@@ -2965,6 +5878,11 @@ class Dashboard:
         )
         reported_prob_liquidation = position_prob_liquidation
         reported_prob_source = "position_hf"
+        liquidation_risk_label = (
+            "ETH/USD and rate driven (stablecoin debt + oracle collateral value)"
+            if self.debt_mode == "stablecoin"
+            else "rate/carry driven (oracle exchange-rate path + debt accrual)"
+        )
 
         horizon_label = f"{grid.horizon_days:g}d"
         risk_metrics_payload = {
@@ -2974,6 +5892,11 @@ class Dashboard:
             "var_99_eth": round(risk_output.var_99, 4),
             "cvar_95_eth": round(risk_output.cvar_95, 4),
             "cvar_99_eth": round(risk_output.cvar_99, 4),
+            "terminal_pnl_mean_eth": round(float(np.mean(terminal_pnl)), 4),
+            "terminal_pnl_p5_eth": round(float(terminal_pnl_p5), 4),
+            "terminal_pnl_p50_eth": round(float(terminal_pnl_p50), 4),
+            "terminal_pnl_p95_eth": round(float(terminal_pnl_p95), 4),
+            "prob_terminal_profit_pct": round(terminal_profit_probability * 100, 2),
             "max_drawdown_mean_eth": round(risk_output.max_drawdown_mean, 4),
             "max_drawdown_95_eth": round(risk_output.max_drawdown_95, 4),
             "prob_liquidation_pct": round(reported_prob_liquidation * 100, 2),
@@ -2999,7 +5922,7 @@ class Dashboard:
             ),
             "prob_exit_pct": round(decomposition.exit_probability * 100, 2),
             "health_factor_current": round(snap.health_factor, 4),
-            "liquidation_risk": "rate/carry driven (oracle exchange-rate path + debt accrual)",
+            "liquidation_risk": liquidation_risk_label,
             "time_to_hf_lt_1_median_days": (
                 round(time_to_hf1_median, 2) if time_to_hf1_median is not None else None
             ),
@@ -3058,10 +5981,51 @@ class Dashboard:
                 "params": params_source,
                 "params_last_updated": self.params_meta["last_updated"],
                 "params_log": self.params_meta["params_log"],
+                "debt_mode": self.debt_mode,
+                "debt_asset": self.debt_asset,
+                "stablecoin_borrow_apy": self.stablecoin_borrow_apy,
+                "stablecoin_borrow_apy_source": self.stablecoin_borrow_apy_source
+                if self.debt_mode == "stablecoin"
+                else None,
+                "stablecoin_rate_model": (
+                    "aave_utilization_strategy"
+                    if self.stablecoin_rate_model is not None
+                    else ("manual_constant_apy" if self.debt_mode == "stablecoin" else None)
+                ),
+                "stablecoin_reserve": (
+                    {
+                        "symbol": self.stablecoin_reserve.symbol,
+                        "current_utilization": self.stablecoin_reserve.current_utilization,
+                        "current_variable_borrow_rate": (
+                            self.stablecoin_reserve.current_variable_borrow_rate
+                        ),
+                        "total_supply": self.stablecoin_reserve.total_supply,
+                        "total_borrows": self.stablecoin_reserve.total_borrows,
+                        "source": self.stablecoin_reserve.source,
+                    }
+                    if self.stablecoin_reserve is not None
+                    else None
+                ),
+                "eth_expected_return": self.eth_expected_return,
+                "eth_expected_return_source": self.eth_expected_return_source,
+                "eth_drift_mu_annualized": self.eth_drift_mu,
+                "eth_price_model": self.eth_price_model,
+                "eth_entry_price_usd": float(self.market.eth_usd_price),
+                "eth_mean_reversion_target_usd": self.eth_mean_reversion_target_usd,
+                "eth_mean_reversion_target_ratio": self.eth_mean_reversion_target_ratio,
+                "eth_mean_reversion_half_life_days": self.eth_mean_reversion_half_life_days,
+                "eth_mean_reversion_speed_annual": self.eth_mean_reversion_speed_annual,
                 "staking_apy_method": self.staking_apy_method,
                 "staking_apy_metadata": self.staking_apy_metadata,
+                "depeg_feedback_params": {
+                    "unwind_sensitivity": self.depeg_feedback.unwind_sensitivity,
+                    "max_daily_unwind_frac": self.depeg_feedback.max_daily_unwind_frac,
+                    "total_looped_tvl_eth": self.depeg_feedback.total_looped_tvl_eth,
+                    "available_liquidity_eth": self.depeg_feedback.available_liquidity_eth,
+                },
                 "defaults_used": self.defaults_used,
                 "vol": vol_source,
+                "utilization_calibration": self.utilization_calibration,
                 "aave_oracle_address": self.aave_oracle_address,
                 "cohort_source": self.cohort_source,
                 "cohort_fetch_error": self.cohort_fetch_error,
@@ -3186,16 +6150,25 @@ class Dashboard:
             position_summary={
                 'capital_eth': snap.capital_eth,
                 'n_loops': snap.n_loops,
+                'debt_mode': snap.debt_mode,
+                'debt_asset': snap.debt_asset,
                 'ltv': snap.ltv,
                 'leverage': round(snap.leverage, 3),
                 'total_collateral_eth': round(snap.total_collateral_eth, 3),
                 'total_collateral_wsteth': round(snap.total_collateral_wsteth, 3),
                 'total_debt_weth': round(snap.total_debt_weth, 3),
+                'total_debt_eth_equivalent': round(snap.total_debt_weth, 3),
+                'total_debt_stable': (
+                    round(float(snap.total_debt_stable), 3)
+                    if snap.total_debt_stable is not None
+                    else None
+                ),
+                'initial_eth_usd_price': round(snap.initial_eth_usd_price, 6),
                 'current_borrow_rate_pct': round(current_borrow * 100, 3),
                 'net_apy_pct': round(snap.net_apy * 100, 3),
                 'net_apy_label': 'current net APY',
                 'health_factor': round(snap.health_factor, 4),
-                'liquidation_risk': 'carry/rate driven (HF tracks debt growth + oracle ER)',
+                'liquidation_risk': liquidation_risk_label,
             },
             current_apy={
                 'label': 'current net APY',
@@ -3287,6 +6260,7 @@ class Dashboard:
             liquidation_diagnostics=liquidation_diagnostics,
             spread_forecast=spread_forecast_payload,
             time_series_diagnostics=time_series_diagnostics,
+            professional_modeling=professional_modeling_payload,
             simulation_config={
                 'n_simulations': n_paths,
                 'horizon_days': round(float(grid.horizon_days), 6),
@@ -3295,8 +6269,49 @@ class Dashboard:
                 'seed': seed,
                 'dt': dt,
                 'dt_days': dt_days,
+                'debt_mode': self.debt_mode,
+                'debt_asset': self.debt_asset,
+                'stablecoin_borrow_apy': self.stablecoin_borrow_apy,
+                'stablecoin_borrow_apy_source': self.stablecoin_borrow_apy_source
+                if self.debt_mode == "stablecoin"
+                else None,
+                'stablecoin_rate_model': (
+                    "aave_utilization_strategy"
+                    if self.stablecoin_rate_model is not None
+                    else ("manual_constant_apy" if self.debt_mode == "stablecoin" else None)
+                ),
+                'stablecoin_current_utilization': (
+                    self.stablecoin_reserve.current_utilization
+                    if self.stablecoin_reserve is not None
+                    else None
+                ),
+                'stablecoin_total_supply': (
+                    self.stablecoin_reserve.total_supply
+                    if self.stablecoin_reserve is not None
+                    else None
+                ),
+                'stablecoin_total_borrows': (
+                    self.stablecoin_reserve.total_borrows
+                    if self.stablecoin_reserve is not None
+                    else None
+                ),
+                'eth_expected_return': self.eth_expected_return,
+                'eth_expected_return_source': self.eth_expected_return_source,
+                'eth_drift_mu_annualized': self.eth_drift_mu,
+                'eth_price_model': self.eth_price_model,
+                'eth_entry_price_usd': float(self.market.eth_usd_price),
+                'eth_mean_reversion_target_usd': self.eth_mean_reversion_target_usd,
+                'eth_mean_reversion_target_ratio': self.eth_mean_reversion_target_ratio,
+                'eth_mean_reversion_half_life_days': self.eth_mean_reversion_half_life_days,
+                'eth_mean_reversion_speed_annual': self.eth_mean_reversion_speed_annual,
                 'staking_apy_method': self.staking_apy_method,
                 'staking_apy_metadata': self.staking_apy_metadata,
+                'depeg_feedback_params': {
+                    'unwind_sensitivity': self.depeg_feedback.unwind_sensitivity,
+                    'max_daily_unwind_frac': self.depeg_feedback.max_daily_unwind_frac,
+                    'total_looped_tvl_eth': self.depeg_feedback.total_looped_tvl_eth,
+                    'available_liquidity_eth': self.depeg_feedback.available_liquidity_eth,
+                },
                 'timestep_minutes': (
                     float(getattr(self.config, "timestep_minutes", 0.0))
                     if getattr(self.config, "timestep_minutes", None) is not None
@@ -3313,6 +6328,10 @@ class Dashboard:
                 'step_at_24h': int(forecast_step_idx),
                 'forecast_label_key': forecast_label,
                 'calibrated_sigma': round(self.calibrated_sigma, 4),
+                'utilization_calibration': self.utilization_calibration,
+                'utilization_mean_reversion_speed': self.util_params.mean_reversion_speed,
+                'utilization_base_target': self.util_params.base_target,
+                'utilization_vol': self.util_params.vol,
                 'cascade_avg_ltv': self.cascade_avg_ltv,
                 'cascade_avg_lt': self.cascade_avg_lt,
                 'cohort_source': self.cohort_source,

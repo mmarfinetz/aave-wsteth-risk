@@ -47,6 +47,32 @@ class DashboardRunRequest:
     allow_large_step_grid: bool = False
     seed: int = 42
     force_refresh: bool = False
+    debt_mode: str = "weth"
+    debt_asset: str = "WETH"
+    stablecoin_borrow_apy: float | None = None
+    eth_expected_return: float | None = None
+    eth_entry_price_usd: float | None = None
+    eth_price_model: str = "gbm"
+    eth_mean_reversion_target_usd: float | None = None
+    eth_mean_reversion_half_life_days: float | None = None
+    eth_mean_reversion_speed_annual: float | None = None
+    optimization_min_loops: int | None = None
+    optimization_max_loops: int | None = None
+    entry_sweep_prices_usd: str | list[float] | None = None
+    entry_sweep_min_usd: float | None = None
+    entry_sweep_max_usd: float | None = None
+    entry_sweep_step_usd: float | None = None
+    entry_sweep_points: int | None = None
+    entry_sweep_target_usd: float | None = None
+    entry_sweep_max_paths: int | None = None
+    market_regime_features: dict[str, Any] | None = None
+    market_regime_targets_usd: str | list[float] | None = None
+    market_regime_n_paths: int = 20_000
+    opt_max_prob_hf_lt_1_pct: float | None = None
+    opt_min_start_hf: float | None = None
+    opt_max_entry_cost_bps: float | None = None
+    opt_max_unwind_cost_bps: float | None = None
+    opt_unwind_stress_multiplier: float | None = None
     staking_apy_method: str | None = None
     staking_apy_lookback_days: int = 7
     exchange_rate_mode: str | None = None
@@ -102,6 +128,11 @@ class DashboardRunRequest:
             str(self.exchange_rate_mode).strip().lower()
             if self.exchange_rate_mode is not None and str(self.exchange_rate_mode).strip()
             else ("simple" if config.profile_name == "operational" else "capo_slashing")
+        )
+        payload["debt_mode"] = str(self.debt_mode).strip().lower() or "weth"
+        payload["debt_asset"] = str(self.debt_asset).strip().upper() or "WETH"
+        payload["eth_price_model"] = (
+            str(self.eth_price_model).strip().lower().replace("-", "_") or "gbm"
         )
         payload["zerox_taker"] = (
             str(self.zerox_taker).strip()
@@ -223,6 +254,49 @@ def build_request_from_env() -> DashboardRunRequest:
         allow_large_step_grid=_env_flag("DASHBOARD_ALLOW_LARGE_STEP_GRID", False),
         seed=_env_int("DASHBOARD_SEED", 42),
         force_refresh=_env_flag("DASHBOARD_FORCE_REFRESH", False),
+        debt_mode=_env_str("DASHBOARD_DEBT_MODE", "weth").lower() or "weth",
+        debt_asset=_env_str("DASHBOARD_DEBT_ASSET", "WETH").upper() or "WETH",
+        stablecoin_borrow_apy=_env_float("DASHBOARD_STABLECOIN_BORROW_APY", None),
+        eth_expected_return=_env_float("DASHBOARD_ETH_EXPECTED_RETURN", None),
+        eth_entry_price_usd=_env_float("DASHBOARD_ETH_ENTRY_PRICE_USD", None),
+        eth_price_model=(
+            _env_str("DASHBOARD_ETH_PRICE_MODEL", "gbm").lower().replace("-", "_") or "gbm"
+        ),
+        eth_mean_reversion_target_usd=_env_float(
+            "DASHBOARD_ETH_MEAN_REVERSION_TARGET_USD",
+            None,
+        ),
+        eth_mean_reversion_half_life_days=_env_float(
+            "DASHBOARD_ETH_MEAN_REVERSION_HALF_LIFE_DAYS",
+            None,
+        ),
+        eth_mean_reversion_speed_annual=_env_float(
+            "DASHBOARD_ETH_MEAN_REVERSION_SPEED_ANNUAL",
+            None,
+        ),
+        optimization_min_loops=_env_optional_int("DASHBOARD_OPTIMIZATION_MIN_LOOPS"),
+        optimization_max_loops=_env_optional_int("DASHBOARD_OPTIMIZATION_MAX_LOOPS"),
+        entry_sweep_prices_usd=_env_str("DASHBOARD_ENTRY_SWEEP_PRICES_USD", "") or None,
+        entry_sweep_min_usd=_env_float("DASHBOARD_ENTRY_SWEEP_MIN_USD", None),
+        entry_sweep_max_usd=_env_float("DASHBOARD_ENTRY_SWEEP_MAX_USD", None),
+        entry_sweep_step_usd=_env_float("DASHBOARD_ENTRY_SWEEP_STEP_USD", None),
+        entry_sweep_points=_env_optional_int("DASHBOARD_ENTRY_SWEEP_POINTS"),
+        entry_sweep_target_usd=_env_float("DASHBOARD_ENTRY_SWEEP_TARGET_USD", None),
+        entry_sweep_max_paths=_env_optional_int("DASHBOARD_ENTRY_SWEEP_MAX_PATHS"),
+        market_regime_features=_env_json_object("DASHBOARD_MARKET_REGIME_FEATURES_JSON"),
+        market_regime_targets_usd=_env_str("DASHBOARD_MARKET_REGIME_TARGETS_USD", "") or None,
+        market_regime_n_paths=_env_int("DASHBOARD_MARKET_REGIME_PATHS", 20_000),
+        opt_max_prob_hf_lt_1_pct=_env_float(
+            "DASHBOARD_OPT_MAX_PROB_HF_LT_1_PCT",
+            None,
+        ),
+        opt_min_start_hf=_env_float("DASHBOARD_OPT_MIN_START_HF", None),
+        opt_max_entry_cost_bps=_env_float("DASHBOARD_OPT_MAX_ENTRY_COST_BPS", None),
+        opt_max_unwind_cost_bps=_env_float("DASHBOARD_OPT_MAX_UNWIND_COST_BPS", None),
+        opt_unwind_stress_multiplier=_env_float(
+            "DASHBOARD_OPT_UNWIND_STRESS_MULTIPLIER",
+            None,
+        ),
         staking_apy_method=_env_str("DASHBOARD_STAKING_APY_METHOD", "").lower() or None,
         staking_apy_lookback_days=_env_int("DASHBOARD_STAKING_APY_LOOKBACK_DAYS", 7),
         exchange_rate_mode=_env_str(
@@ -556,6 +630,123 @@ def run_dashboard_simulation(
 
     params["account_replay_max_paths"] = int(request.account_replay_max_paths)
     params["account_replay_max_accounts"] = int(request.account_replay_max_accounts)
+    params["debt_mode"] = str(request.debt_mode)
+    params["debt_asset"] = str(request.debt_asset)
+    if request.stablecoin_borrow_apy is not None:
+        params["stablecoin_borrow_apy"] = float(request.stablecoin_borrow_apy)
+        params["stablecoin_borrow_apy_source"] = "request"
+    if request.eth_expected_return is not None:
+        params["eth_expected_return"] = float(request.eth_expected_return)
+        params["eth_expected_return_source"] = "request"
+    if request.eth_entry_price_usd is not None:
+        if float(request.eth_entry_price_usd) <= 0.0:
+            raise ValueError("eth_entry_price_usd must be positive")
+        params["eth_entry_price_usd"] = float(request.eth_entry_price_usd)
+    eth_price_model = str(request.eth_price_model).strip().lower().replace("-", "_") or "gbm"
+    if eth_price_model not in {"gbm", "mean_reverting"}:
+        raise ValueError("eth_price_model must be one of: 'gbm', 'mean_reverting'")
+    params["eth_price_model"] = eth_price_model
+    if request.eth_mean_reversion_target_usd is not None:
+        if float(request.eth_mean_reversion_target_usd) <= 0.0:
+            raise ValueError("eth_mean_reversion_target_usd must be positive")
+        params["eth_mean_reversion_target_usd"] = float(
+            request.eth_mean_reversion_target_usd
+        )
+    if request.eth_mean_reversion_half_life_days is not None:
+        if float(request.eth_mean_reversion_half_life_days) <= 0.0:
+            raise ValueError("eth_mean_reversion_half_life_days must be positive")
+        params["eth_mean_reversion_half_life_days"] = float(
+            request.eth_mean_reversion_half_life_days
+        )
+    if request.eth_mean_reversion_speed_annual is not None:
+        if float(request.eth_mean_reversion_speed_annual) <= 0.0:
+            raise ValueError("eth_mean_reversion_speed_annual must be positive")
+        params["eth_mean_reversion_speed_annual"] = float(
+            request.eth_mean_reversion_speed_annual
+        )
+    if (
+        eth_price_model == "mean_reverting"
+        and request.eth_mean_reversion_target_usd is None
+        and request.eth_expected_return is None
+    ):
+        raise ValueError(
+            "eth_price_model='mean_reverting' requires "
+            "eth_mean_reversion_target_usd or eth_expected_return"
+        )
+    if request.optimization_min_loops is not None:
+        if int(request.optimization_min_loops) < 1:
+            raise ValueError("optimization_min_loops must be >= 1")
+        params["optimization_min_loops"] = int(request.optimization_min_loops)
+    if request.optimization_max_loops is not None:
+        if int(request.optimization_max_loops) < 1:
+            raise ValueError("optimization_max_loops must be >= 1")
+        params["optimization_max_loops"] = int(request.optimization_max_loops)
+    if (
+        request.optimization_min_loops is not None
+        and request.optimization_max_loops is not None
+        and int(request.optimization_max_loops) < int(request.optimization_min_loops)
+    ):
+        raise ValueError("optimization_max_loops must be >= optimization_min_loops")
+    if request.entry_sweep_prices_usd is not None:
+        params["entry_sweep_prices_usd"] = request.entry_sweep_prices_usd
+    if request.entry_sweep_min_usd is not None:
+        if float(request.entry_sweep_min_usd) <= 0.0:
+            raise ValueError("entry_sweep_min_usd must be positive")
+        params["entry_sweep_min_usd"] = float(request.entry_sweep_min_usd)
+    if request.entry_sweep_max_usd is not None:
+        if float(request.entry_sweep_max_usd) <= 0.0:
+            raise ValueError("entry_sweep_max_usd must be positive")
+        params["entry_sweep_max_usd"] = float(request.entry_sweep_max_usd)
+    if (
+        request.entry_sweep_min_usd is not None
+        and request.entry_sweep_max_usd is not None
+        and float(request.entry_sweep_max_usd) < float(request.entry_sweep_min_usd)
+    ):
+        raise ValueError("entry_sweep_max_usd must be >= entry_sweep_min_usd")
+    if request.entry_sweep_step_usd is not None:
+        if float(request.entry_sweep_step_usd) <= 0.0:
+            raise ValueError("entry_sweep_step_usd must be positive")
+        params["entry_sweep_step_usd"] = float(request.entry_sweep_step_usd)
+    if request.entry_sweep_points is not None:
+        if int(request.entry_sweep_points) < 2:
+            raise ValueError("entry_sweep_points must be >= 2")
+        params["entry_sweep_points"] = int(request.entry_sweep_points)
+    if request.entry_sweep_target_usd is not None:
+        if float(request.entry_sweep_target_usd) <= 0.0:
+            raise ValueError("entry_sweep_target_usd must be positive")
+        params["entry_sweep_target_usd"] = float(request.entry_sweep_target_usd)
+    if request.entry_sweep_max_paths is not None:
+        if int(request.entry_sweep_max_paths) < 1:
+            raise ValueError("entry_sweep_max_paths must be >= 1")
+        params["entry_sweep_max_paths"] = int(request.entry_sweep_max_paths)
+    if request.market_regime_features is not None:
+        params["market_regime_features"] = dict(request.market_regime_features)
+    if request.market_regime_targets_usd is not None:
+        params["market_regime_targets_usd"] = request.market_regime_targets_usd
+    if int(request.market_regime_n_paths) < 100:
+        raise ValueError("market_regime_n_paths must be >= 100")
+    params["market_regime_n_paths"] = int(request.market_regime_n_paths)
+    if request.opt_max_prob_hf_lt_1_pct is not None:
+        if float(request.opt_max_prob_hf_lt_1_pct) < 0.0:
+            raise ValueError("opt_max_prob_hf_lt_1_pct must be non-negative")
+        params["opt_max_prob_hf_lt_1_pct"] = float(request.opt_max_prob_hf_lt_1_pct)
+    if request.opt_min_start_hf is not None:
+        if float(request.opt_min_start_hf) <= 0.0:
+            raise ValueError("opt_min_start_hf must be positive")
+        params["opt_min_start_hf"] = float(request.opt_min_start_hf)
+    if request.opt_max_entry_cost_bps is not None:
+        if float(request.opt_max_entry_cost_bps) < 0.0:
+            raise ValueError("opt_max_entry_cost_bps must be non-negative")
+        params["opt_max_entry_cost_bps"] = float(request.opt_max_entry_cost_bps)
+    if request.opt_max_unwind_cost_bps is not None:
+        if float(request.opt_max_unwind_cost_bps) < 0.0:
+            raise ValueError("opt_max_unwind_cost_bps must be non-negative")
+        params["opt_max_unwind_cost_bps"] = float(request.opt_max_unwind_cost_bps)
+    if request.opt_unwind_stress_multiplier is not None:
+        stress = float(request.opt_unwind_stress_multiplier)
+        if stress <= 0.0 or stress > 1.0:
+            raise ValueError("opt_unwind_stress_multiplier must be in (0, 1]")
+        params["opt_unwind_stress_multiplier"] = stress
     params["abm"] = ABMConfig(
         enabled=abm_enabled,
         mode=abm_mode,

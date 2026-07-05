@@ -6,7 +6,7 @@ This repository contains the simulation engine and HTTP API only. The dashboard 
 
 ## What this project does
 
-The dashboard simulates a looped wstETH/WETH position under correlated market stress and reports:
+The dashboard simulates a looped wstETH position under correlated market stress and reports:
 
 - position stats (leverage, net APY, HF)
 - carry/rate risk via WETH utilization and borrow-rate paths
@@ -14,6 +14,11 @@ The dashboard simulates a looped wstETH/WETH position under correlated market st
 - stress scenarios (historical + model-derived hypotheticals)
 - unwind cost estimates (10/25/50/100% position)
 - APY/rate forecasts and risk decomposition
+
+Two debt-leg modes are supported:
+
+- `weth` (default): wstETH collateral / WETH debt looping. ETH/USD mostly cancels out of single-position HF.
+- `stablecoin`: wstETH collateral / USDC, USDT, or DAI debt. ETH/USD directly drives HF and P&L, so this is the mode for a directional ETH rally thesis.
 
 ## Data sourcing philosophy
 
@@ -110,6 +115,18 @@ python run_dashboard.py
 # Custom parameters
 python run_dashboard.py --capital 50 --loops 7 --simulations 20000 --horizon 14
 
+# Stablecoin debt mode: borrow USDC against wstETH, assuming ETH +20% over 30d
+python run_dashboard.py --capital 1.979 --loops 5 --profile legacy --horizon 30 \
+  --debt-mode stablecoin --debt-asset USDC \
+  --stablecoin-borrow-apy-pct 6.5 --eth-expected-return-pct 20
+
+# Sweep candidate entry prices for a 1500 -> 2000 ETH/USD rally thesis
+python run_dashboard.py --capital 1.938 --loops 3 --profile legacy --horizon 7 \
+  --debt-mode stablecoin --debt-asset USDC --entry-eth-usd 1500 \
+  --eth-price-model mean-reverting --eth-mean-reversion-target-usd 2000 \
+  --entry-sweep-prices-usd 1400,1450,1500,1550,1600 \
+  --entry-sweep-target-usd 2000 --json
+
 # Legacy profile (backward-compatible 30d daily-step behavior)
 python run_dashboard.py --profile legacy
 
@@ -127,6 +144,51 @@ python run_dashboard.py --use-account-level-cascade
 
 # Use live 0x quote-based unwind costs (requires ZEROX_API_KEY + taker address)
 python run_dashboard.py --unwind-cost-model live_0x --zerox-taker 0xYourEOA...
+
+# Build a dry-run Aave execution plan for the chart-style USDC loop trade.
+# This prints approvals, Aave calls, quote requirements, and HF guardrails.
+python run_trade_plan.py --wsteth 1.6 --loops 5 --entry-eth-usd 1728.8 \
+  --debt-asset USDC --stablecoin-borrow-apy-pct 6.5 \
+  --slippage-bps 50 --adverse-move-pct -5
+
+# Add live CoW Protocol quote checks for each USDC -> wstETH swap step.
+# This still does not sign or submit orders.
+python run_trade_plan.py --wsteth 1.6 --loops 4 --entry-eth-usd 1728.8 \
+  --debt-asset USDC --stablecoin-borrow-apy-pct 6.5 \
+  --slippage-bps 50 --adverse-move-pct -5 \
+  --wallet 0xYourWallet --swap-adapter cow
+
+# Use synchronous swap transaction builders for tighter recursive loops.
+# These fetch executable tx payloads and exact approval targets, but still do
+# not sign or submit transactions.
+ZEROX_API_KEY=... python run_trade_plan.py --wsteth 1.6 --loops 4 \
+  --entry-eth-usd 1728.8 --debt-asset USDC --slippage-bps 50 \
+  --wallet 0xYourWallet --swap-adapter 0x
+
+ONEINCH_API_KEY=... python run_trade_plan.py --wsteth 1.6 --loops 4 \
+  --entry-eth-usd 1728.8 --debt-asset USDC --slippage-bps 50 \
+  --wallet 0xYourWallet --swap-adapter oneinch
+
+# Preflight the same trade against a local Anvil mainnet fork.
+# Terminal 1: anvil --fork-url $MAINNET_RPC_URL
+# Terminal 2:
+python run_anvil_trade_test.py --wallet 0xYourWallet --wsteth 1.6 --loops 5 \
+  --entry-eth-usd 1728.8 --debt-asset USDC
+
+# Execute Aave calls on the fork with simulated swap fills. The wallet must
+# hold the projected total wstETH on the fork, or use --fund-wsteth-from.
+python run_anvil_trade_test.py --wallet 0xYourWallet --wsteth 1.6 --loops 4 \
+  --entry-eth-usd 1728.8 --debt-asset USDC --execute-aave
+
+# Execute the full fork path: Aave borrow -> exact approval -> 0x/1inch swap tx
+# -> Aave resupply. Requires a live aggregator API key for quote/tx payloads.
+ZEROX_API_KEY=... python run_anvil_trade_test.py --wallet 0xYourWallet \
+  --wsteth 1.6 --loops 4 --entry-eth-usd 1728.8 --debt-asset USDC \
+  --execute-aave --swap-adapter 0x
+
+ONEINCH_API_KEY=... python run_anvil_trade_test.py --wallet 0xYourWallet \
+  --wsteth 1.6 --loops 4 --entry-eth-usd 1728.8 --debt-asset USDC \
+  --execute-aave --swap-adapter oneinch
 
 # Enable hybrid Monte Carlo + ABM cascade (ABM surrogate projection)
 python run_dashboard.py --abm-enabled --abm-mode surrogate
@@ -161,12 +223,128 @@ python api.py --demo
 | `ETH_RPC_URL` | No | Preferred Ethereum JSON-RPC endpoint (Alchemy, Infura, your own node). Free public RPCs are used by default. |
 | `COINGECKO_API_KEY` or `COINGECKO_DEMO_API_KEY` | No | CoinGecko ETH price history and stETH/ETH market price. Free demo key available at coingecko.com. |
 | `ETHERSCAN_API_KEY` | No | Etherscan proxy fallback for `eth_call` and gas price when public RPCs fail. |
-| `ZEROX_API_KEY` | No | Required only when `--unwind-cost-model live_0x`; authenticates 0x quote API calls. |
+| `ZEROX_API_KEY` | No | Required only when `run_trade_plan.py` or `run_anvil_trade_test.py` uses `--swap-adapter 0x`, or when `--unwind-cost-model live_0x`; authenticates 0x API calls. |
+| `ONEINCH_API_KEY` | No | Required only when `run_trade_plan.py` or `run_anvil_trade_test.py` uses `--swap-adapter oneinch`; authenticates 1inch Classic Swap API calls. |
 | `ZEROX_TAKER_ADDRESS` | No | Required only when `--unwind-cost-model live_0x` unless provided via `--zerox-taker`. |
 | `GRAPH_API_KEY` | No | The Graph gateway auth for subgraph queries (when `AAVE_SUBGRAPH_URL` uses `/api/subgraphs/...` form). |
 | `AAVE_SUBGRAPH_URL` | Yes for live runs | Aave V3 subgraph endpoint used for cohort analytics on every live parameter load and for optional account-level replay. |
 
 The dashboard does not require paid API keys, but live runs do require `AAVE_SUBGRAPH_URL`. On-chain reads use free public Ethereum RPC endpoints by default, and CoinGecko / Etherscan keys remain optional.
+
+## Trade execution planning
+
+`run_trade_plan.py` turns a stablecoin-debt simulation into an auditable dry-run
+transaction plan. It prints exact ERC-20 approvals, Aave V3 supply/borrow calls,
+swap quote requirements, reserve-level HF guardrails, and liquidation-price
+checks. It is intentionally non-custodial: no private keys are read and no
+transactions are signed or submitted.
+
+The optional CoW adapter (`--swap-adapter cow`) calls the live CoW Protocol
+orderbook API for USDC/USDT/DAI -> wstETH quote terms and includes unsigned
+order payloads in `--json` output. CoW orders are signed intents settled later
+by solvers, so the CLI separately reports the interim health factor after each
+Aave borrow and before the CoW fill is resupplied. Treat a failed interim HF
+check as a blocker for that route, even if the quote price itself passes.
+
+For tighter recursive loops, use `--swap-adapter 0x` or
+`--swap-adapter oneinch`. These adapters fetch synchronous swap transaction
+payloads from the 0x AllowanceHolder endpoint or 1inch Classic Swap API. The
+CLI validates the aggregator's guaranteed output against the planner's wstETH
+floor, reports the exact approval target for each loop, and includes the swap
+transaction payload in `--json`. It still does not sign or submit transactions.
+
+`--min-sync-interim-hf` controls the short-window HF floor between Aave borrow,
+swap, and resupply transactions. The default is `1.01`, which blocks routes that
+would be liquidatable before the swapped wstETH is supplied.
+
+The Anvil harness verifies Aave mechanics on a mainnet fork. With
+`--swap-adapter 0x` or `--swap-adapter oneinch`, it also executes the aggregator
+swap transaction returned by the live quote API against the fork, then supplies
+the actual wstETH received. It cannot locally simulate CoW solver settlement;
+use CoW only for live orderbook quote checks. Before each fork borrow, the
+harness reads Aave `availableBorrowsBase` and the live Aave oracle price for the
+debt asset; if a chart-price plan asks for more debt than the forked protocol
+state allows, it fails before submitting the borrow transaction.
+
+## Regime model backtesting and calibration
+
+`run_regime_backtest.py` walk-forward tests the attention-Markov regime model
+against real Deribit ETH-PERPETUAL history. It fetches hourly OHLCV and funding
+in chunked public API requests (cached with timestamps in
+`data/cache/regime_history_cache.json`), reconstructs model features at each
+historical snapshot using only data available at that time, labels realized
+target touches from future candle extremes, and scores first-touch
+probabilities with the Brier-based upgrade gate built into
+`models/market_regime.py`.
+
+```bash
+# Full run: 2 years of history, 7-day horizon, fit calibration scales
+python run_regime_backtest.py --lookback-days 730 --json-out regime_report.json
+
+# Evaluate the untrained heuristic model only
+python run_regime_backtest.py --skip-calibration
+```
+
+Calibration optimizes four global scales (regime drifts, vol multipliers, jump
+intensities, attention signal strength) on a training window and reports the
+Brier score on an embargoed out-of-sample validation window; the regime
+loadings and transition structure remain heuristic and are reported as such.
+The fitted `RegimeCalibration` is persisted with full provenance (train window,
+sample counts, train/validation Brier, climatology baseline) to
+`data/cache/regime_calibration.json`. When that file exists the dashboard's
+market-regime forecast loads it automatically and reports
+`calibration_status: walk_forward_scalar_calibrated` plus the backtest gate
+results; otherwise it stays `heuristic_untrained`. Validation samples use
+overlapping 7-day horizons and are autocorrelated; treat the gate as a
+necessary check, not sufficient proof of edge.
+
+## Supervised touch model, position sizing, and exit policy
+
+Three trading-model layers sit on top of the risk pipeline:
+
+**Supervised touch model** (`models/touch_model.py`, CLI
+`run_touch_backtest.py`): a regularized logistic regression on labeled
+walk-forward (snapshot, target) pairs from real Deribit hourly history. The
+validated feature subset is the pair of analytic barrier-touch probability
+logits at fast and 30-day EWMA vol. `--save-model` refits on all realized
+labels and persists to `data/cache/touch_model_{48,168}h.json` — persisting is
+refused unless the walk-forward Brier gate (>=5% improvement over pooled
+climatology, calibration error <=0.08) passes. Backtest on 2024-07..2026-07
+history: +9.58% (48h, ±3/±6% targets) and +6.29% (168h, ±5/±10% targets) vs
+pooled climatology; strict per-target trailing-climatology skill is much
+smaller (+2.0%/+1.4%), so treat outputs as scenario weights, not directional
+alpha. When a persisted model exists and derivatives features are enabled, the
+dashboard emits `professional_modeling.touch_model_forecast` and the pre-trade
+entry score uses it in place of the heuristic regime touch probabilities
+(`components.touch_probability_source` records which source was used).
+Disable with `--no-touch-model-forecast`.
+
+```bash
+python run_touch_backtest.py --horizon-days 2 --save-model
+python run_touch_backtest.py --horizon-days 7 --save-model
+```
+
+**Position sizing** (`models/position_sizing.py`,
+`professional_modeling.position_sizing`): recommends a loop count as
+min(fractional-Kelly, CVaR-budget) over the optimizer's candidate set. Kelly
+is evaluated empirically — each candidate's E[log(1 + pnl/capital)] on the
+simulated terminal distribution — and the growth-optimal candidate's excess
+leverage is scaled by `--sizing-kelly-fraction` (default 0.5). The CVaR95 loss
+budget is `--sizing-cvar-budget-pct` of capital (default 20%). A
+downside-skewed touch forecast shrinks the Kelly fraction (never grows it);
+`recommended_loops: 0` means stay out.
+
+**Exit / deleveraging policy** (`models/exit_policy.py`,
+`professional_modeling.exit_policy`): an HF-triggered partial deleverage
+ladder evaluated path-by-path against the do-nothing baseline on the same
+simulated paths. At each rung's first HF crossing the engine sells collateral
+at the market stETH/ETH price (Curve slippage + gas) to repay a fraction of
+debt, which raises HF because collateral exceeds debt. Default rungs sit at
+60%/30% of the entry HF buffer with 25%/50% deleveraging; override with
+`--exit-ladder "1.05:0.25,1.02:0.50"`. The report compares P(HF<1), min-HF,
+and terminal P&L (mean/CVaR95) with and without the policy, plus realized
+trigger costs. Note: for wstETH/WETH debt the oracle HF is nearly static, so
+the ladder mainly matters in stablecoin-debt mode.
 
 ## CLI options
 
@@ -183,6 +361,24 @@ The dashboard does not require paid API keys, but live runs do require `AAVE_SUB
 | `--seed` | `42` | RNG seed for reproducibility |
 | `--json` | off | Emit JSON output instead of formatted text |
 | `--fetch` | off | Force live data refresh (bypass fresh cache) |
+| `--debt-mode` | `weth` | Debt leg mode (`weth` or `stablecoin`) |
+| `--debt-asset` | `WETH` | Debt asset label (`WETH`, `USDC`, `USDT`, `DAI`); stablecoin mode defaults effectively to `USDC` when unset |
+| `--stablecoin-borrow-apy-pct` | unset | Optional stablecoin borrow APY percent override; when omitted, stablecoin mode uses live/cached Aave reserve-rate data |
+| `--eth-expected-return-pct` | unset | Expected ETH/USD return over the simulation horizon; useful for directional stablecoin-debt scenarios |
+| `--entry-eth-usd` | unset | Override ETH/USD entry price used for stablecoin debt valuation |
+| `--eth-price-model` | `gbm` | ETH path model (`gbm` or `mean-reverting`) |
+| `--eth-mean-reversion-target-usd` | unset | ETH/USD target for mean-reverting scenarios |
+| `--eth-mean-reversion-half-life-days` | unset | Mean-reversion half-life in days; defaults to 7 when mean-reverting mode needs one |
+| `--optimization-min-loops` / `--optimization-max-loops` | unset | Loop-count range evaluated by the professional model optimizer |
+| `--entry-sweep-prices-usd` | unset | Comma-separated ETH/USD entry prices evaluated by the professional entry-sweep report |
+| `--entry-sweep-min-usd` / `--entry-sweep-max-usd` | current price +/- 15% | Generated entry-sweep range when explicit prices are not supplied |
+| `--entry-sweep-step-usd` | unset | Fixed dollar spacing for generated entry-sweep prices |
+| `--entry-sweep-points` | `7` | Number of generated entry prices when step size is unset |
+| `--entry-sweep-target-usd` | mean-reversion target or expected-return target | ETH/USD exit target used for target P&L and reward/risk ranking |
+| `--entry-sweep-max-paths` | `2000` | Maximum Monte Carlo paths used for each entry-sweep candidate |
+| `--opt-max-prob-hf-lt-1-pct` | conservative default | Optimizer max allowed probability that HF drops below 1 |
+| `--opt-min-start-hf` | conservative default | Optimizer minimum starting health factor |
+| `--opt-max-entry-cost-bps` / `--opt-max-unwind-cost-bps` | conservative defaults | Optimizer max entry and stressed unwind cost constraints |
 | `--staking-apy-method` | horizon-aware | Staking APY method (`latest` or `trailing_7d_avg`) |
 | `--staking-apy-lookback-days` | `7` | Lookback window for trailing staking APY |
 | `--exchange-rate-mode` | profile-aware | Exchange-rate model mode (`simple` or `capo_slashing`) |
@@ -577,6 +773,16 @@ So:
 - ETH/USD directionality does not directly drive HF for this pair.
 - stETH/ETH market depeg does not directly drive HF for this pair.
 - Borrow-rate-driven debt growth can still push HF down over time.
+
+In `stablecoin` debt mode, debt is USD-denominated. The simplified HF identity becomes:
+
+`HF = (C_wstETH * exchange_rate * ETH/USD * LT) / D_stable`
+
+So:
+
+- ETH/USD upside improves HF and reduces the ETH value of the stablecoin debt.
+- ETH/USD downside directly worsens HF and can trigger liquidation.
+- Stablecoin borrow APY uses live/cached Aave reserve-rate data by default; `stablecoin_borrow_apy` is an explicit scenario override.
 
 ## Known modeling limits
 

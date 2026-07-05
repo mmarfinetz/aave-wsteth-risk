@@ -5,8 +5,12 @@ import pytest
 
 from config.params import (
     DepegParams,
+    UtilizationParams,
+    WETHRateParams,
     _calibrate_depeg_params,
     _calibrate_governance_and_slashing,
+    _calibrate_utilization_params,
+    _infer_utilization_from_borrow_rates,
     load_params,
 )
 from data.fetcher import FetchedData
@@ -34,6 +38,19 @@ def _synthetic_eth_history(n_days: int = 365, seed: int = 9) -> list[float]:
     for i, ret in enumerate(returns, start=1):
         prices[i] = prices[i - 1] * np.exp(ret)
     return prices.tolist()
+
+
+def _borrow_rates_from_utilization(utilization: np.ndarray, params: WETHRateParams) -> np.ndarray:
+    below = params.base_rate + params.slope1 * (
+        utilization / params.optimal_utilization
+    )
+    above = (
+        params.base_rate
+        + params.slope1
+        + params.slope2
+        * ((utilization - params.optimal_utilization) / (1.0 - params.optimal_utilization))
+    )
+    return np.where(utilization <= params.optimal_utilization, below, above)
 
 
 def _fake_fetched_snapshot(
@@ -154,6 +171,83 @@ def test_calibrate_governance_and_slashing_from_history():
     assert 0.0025 <= params["slashing_severity"] <= 0.25
 
 
+def test_infer_utilization_from_borrow_rates_inverts_two_slope_curve():
+    rate_params = WETHRateParams(
+        base_rate=0.001,
+        slope1=0.03,
+        slope2=0.70,
+        optimal_utilization=0.90,
+        reserve_factor=0.15,
+    )
+    utilization = np.array([0.10, 0.50, 0.89, 0.92, 0.98], dtype=float)
+    borrow_rates = _borrow_rates_from_utilization(utilization, rate_params)
+
+    inferred = _infer_utilization_from_borrow_rates(borrow_rates, rate_params)
+
+    assert inferred == pytest.approx(utilization, rel=1e-10, abs=1e-10)
+
+
+def test_calibrate_utilization_params_from_borrow_rate_history():
+    rate_params = WETHRateParams(
+        base_rate=0.0,
+        slope1=0.027,
+        slope2=0.80,
+        optimal_utilization=0.90,
+        reserve_factor=0.15,
+    )
+    rng = np.random.default_rng(123)
+    n = 240
+    dt = 1.0 / 365.0
+    target = 0.76
+    kappa = 8.0
+    sigma = 0.035
+    utilization = np.empty(n, dtype=float)
+    utilization[0] = 0.70
+    for idx in range(1, n):
+        utilization[idx] = (
+            utilization[idx - 1]
+            + kappa * (target - utilization[idx - 1]) * dt
+            + rng.normal(0.0, sigma * np.sqrt(dt))
+        )
+    utilization = np.clip(utilization, 0.40, 0.99)
+    borrow_rates = _borrow_rates_from_utilization(utilization, rate_params)
+    timestamps = np.arange(1_700_000_000, 1_700_000_000 + n * 86400, 86400)
+
+    params, meta = _calibrate_utilization_params(
+        weth_borrow_apy_history=borrow_rates.tolist(),
+        weth_borrow_apy_timestamps=timestamps.tolist(),
+        rate_params=rate_params,
+        current_utilization=float(utilization[-1]),
+    )
+
+    assert isinstance(params, UtilizationParams)
+    assert meta["method"].startswith("borrow-rate inverse")
+    assert meta["n_rate_obs"] == n
+    assert 0.25 <= params.mean_reversion_speed <= 50.0
+    assert 0.40 <= params.base_target <= 0.99
+    assert 0.005 <= params.vol <= 0.50
+    assert meta["inferred_utilization"]["p50"] == pytest.approx(
+        float(np.percentile(utilization, 50.0)),
+        rel=1e-10,
+    )
+
+
+def test_calibrate_utilization_params_falls_back_when_history_insufficient():
+    defaults = UtilizationParams(base_target=0.81, mean_reversion_speed=7.0, vol=0.04)
+
+    params, meta = _calibrate_utilization_params(
+        weth_borrow_apy_history=[0.01, 0.011],
+        weth_borrow_apy_timestamps=[1_700_000_000, 1_700_086_400],
+        rate_params=WETHRateParams(),
+        current_utilization=0.81,
+        defaults=defaults,
+    )
+
+    assert params == defaults
+    assert meta["method"].startswith("fallback")
+    assert meta["n_rate_obs"] == 2
+
+
 def test_load_params_returns_calibrated_tail_fields(monkeypatch):
     monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
 
@@ -189,6 +283,8 @@ def test_load_params_returns_calibrated_tail_fields(monkeypatch):
     assert isinstance(payload["depeg"], DepegParams)
     assert "depeg_calibration" in payload
     assert "tail_risk_calibration" in payload
+    assert "utilization_calibration" in payload
+    assert isinstance(payload["utilization"], UtilizationParams)
     assert "governance_shock_prob_annual" in payload
     assert "slashing_severity" in payload
     assert payload["weth_execution"].adv_weth == pytest.approx(fake.adv_weth)

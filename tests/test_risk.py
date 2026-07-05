@@ -175,6 +175,82 @@ class TestLoopedPosition:
         assert snap.net_apy > 0
         assert snap.health_factor > 1.0
 
+    def test_stablecoin_debt_hf_depends_on_eth_usd(self):
+        pos = LoopedPosition(
+            capital_eth=2.0,
+            n_loops=5,
+            debt_mode="stablecoin",
+            debt_asset="USDC",
+            initial_eth_usd_price=2000.0,
+        )
+        n_paths = 2
+        n_steps = 2
+        borrow_rates = np.full((n_paths, n_steps + 1), 0.06)
+        exchange = np.full((n_paths, n_steps + 1), pos.wsteth_steth_rate)
+        eth_usd = np.array(
+            [
+                [2000.0, 2200.0, 2400.0],
+                [2000.0, 1600.0, 1400.0],
+            ],
+            dtype=float,
+        )
+
+        hf = pos.health_factor_paths(
+            borrow_rates,
+            exchange_rate_paths=exchange,
+            eth_usd_paths=eth_usd,
+        )
+
+        assert hf[0, -1] > hf[0, 0]
+        assert hf[1, -1] < hf[1, 0]
+
+    def test_stablecoin_debt_pnl_benefits_from_eth_usd_upside(self):
+        pos = LoopedPosition(
+            capital_eth=2.0,
+            n_loops=5,
+            debt_mode="stablecoin",
+            debt_asset="USDC",
+            initial_eth_usd_price=2000.0,
+        )
+        n_paths = 2
+        n_steps = 2
+        borrow_rates = np.full((n_paths, n_steps + 1), 0.06)
+        steth_eth = np.ones((n_paths, n_steps + 1))
+        exchange = np.full((n_paths, n_steps + 1), pos.wsteth_steth_rate)
+        eth_usd = np.array(
+            [
+                [2000.0, 2200.0, 2400.0],
+                [2000.0, 1800.0, 1600.0],
+            ],
+            dtype=float,
+        )
+
+        pnl = pos.pnl_paths(
+            borrow_rate_paths=borrow_rates,
+            steth_eth_paths=steth_eth,
+            exchange_rate_paths=exchange,
+            eth_usd_paths=eth_usd,
+        )
+
+        assert pnl[0, -1] > 0.0
+        assert pnl[1, -1] < pnl[0, -1]
+
+    def test_stablecoin_debt_requires_eth_usd_paths_for_path_metrics(self):
+        pos = LoopedPosition(
+            capital_eth=2.0,
+            n_loops=2,
+            debt_mode="stablecoin",
+            debt_asset="USDC",
+            initial_eth_usd_price=2000.0,
+        )
+        rates = np.full((2, 3), 0.05)
+        steth_eth = np.ones((2, 3))
+
+        with pytest.raises(ValueError, match="eth_usd_paths"):
+            pos.pnl_paths(rates, steth_eth)
+        with pytest.raises(ValueError, match="eth_usd_paths"):
+            pos.health_factor_paths(rates)
+
 
 class TestRiskMetrics:
     def setup_method(self):

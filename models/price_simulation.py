@@ -202,3 +202,84 @@ class GBMSimulator:
         )
 
         return s0 * np.exp(log_prices)
+
+
+class MeanRevertingLogPriceSimulator:
+    """
+    Log-price mean reversion simulator.
+
+    d log(S) = kappa * (log(target) - log(S)) dt + sigma dW
+
+    This is useful for scenario analysis where entry happens below a bullish
+    fair-value anchor and paths should drift toward that anchor instead of using
+    a constant GBM drift.
+    """
+
+    def __init__(
+        self,
+        *,
+        target: float,
+        kappa: float,
+        sigma: float | None = None,
+        config: SimulationConfig = SIM_CONFIG,
+    ):
+        if target <= 0.0:
+            raise ValueError("target must be positive")
+        if kappa < 0.0:
+            raise ValueError("kappa must be non-negative")
+        self.target = float(target)
+        self.kappa = float(kappa)
+        self.sigma = sigma
+        self.config = config
+
+    def simulate(
+        self,
+        s0: float,
+        n_paths: int | None = None,
+        n_steps: int | None = None,
+        dt: float | None = None,
+        sigma: float | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Generate log-OU price paths with antithetic variates."""
+        if s0 <= 0.0:
+            raise ValueError("s0 must be positive")
+        n_paths = n_paths or self.config.n_simulations
+        n_steps = n_steps or self.config.grid.n_steps
+        dt = dt or self.config.dt
+        sigma = sigma if sigma is not None else self.sigma
+        if sigma is None:
+            raise ValueError(
+                "sigma must be provided either in __init__ or simulate(). "
+                "Use VolatilityEstimator.calibrate_from_prices() to calibrate."
+            )
+        if rng is None:
+            rng = np.random.default_rng(self.config.seed)
+
+        half = n_paths // 2
+        z = rng.standard_normal((half, n_steps))
+        z_full = np.concatenate([z, -z], axis=0)
+        if n_paths % 2 == 1:
+            extra = rng.standard_normal((1, n_steps))
+            z_full = np.concatenate([z_full, extra], axis=0)
+
+        x = np.full((z_full.shape[0], n_steps + 1), np.log(float(s0)), dtype=float)
+        target_log = np.log(float(self.target))
+        kappa = float(self.kappa)
+        sigma = float(sigma)
+        if kappa <= np.finfo(float).eps:
+            shock_scale = sigma * np.sqrt(float(dt))
+            for step in range(n_steps):
+                x[:, step + 1] = x[:, step] + shock_scale * z_full[:, step]
+        else:
+            decay = np.exp(-kappa * float(dt))
+            variance = sigma * sigma * (1.0 - np.exp(-2.0 * kappa * float(dt))) / (2.0 * kappa)
+            shock_scale = np.sqrt(max(variance, 0.0))
+            for step in range(n_steps):
+                x[:, step + 1] = (
+                    target_log
+                    + (x[:, step] - target_log) * decay
+                    + shock_scale * z_full[:, step]
+                )
+
+        return np.exp(x)
