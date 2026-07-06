@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend-preview",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd frontend && NODE_OPTIONS= PATH=\"$HOME/.nvm/versions/node/v20.18.2/bin:$PATH\" npm run preview -- --port 4173 --strictPort"
+      ],
+      "port": 4173
+    }
+  ]
+}
