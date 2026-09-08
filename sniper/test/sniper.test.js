@@ -333,6 +333,35 @@ test('a fill reports the position the exit ladder needs to price against', async
   await h.close();
 });
 
+test('refuses when the quote is already below MIN_TOKENS_OUT', async () => {
+  // The pool quotes ~4984 tokens for 0.01 ETH; a 6000 floor cannot be met.
+  const h = await harness({
+    env: { LIVE: 'true', MIN_TOKENS_OUT: '6000' },
+    chain: liveUniPool()
+  });
+  const result = await h.sniper.scan(1);
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.reason, 'below-min-tokens-out');
+  assert.equal(h.mock.sent.length, 0, 'must not broadcast a doomed swap');
+  await h.close();
+});
+
+test('the mock router enforces amountOutMinimum like the real one', async () => {
+  // Fixture fidelity: a router that always succeeded made doomed swaps look fine.
+  const h = await harness({ chain: liveUniPool() });
+  const router = h.sniper.contracts.uniRouter;
+  await assert.rejects(
+    () => router.exactInputSingle.staticCall({
+      tokenIn: WETH, tokenOut: LAPTOP, fee: 3000, recipient: h.wallet.address,
+      amountIn: ethers.parseEther('0.01'),
+      amountOutMinimum: ethers.parseUnits('999999', 18),   // unreachable
+      sqrtPriceLimitX96: 0n
+    }, { value: ethers.parseEther('0.01') }),
+    /Too little received/
+  );
+  await h.close();
+});
+
 // --- sizing: what a four-figure buy does to a launch pool ------------------------
 
 test('blocks a $1k-sized buy against a pool too thin to absorb it', async () => {

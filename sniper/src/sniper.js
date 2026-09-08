@@ -97,6 +97,18 @@ export class Sniper {
 
     // How much of the fill is this trade pushing the pool? At small size this is noise;
     // at four figures against a thin launch pool it is most of the cost.
+    // The quote is already below the floor, so the swap is doomed. Catch it here with a
+    // reason that names the price, rather than letting the router revert with
+    // "Too little received" every block.
+    if (op.quotedOut < this.absoluteMinOut) {
+      logger.error(
+        `Quote of ${ethers.formatUnits(op.quotedOut, this.tokenDecimals)} tokens is below ` +
+        `MIN_TOKENS_OUT of ${ethers.formatUnits(this.absoluteMinOut, this.tokenDecimals)} - ` +
+        'the launch priced above your floor. Not buying.'
+      );
+      return { status: 'blocked', reason: 'below-min-tokens-out', op };
+    }
+
     if (config.MAX_PRICE_IMPACT_BPS > 0n) {
       const probeIn = config.BUY_WEI / 100n;
       const probeOut = probeIn > 0n ? await probeSpot(ctx, op, probeIn) : null;

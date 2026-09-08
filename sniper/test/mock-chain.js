@@ -17,6 +17,19 @@ const aeroFactoryIface = new ethers.Interface(AERO_FACTORY_ABI);
 const aeroRouterIface = new ethers.Interface(AERO_ROUTER_ABI);
 const chainlinkIface = new ethers.Interface(CHAINLINK_ABI);
 
+/**
+ * Encode a revert reason the way a real contract does: the Error(string) selector
+ * followed by the ABI-encoded message. Without this, ethers sees empty revert data and
+ * reports a generic failure, so tests cannot assert on *why* something reverted -- and a
+ * revert for the wrong reason looks identical to the right one.
+ */
+function encodeRevert(message) {
+  return ethers.concat([
+    '0x08c379a0',
+    ethers.AbiCoder.defaultAbiCoder().encode(['string'], [message])
+  ]);
+}
+
 const lc = (a) => String(a).toLowerCase();
 const ZERO_ADDR = ethers.ZeroAddress;
 
@@ -170,13 +183,36 @@ export function createMockChain(overrides = {}) {
       if (sel === aeroRouterIface.getFunction('swapExactETHForTokens').selector) {
         if (state.aeroSwapReverts) throw new Error('execution reverted: aerodrome swap');
         const decoded = aeroRouterIface.decodeFunctionData('swapExactETHForTokens', data);
-        return encodeCall(aeroRouterIface, 'swapExactETHForTokens', [[0n, decoded[0]]]);
+        const [amountOutMin, routes] = decoded;
+        if (state.aeroPool && state.poolReserves[lc(state.aeroPool)]) {
+          const amountIn = state.lastSwapValue ?? 0n;
+          if (amountIn > 0n) {
+            const out = reserveQuote({
+              pool: state.aeroPool, amountIn, tokenIn: routes[0][0], feeBps: 30n
+            });
+            if (out < amountOutMin) throw new Error('execution reverted: INSUFFICIENT_OUTPUT_AMOUNT');
+            return encodeCall(aeroRouterIface, 'swapExactETHForTokens', [[amountIn, out]]);
+          }
+        }
+        return encodeCall(aeroRouterIface, 'swapExactETHForTokens', [[0n, amountOutMin]]);
       }
     }
 
     if (target === lc(UNI_V3_ROUTER)) {
       if (state.uniSwapReverts) throw new Error('execution reverted: uniswap swap');
       const [p] = uniRouterIface.decodeFunctionData('exactInputSingle', data);
+      // The real router reverts when the pool cannot deliver amountOutMinimum. Returning
+      // the minimum unconditionally let doomed swaps look successful in tests.
+      const pool = state.uniPools[Number(p.fee)];
+      if (pool && state.poolReserves[lc(pool)]) {
+        const out = reserveQuote({
+          pool, amountIn: p.amountIn, tokenIn: p.tokenIn, feeBps: BigInt(Number(p.fee)) / 100n
+        });
+        if (out < p.amountOutMinimum) {
+          throw new Error('execution reverted: Too little received');
+        }
+        return encodeCall(uniRouterIface, 'exactInputSingle', [out]);
+      }
       return encodeCall(uniRouterIface, 'exactInputSingle', [p.amountOutMinimum]);
     }
 
@@ -232,8 +268,13 @@ export function createMockChain(overrides = {}) {
       case 'eth_getTransactionCount': return hex(7);
       case 'eth_gasPrice':     return hex(1_000_000n);
       case 'eth_maxPriorityFeePerGas': return hex(100_000n);
-      case 'eth_estimateGas':  return hex(250_000n);
-      case 'eth_call':         return handleCall(params[0].to, params[0].data);
+      case 'eth_estimateGas':
+        state.lastSwapValue = params[0]?.value ? BigInt(params[0].value) : state.lastSwapValue;
+        handleCall(params[0].to, params[0].data);   // estimateGas reverts when the call would
+        return hex(250_000n);
+      case 'eth_call':
+        state.lastSwapValue = params[0].value ? BigInt(params[0].value) : 0n;
+        return handleCall(params[0].to, params[0].data);
       case 'eth_sendRawTransaction': return recordBroadcast(params[0]);
       case 'eth_getBlockByNumber':
         return {
@@ -273,7 +314,7 @@ export function createMockChain(overrides = {}) {
         } catch (err) {
           return {
             jsonrpc: '2.0', id: entry.id,
-            error: { code: 3, message: err.message, data: '0x' }
+            error: { code: 3, message: `execution reverted: ${err.message}`, data: encodeRevert(err.message) }
           };
         }
       };
@@ -359,7 +400,7 @@ export function createMockChain(overrides = {}) {
             } catch (err) {
               return {
                 jsonrpc: '2.0', id: entry.id,
-                error: { code: 3, message: err.message, data: '0x' }
+                error: { code: 3, message: `execution reverted: ${err.message}`, data: encodeRevert(err.message) }
               };
             }
           };

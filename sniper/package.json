@@ -15,7 +15,8 @@
     "exit": "node scripts/exit.js",
     "demo:exit": "node scripts/demo-exit.js",
     "fork-test": "node scripts/fork-test.js",
-    "record-fixtures": "node scripts/record-fixtures.js"
+    "record-fixtures": "node scripts/record-fixtures.js",
+    "simulate": "node scripts/simulate.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
