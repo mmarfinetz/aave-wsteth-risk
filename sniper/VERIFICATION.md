@@ -135,12 +135,56 @@ Both behaviours — the dust pool and the reverting quote — are captured in
 
 Worth knowing: a sniper without a liquidity floor would try to trade into that pool.
 
+## The buy executes — verified on a fork of real Base
+
+`npm run fork-node` then `npm run fork-test`. Forked at block 51056907, buying 0.4033 ETH
+(~$1,000) of USDC through the real SwapRouter02 at real reserves:
+
+```
+ok  Uniswap V3 fee 100  pool 0xb4CB8009...  65.49 WETH, quotes 1001.035558
+ok  Uniswap V3 fee 500  pool 0xd0b53D92... 2079.71 WETH, quotes 1001.099621   <- chosen
+ok  Uniswap V3 fee 3000 pool 0x6c561B44... 16215.53 WETH, quotes  998.961711
+ok  Uniswap V3 fee 10000 pool 0x0b1C2DCb...   81.57 WETH, quotes  990.547758
+ok  Aerodrome            pool 0xcDAC0d6c... 1870.38 WETH, quotes  997.647963
+
+SUCCESS in block 51056910
+ok  wallet received 1001.099621 USDC
+ok  received at least amountOutMinimum
+```
+
+All five venues discovered, the best quote chosen, `staticCall` and `estimateGas` passed,
+the transaction mined, and the tokens actually arrived. This is the whole buy path
+against the deployed contracts.
+
+Against the real target token the same run correctly declines:
+
+```
+Uniswap 500   pool 0x7ed7bFbc...  below MIN_WETH_LIQ (0.00075 WETH)
+Uniswap 10000 pool 0xA321D950...  execution reverted: "Unexpected error"
+Aerodrome     no pool
+-> no venue cleared MIN_WETH_LIQ
+```
+
+Note the fee-500 pool: it did **not** exist at block 51053997 and did at 51056907.
+Liquidity is being seeded ahead of the launch, in dust amounts, across more than one fee
+tier. The bot skips all of it.
+
+### Why Hardhat rather than anvil
+
+foundryup fetches its binaries from GitHub **release assets**, which this environment's
+GitHub proxy serves only for repositories attached to the session — an unattached repo
+gets a 403 regardless of network access level (confirmed: `api.github.com/repos/
+foundry-rs/foundry/releases/latest` → 403, the session's own repo → 200). Hardhat
+installs from npm and forks equally well. Two quirks are handled in
+`scripts/fork-node/`: Hardhat's forking client ignores `HTTPS_PROXY` (hence the localhost
+shim), and it has no hardfork history for chain 8453 (hence mining one block past the
+fork point).
+
 ## What is still not verified
 
-- **No transaction has been sent.** Every check above is a read or a rejected order.
-- **The buy has never executed**, on a fork or otherwise. `npm run fork-test` needs
-  foundry, which is not installed here.
+- **Nothing has executed on Base mainnet.** The fill above happened on a fork, with
+  minted ETH.
 - **Whether the bot wins a launch race** — not modelled anywhere, and not knowable from
   a test.
-- **Behaviour at launch**, when the real pool is funded. The recorded fixture captures
-  the pre-launch state only; re-record after launch to replay the live pool.
+- **Behaviour against the funded pool**, which does not exist yet. Re-run
+  `npm run record-fixtures` and the fork test after launch to exercise it.

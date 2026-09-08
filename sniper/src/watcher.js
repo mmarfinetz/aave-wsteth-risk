@@ -57,7 +57,7 @@ export class Watcher {
     this.sniper = new Sniper({
       contracts, wallet, config: this.config, logger: this.logger, now: this.now
     });
-    this.sniper.setTokenDecimals(this.info.decimals);
+    this.sniper.setTokenDecimals(this.info.decimals, this.info.symbol);
     this.sniper.bought = alreadyBought;
 
     this.lastBlockAt = this.now();

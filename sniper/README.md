@@ -27,6 +27,7 @@ Worth being blunt, because the test count is misleading on its own.
 | `npm run verify` / `verify:cow` | **Live contracts.** Each address answers as itself, contracts cross-reference each other, and the CoW book accepts our order format. See VERIFICATION.md | That a trade executes |
 | `npm test` (86 tests) | The code is self-consistent: guard ordering, exact bigint math, real ABI encode/decode, EIP-712 signatures that recover, reconnect behaviour | Little about live Base. The hand-written mocks encode this repo's *assumptions*; where an assumption is wrong, mock and code are wrong together and those tests still pass |
 | replay tests (fixtures committed) | Replays **real recorded Base responses**, reverts included, through the real decode path. Unlike the mocks, these bytes cannot agree with a mistake in `src/` | Only the read path, at the block recorded |
+| `npm run fork-node` + `npm run fork-test` | **The buy actually executing** against the real routers at real reserves, on a fork. Asserts the wallet received at least `amountOutMinimum` | Nothing about mainnet execution or the launch race |
 | `npm run simulate` | The real decision path at real size, across the launch conditions that plausibly occur: which scenarios buy, which are refused and why, and what the exit ladder would rest at | Pool reserves are assumed, not observed. It tests the decision, not the market |
 | `npm run preflight` | Real Base answers: chain, token, wallet funding, live pool state, the ETH/USD price actually used | Nothing about executing a trade |
 | `npm run fork-test` | The **real** Uniswap/Aerodrome contracts accept the calls and the buy fills, at real reserves | Nothing about the target token before it launches, or about winning the race |
@@ -58,9 +59,14 @@ each check is.
 before committing size. It needs foundry and a Base RPC:
 
 ```
-anvil --fork-url https://mainnet.base.org --port 8545
+BASE_RPC=https://... npm run fork-node     # shim + Hardhat fork of Base
+# in another shell:
 FORK_RPC=http://127.0.0.1:8545 TOKEN=0x<a token that already trades> npm run fork-test
 ```
+
+anvil would be the obvious choice; foundryup downloads binaries from GitHub release
+assets, which some sandboxes refuse for unattached repositories. Hardhat installs from
+npm. See VERIFICATION.md for the two quirks `scripts/fork-node/` works around.
 
 Point `TOKEN` at something with existing liquidity. Before launch the real target has no
 pool, so a fork of today only proves discovery correctly finds nothing — which is worth

@@ -54,8 +54,27 @@ try {
   }
 
   const wallet = ethers.Wallet.createRandom().connect(provider);
-  await provider.send('anvil_setBalance', [wallet.address, ethers.toBeHex(ethers.parseEther('100'))]);
+  // anvil and hardhat expose the same cheat under different namespaces.
+  const balanceHex = ethers.toBeHex(ethers.parseEther('100'));
+  let funded = false;
+  for (const method of ['anvil_setBalance', 'hardhat_setBalance']) {
+    try {
+      await provider.send(method, [wallet.address, balanceHex]);
+      funded = true;
+      info(`funded via ${method}`);
+      break;
+    } catch { /* try the other namespace */ }
+  }
+  if (!funded) throw new Error('Neither anvil_setBalance nor hardhat_setBalance is available');
   ok(`funded a throwaway wallet with 100 fork ETH: ${wallet.address}`);
+
+  // A fork node only needs a hardfork activation history for blocks at or below the fork
+  // point. Mining one block puts every later call past it, so the node uses its
+  // configured hardfork and no per-chain history is required.
+  try {
+    await provider.send('evm_mine', []);
+    info(`mined one block past the fork point (now ${await provider.getBlockNumber()})`);
+  } catch { /* not all backends expose evm_mine; harmless if absent */ }
 
   const token = ethers.getAddress(TOKEN);
   const contracts = buildContracts(provider, wallet);
@@ -100,7 +119,7 @@ try {
   };
 
   const sniper = new Sniper({ contracts, wallet, config, token });
-  sniper.setTokenDecimals(decimals);
+  sniper.setTokenDecimals(decimals, symbol);
   sniper.absoluteMinOut = 1n;   // the fork test is about mechanics, not price
 
   const before = await erc20.balanceOf(wallet.address);

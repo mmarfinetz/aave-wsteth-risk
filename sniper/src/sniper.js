@@ -18,14 +18,16 @@ export class Sniper {
     this.now = now;
 
     this.tokenDecimals = 18;
+    this.tokenSymbol = 'tokens';
     this.absoluteMinOut = 0n;
     this.busy = false;
     this.bought = false;
     this.lastFingerprint = '';
   }
 
-  setTokenDecimals(decimals) {
+  setTokenDecimals(decimals, symbol) {
     this.tokenDecimals = Number(decimals);
+    if (symbol) this.tokenSymbol = symbol;
     if (this.config.MIN_TOKENS_OUT) {
       this.absoluteMinOut = ethers.parseUnits(
         String(this.config.MIN_TOKENS_OUT).trim(),
@@ -82,7 +84,7 @@ export class Sniper {
       logger.log(`pool:        ${op.pool}`);
       logger.log(`pool WETH:   ${ethers.formatEther(op.wethLiquidity)}`);
       logger.log(`buy ETH:     ${ethers.formatEther(config.BUY_WEI)}`);
-      logger.log(`quoted out:  ${ethers.formatUnits(op.quotedOut, this.tokenDecimals)} LAPTOP`);
+      logger.log(`quoted out:  ${ethers.formatUnits(op.quotedOut, this.tokenDecimals)} ${this.tokenSymbol}`);
     }
 
     if (!config.LIVE) {

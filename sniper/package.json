@@ -18,12 +18,17 @@
     "record-fixtures": "node scripts/record-fixtures.js",
     "simulate": "node scripts/simulate.js",
     "verify": "node scripts/verify-contracts.js",
-    "verify:cow": "node scripts/verify-cow.js"
+    "verify:cow": "node scripts/verify-cow.js",
+    "fork-node": "node scripts/start-fork.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "ethers": "^6.13.4",
     "https-proxy-agent": "^9.1.0",
     "undici": "^8.10.2"
+  },
+  "devDependencies": {
+    "hardhat": "^2.22.0",
+    "undici": "^6.0.0"
   }
 }
