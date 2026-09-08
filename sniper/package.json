@@ -1,0 +1,20 @@
+{
+  "name": "base-launch-sniper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Base launch watcher: buys a token on Uniswap V3 or Aerodrome once real liquidity appears.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "watch": "node index.js",
+    "test": "node --test test/*.test.js",
+    "preflight": "node scripts/preflight.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  }
+}
