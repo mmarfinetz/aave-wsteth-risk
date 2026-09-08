@@ -16,6 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 import * as C from '../src/constants.js';
+import { proxiedRequest } from './_proxy.js';
 
 const RPC = process.env.BASE_RPC;
 const TOKEN = process.env.TOKEN ?? C.LAPTOP;
@@ -29,17 +30,25 @@ if (!RPC) {
 /** Records every eth_call that passes through, with its raw result. */
 class RecordingProvider extends ethers.JsonRpcProvider {
   constructor(url) {
-    super(url, { chainId: 8453, name: 'base' }, { staticNetwork: true });
+    super(proxiedRequest(url), { chainId: 8453, name: 'base' }, { staticNetwork: true });
     this.recorded = [];
   }
   async call(tx) {
-    const result = await super.call(tx);
-    this.recorded.push({
-      to: ethers.getAddress(tx.to),
-      data: ethers.hexlify(tx.data),
-      result
-    });
-    return result;
+    const entry = { to: ethers.getAddress(tx.to), data: ethers.hexlify(tx.data) };
+    try {
+      entry.result = await super.call(tx);
+      this.recorded.push(entry);
+      return entry.result;
+    } catch (err) {
+      // A revert is real behaviour -- an uninitialized pool reverts on quote, and the
+      // bot has to handle that. Recording only successes would replay a chain where
+      // every call works, which is the opposite of what a launch looks like.
+      entry.revert = true;
+      entry.errorData = err.data ?? '0x';
+      entry.errorMessage = err.shortMessage ?? err.message ?? 'execution reverted';
+      this.recorded.push(entry);
+      throw err;
+    }
   }
 }
 

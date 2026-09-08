@@ -13,6 +13,7 @@ import { buildContracts } from '../src/wiring.js';
 import { preflight } from '../src/preflight.js';
 import { inspectUniswapV3, inspectAerodrome } from '../src/venues.js';
 import { LAPTOP, UNI_FEE_TIERS } from '../src/constants.js';
+import { proxiedProvider } from './_proxy.js';
 
 const ok = (m) => console.log(`  ok    ${m}`);
 const bad = (m) => console.log(`  FAIL  ${m}`);
@@ -27,7 +28,11 @@ console.log(`  EARLIEST_BUY=${new Date(config.EARLIEST_BUY_MS).toISOString()}`);
 console.log(`  MIN_TOKENS_OUT=${config.MIN_TOKENS_OUT ?? '(unset)'}`);
 console.log(`  sell-path gate=${config.REQUIRE_SELL_PATH}`);
 
-const provider = new ethers.WebSocketProvider(config.BASE_WSS);
+// Preflight only reads, so an HTTP endpoint is enough; only the watcher needs a socket.
+// BASE_RPC also makes this runnable from environments where outbound ws is awkward.
+const provider = process.env.BASE_RPC
+  ? proxiedProvider(process.env.BASE_RPC)
+  : new ethers.WebSocketProvider(config.BASE_WSS);
 const wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
 const contracts = buildContracts(provider, wallet);
 
@@ -36,6 +41,10 @@ let failed = false;
 try {
   console.log('\nConnectivity and wallet');
   const meta = await preflight({ provider, wallet, contracts, config });
+  if (meta.ethUsd) {
+    ok(`ETH/USD ${ethers.formatUnits(meta.ethUsd.price, meta.ethUsd.decimals)} ` +
+       `(${meta.ethUsd.ageSec}s old) -> BUY_ETH resolved to ${ethers.formatEther(config.BUY_WEI)}`);
+  }
   ok(`chain is Base 8453, socket alive`);
   ok(`token ${LAPTOP} responds: ${meta.symbol}, ${meta.decimals} decimals`);
   ok(`wallet ${wallet.address} holds ${ethers.formatEther(meta.balance)} ETH`);

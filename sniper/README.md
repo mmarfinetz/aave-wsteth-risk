@@ -7,6 +7,8 @@ on whichever of Uniswap V3 or Aerodrome quotes better.
 npm install
 cp .env.example .env      # fill in BASE_WSS and PRIVATE_KEY
 npm test                  # 30 tests, no network required
+npm run verify            # read every contract on chain and cross-check them
+npm run verify:cow        # check the live CoW orderbook accepts our order format
 npm run preflight         # read-only check against real Base, sends nothing
 npm start                 # arm the watcher (LIVE=false until you set it)
 
@@ -22,8 +24,9 @@ Worth being blunt, because the test count is misleading on its own.
 | Layer | What it proves | What it does not |
 |---|---|---|
 | `test/contracts.test.js` | **Interface identity.** Every selector, the CoW order type hash and the domain separator are pinned to independently verified constants. A selector is a hash over the full signature including struct field order, so this pins the exact calldata the deployed contracts expect | That the addresses are the right *contracts* — see VERIFICATION.md for how each was checked |
-| `npm test` (84 tests) | The code is self-consistent: guard ordering, exact bigint math, real ABI encode/decode, EIP-712 signatures that recover, reconnect behaviour | Little about live Base. The hand-written mocks encode this repo's *assumptions*; where an assumption is wrong, mock and code are wrong together and those tests still pass |
-| `npm run record-fixtures` then `npm test` | Replays **real recorded Base responses** through the real decode path. Unlike the mocks, these bytes cannot agree with a mistake in `src/` | Only the read path, at the block it was recorded |
+| `npm run verify` / `verify:cow` | **Live contracts.** Each address answers as itself, contracts cross-reference each other, and the CoW book accepts our order format. See VERIFICATION.md | That a trade executes |
+| `npm test` (86 tests) | The code is self-consistent: guard ordering, exact bigint math, real ABI encode/decode, EIP-712 signatures that recover, reconnect behaviour | Little about live Base. The hand-written mocks encode this repo's *assumptions*; where an assumption is wrong, mock and code are wrong together and those tests still pass |
+| replay tests (fixtures committed) | Replays **real recorded Base responses**, reverts included, through the real decode path. Unlike the mocks, these bytes cannot agree with a mistake in `src/` | Only the read path, at the block recorded |
 | `npm run simulate` | The real decision path at real size, across the launch conditions that plausibly occur: which scenarios buy, which are refused and why, and what the exit ladder would rest at | Pool reserves are assumed, not observed. It tests the decision, not the market |
 | `npm run preflight` | Real Base answers: chain, token, wallet funding, live pool state, the ETH/USD price actually used | Nothing about executing a trade |
 | `npm run fork-test` | The **real** Uniswap/Aerodrome contracts accept the calls and the buy fills, at real reserves | Nothing about the target token before it launches, or about winning the race |
@@ -43,6 +46,10 @@ identically. Two things now push back on that:
 BASE_RPC=https://... TOKEN=0x<a token with liquidity> npm run record-fixtures
 npm test        # replay tests light up automatically once a fixture exists
 ```
+
+Two fixtures are already committed: the target token in its pre-launch state (including a
+quoter call that genuinely reverts) and USDC, which exercises all four Uniswap fee tiers
+plus Aerodrome with real quotes. Re-record after launch to replay the funded pool.
 
 See **VERIFICATION.md** for every address, what it was checked against, and how strong
 each check is.

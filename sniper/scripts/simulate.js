@@ -21,7 +21,28 @@ import { CowClient } from '../src/cow.js';
 import { LAPTOP, WETH } from '../src/constants.js';
 
 const BUY_USD = process.env.BUY_USD ?? '1000';
-const ETH_USD = 4400n;                       // the simulated feed's price
+
+// Size against the live price when a Base RPC is reachable. A stale assumption here is
+// not cosmetic: it changes how much ETH the buy is, and therefore the price impact.
+async function liveEthUsd() {
+  const rpc = process.env.BASE_RPC;
+  if (!rpc) return null;
+  try {
+    const { proxiedProvider } = await import('./_proxy.js');
+    const { CHAINLINK_ETH_USD, CHAINLINK_ABI } = await import('../src/constants.js');
+    const p = proxiedProvider(rpc);
+    const feed = new ethers.Contract(CHAINLINK_ETH_USD, CHAINLINK_ABI, p);
+    const [, answer] = await feed.latestRoundData();
+    const decimals = Number(await feed.decimals());
+    p.destroy();
+    return BigInt(Math.round(Number(ethers.formatUnits(answer, decimals))));
+  } catch {
+    return null;
+  }
+}
+
+const live = await liveEthUsd();
+const ETH_USD = live ?? BigInt(process.env.ETH_USD ?? '2479');
 const SUPPLY = 1_000_000_000n;               // $LAPTOP total supply
 const POOL = '0x1111111111111111111111111111111111111111';
 const AERO_POOL = '0x3333333333333333333333333333333333333333';
@@ -45,7 +66,8 @@ async function runScenario(sc) {
   const key = (sc.venue === 'aero' ? AERO_POOL : POOL).toLowerCase();
 
   const chainState = {
-    walletBalance: ethers.parseEther('2'),
+    walletBalance: ethers.parseEther('5'),
+    ethUsdPrice: ETH_USD * 100_000_000n,   // 8-decimal feed, matching ETH_USD above
     poolWeth: { [key]: reserves.weth },
     poolReserves: { [key]: reserves },
     ...(sc.venue === 'aero'
@@ -93,7 +115,8 @@ async function runScenario(sc) {
   return { result, config, reserves };
 }
 
-console.log(`Simulated snipe of $${BUY_USD} (ETH assumed $${ETH_USD})`);
+console.log(`Simulated snipe of $${BUY_USD} at ETH $${ETH_USD}` +
+  (live ? ' (live Chainlink)' : ' (assumed - set BASE_RPC for the live price)'));
 console.log('Chain is simulated; guards, math and order construction are the real code.\n');
 
 const scenarios = [
@@ -159,7 +182,8 @@ const lifecycle = await (async () => {
     token: tokenReserveFor({ wethEth: 60, fdvUsd: 80_000_000 })
   };
   const mock = createMockChain({
-    walletBalance: ethers.parseEther('2'),
+    walletBalance: ethers.parseEther('5'),
+    ethUsdPrice: ETH_USD * 100_000_000n,
     uniPools: { 3000: POOL },
     poolWeth: { [POOL.toLowerCase()]: reserves.weth },
     poolReserves: { [POOL.toLowerCase()]: reserves }

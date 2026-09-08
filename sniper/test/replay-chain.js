@@ -27,7 +27,7 @@ export function loadFixtures() {
 export function createReplayChain(fixture) {
   const byKey = new Map();
   for (const call of fixture.calls) {
-    byKey.set(`${call.to.toLowerCase()}:${call.data.toLowerCase()}`, call.result);
+    byKey.set(`${call.to.toLowerCase()}:${call.data.toLowerCase()}`, call);
   }
 
   const misses = [];
@@ -56,7 +56,16 @@ export function createReplayChain(fixture) {
                 error: { code: 3, message: 'execution reverted: not in fixture', data: '0x' }
               };
             }
-            return { jsonrpc: '2.0', id: entry.id, result: found };
+            // Replay recorded reverts as reverts, so the fixture reproduces what Base
+            // actually did rather than a chain where everything succeeds.
+            if (found.revert) {
+              return {
+                jsonrpc: '2.0', id: entry.id,
+                error: { code: 3, message: found.errorMessage ?? 'execution reverted',
+                         data: found.errorData ?? '0x' }
+              };
+            }
+            return { jsonrpc: '2.0', id: entry.id, result: found.result };
           }
           default:
             return {
