@@ -1,6 +1,4 @@
-import {
-  LAPTOP, WETH, ZERO, UNI_FEE_TIERS, AERO_FACTORY
-} from './constants.js';
+import { WETH, ZERO, UNI_FEE_TIERS, AERO_FACTORY } from './constants.js';
 
 /**
  * Probe every Uniswap V3 fee tier in parallel.
@@ -10,10 +8,10 @@ import {
  * block stale by the time the swap landed.
  */
 export async function inspectUniswapV3(ctx) {
-  const { uniFactory, weth, uniQuoter, buyWei, minWethLiq, diagnostics } = ctx;
+  const { uniFactory, weth, uniQuoter, buyWei, minWethLiq, diagnostics, token } = ctx;
 
   const probes = UNI_FEE_TIERS.map(async (fee) => {
-    const pool = await uniFactory.getPool(WETH, LAPTOP, fee);
+    const pool = await uniFactory.getPool(WETH, token, fee);
     if (!pool || pool === ZERO) {
       diagnostics.push({ venue: 'Uniswap V3', fee, skipped: 'no pool' });
       return null;
@@ -31,7 +29,7 @@ export async function inspectUniswapV3(ctx) {
 
     const [quotedOut] = await uniQuoter.quoteExactInputSingle.staticCall({
       tokenIn: WETH,
-      tokenOut: LAPTOP,
+      tokenOut: token,
       amountIn: buyWei,
       fee,
       sqrtPriceLimitX96: 0n
@@ -67,11 +65,11 @@ export async function inspectUniswapV3(ctx) {
 }
 
 export async function inspectAerodrome(ctx) {
-  const { aeroFactory, weth, aeroRouterRead, buyWei, minWethLiq, diagnostics } = ctx;
+  const { aeroFactory, weth, aeroRouterRead, buyWei, minWethLiq, diagnostics, token } = ctx;
 
   try {
     // A meme-token/WETH pair is a volatile pool, not a stable pool.
-    const pool = await aeroFactory.getPool(WETH, LAPTOP, false);
+    const pool = await aeroFactory.getPool(WETH, token, false);
     if (!pool || pool === ZERO) {
       diagnostics.push({ venue: 'Aerodrome', skipped: 'no pool' });
       return [];
@@ -85,7 +83,7 @@ export async function inspectAerodrome(ctx) {
       return [];
     }
 
-    const routes = [{ from: WETH, to: LAPTOP, stable: false, factory: AERO_FACTORY }];
+    const routes = [{ from: WETH, to: token, stable: false, factory: AERO_FACTORY }];
     const amounts = await aeroRouterRead.getAmountsOut(buyWei, routes);
     const quotedOut = amounts.at(-1);
     if (!quotedOut || quotedOut <= 0n) {
@@ -112,14 +110,14 @@ export async function inspectAerodrome(ctx) {
  * far below the buy side that a transfer tax is eating the position.
  */
 export async function probeSellPath(ctx, op) {
-  const { uniQuoter, aeroRouterRead, diagnostics } = ctx;
+  const { uniQuoter, aeroRouterRead, diagnostics, token } = ctx;
 
   try {
     let returned;
 
     if (op.venue === 'Uniswap V3') {
       const [out] = await uniQuoter.quoteExactInputSingle.staticCall({
-        tokenIn: LAPTOP,
+        tokenIn: token,
         tokenOut: WETH,
         amountIn: op.quotedOut,
         fee: op.fee,
@@ -127,7 +125,7 @@ export async function probeSellPath(ctx, op) {
       });
       returned = out;
     } else {
-      const reverse = [{ from: LAPTOP, to: WETH, stable: false, factory: AERO_FACTORY }];
+      const reverse = [{ from: token, to: WETH, stable: false, factory: AERO_FACTORY }];
       const amounts = await aeroRouterRead.getAmountsOut(op.quotedOut, reverse);
       returned = amounts.at(-1);
     }
@@ -140,6 +138,26 @@ export async function probeSellPath(ctx, op) {
     const reason = err?.shortMessage ?? err?.message ?? String(err);
     diagnostics.push({ venue: op.venue, sellProbe: 'failed', error: reason });
     return { ok: false, reason, returned: 0n };
+  }
+}
+
+/**
+ * Quote a much smaller buy on the same venue, to approximate the undisturbed price.
+ * Used only to estimate how much of the fill is the trade moving the pool against itself.
+ */
+export async function probeSpot(ctx, op, probeIn) {
+  const { uniQuoter, aeroRouterRead, token } = ctx;
+  try {
+    if (op.venue === 'Uniswap V3') {
+      const [out] = await uniQuoter.quoteExactInputSingle.staticCall({
+        tokenIn: WETH, tokenOut: token, amountIn: probeIn, fee: op.fee, sqrtPriceLimitX96: 0n
+      });
+      return out;
+    }
+    const amounts = await aeroRouterRead.getAmountsOut(probeIn, op.routes);
+    return amounts.at(-1);
+  } catch {
+    return null;   // no probe means no impact estimate; the caller decides what that means
   }
 }
 

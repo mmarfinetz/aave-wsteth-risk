@@ -13,7 +13,8 @@
     "test": "node --test test/*.test.js",
     "preflight": "node scripts/preflight.js",
     "exit": "node scripts/exit.js",
-    "demo:exit": "node scripts/demo-exit.js"
+    "demo:exit": "node scripts/demo-exit.js",
+    "fork-test": "node scripts/fork-test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

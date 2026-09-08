@@ -3,7 +3,8 @@ import {
   LAPTOP, WETH, UNI_V3_FACTORY, UNI_V3_QUOTER, UNI_V3_ROUTER,
   AERO_FACTORY, AERO_ROUTER,
   ERC20_ABI, UNI_FACTORY_ABI, UNI_QUOTER_ABI, UNI_ROUTER_ABI,
-  AERO_FACTORY_ABI, AERO_ROUTER_ABI
+  AERO_FACTORY_ABI, AERO_ROUTER_ABI,
+  CHAINLINK_ETH_USD, CHAINLINK_ABI
 } from './constants.js';
 
 /** Read contracts bind to the provider; the two routers that spend funds bind to the wallet. */
@@ -17,6 +18,7 @@ export function buildContracts(provider, wallet) {
     uniRouter: new ethers.Contract(UNI_V3_ROUTER, UNI_ROUTER_ABI, wallet),
     aeroFactory: new ethers.Contract(AERO_FACTORY, AERO_FACTORY_ABI, provider),
     aeroRouterRead: new ethers.Contract(AERO_ROUTER, AERO_ROUTER_ABI, provider),
-    aeroRouter: new ethers.Contract(AERO_ROUTER, AERO_ROUTER_ABI, wallet)
+    aeroRouter: new ethers.Contract(AERO_ROUTER, AERO_ROUTER_ABI, wallet),
+    ethUsdFeed: new ethers.Contract(CHAINLINK_ETH_USD, CHAINLINK_ABI, provider)
   };
 }

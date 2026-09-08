@@ -16,6 +16,16 @@ export const UNI_FEE_TIERS = [100, 500, 3000, 10000];
 export const AERO_FACTORY = ethers.getAddress('0x420DD381b31aEf6683db6B902084cB0FFECe40Da');
 export const AERO_ROUTER = ethers.getAddress('0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43');
 
+// Chainlink ETH/USD on Base. Used only to size a USD-denominated buy.
+// VERIFY THIS: preflight prints the price it reads, so a wrong feed shows up as an
+// obviously wrong number rather than a silently mis-sized trade.
+export const CHAINLINK_ETH_USD = ethers.getAddress('0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70');
+
+export const CHAINLINK_ABI = [
+  'function latestRoundData() view returns (uint80 roundId,int256 answer,uint256 startedAt,uint256 updatedAt,uint80 answeredInRound)',
+  'function decimals() view returns (uint8)'
+];
+
 export const BASE_CHAIN_ID = 8453n;
 export const ZERO = ethers.ZeroAddress;
 

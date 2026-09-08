@@ -5,7 +5,8 @@ import {
   LAPTOP, WETH, UNI_V3_FACTORY, UNI_V3_QUOTER, UNI_V3_ROUTER,
   AERO_FACTORY, AERO_ROUTER,
   ERC20_ABI, UNI_FACTORY_ABI, UNI_QUOTER_ABI, UNI_ROUTER_ABI,
-  AERO_FACTORY_ABI, AERO_ROUTER_ABI
+  AERO_FACTORY_ABI, AERO_ROUTER_ABI,
+  CHAINLINK_ETH_USD, CHAINLINK_ABI
 } from '../src/constants.js';
 
 const erc20 = new ethers.Interface(ERC20_ABI);
@@ -14,9 +15,24 @@ const uniQuoterIface = new ethers.Interface(UNI_QUOTER_ABI);
 const uniRouterIface = new ethers.Interface(UNI_ROUTER_ABI);
 const aeroFactoryIface = new ethers.Interface(AERO_FACTORY_ABI);
 const aeroRouterIface = new ethers.Interface(AERO_ROUTER_ABI);
+const chainlinkIface = new ethers.Interface(CHAINLINK_ABI);
 
 const lc = (a) => String(a).toLowerCase();
 const ZERO_ADDR = ethers.ZeroAddress;
+
+/**
+ * Constant-product output with a fee, the x*y=k curve both venues price on.
+ *
+ * The mock used to return a fixed amount whatever the input, which made it a lookup
+ * table rather than a pool: a probe quote at 1/100th the size came back identical, so
+ * price impact was invisible. Pricing off reserves means size actually costs something,
+ * the way it does on chain.
+ */
+export function cpQuote({ amountIn, reserveIn, reserveOut, feeBps = 30n }) {
+  if (amountIn <= 0n || reserveIn <= 0n || reserveOut <= 0n) return 0n;
+  const afterFee = amountIn * (10_000n - feeBps) / 10_000n;
+  return (afterFee * reserveOut) / (reserveIn + afterFee);
+}
 
 /**
  * A minimal Base node. It answers real JSON-RPC over HTTP so the code under test goes
@@ -32,11 +48,17 @@ export function createMockChain(overrides = {}) {
     totalSupply: ethers.parseUnits('1000000000', 18),
     walletBalance: ethers.parseEther('1'),
     tokenHasCode: true,
+    ethUsdPrice: 440000000000n,       // $4,400.00 at 8 decimals
+    ethUsdDecimals: 8,
+    ethUsdUpdatedAt: null,            // null = fresh as of the call
+
     uniPools: {},        // fee -> pool address
     aeroPool: ZERO_ADDR,
     poolWeth: {},        // pool address (lowercase) -> WETH balance
-    uniQuote: () => 0n,  // ({ fee, amountIn, tokenIn, tokenOut }) -> bigint
-    aeroQuote: () => 0n, // ({ amountIn, from, to }) -> bigint
+    uniQuote: null,      // ({ fee, amountIn, tokenIn, tokenOut }) -> bigint | null(revert)
+    aeroQuote: null,     // ({ amountIn, from, to }) -> bigint | null(revert)
+    // pool address -> { weth, token } reserves; drives the constant-product quotes.
+    poolReserves: {},
     tokenBalances: {},   // address -> LAPTOP balance
     allowances: {},      // "owner:spender" -> allowance
     uniSwapReverts: false,
@@ -47,6 +69,19 @@ export function createMockChain(overrides = {}) {
 
   const calls = [];
   const sent = [];
+
+  /** Price off the pool's reserves, in whichever direction is being asked. */
+  function reserveQuote({ pool, amountIn, tokenIn, feeBps }) {
+    const reserves = state.poolReserves[lc(pool)];
+    if (!reserves) return 0n;
+    const buyingToken = lc(tokenIn) === lc(WETH);
+    return cpQuote({
+      amountIn,
+      reserveIn: buyingToken ? reserves.weth : reserves.token,
+      reserveOut: buyingToken ? reserves.token : reserves.weth,
+      feeBps
+    });
+  }
 
   const encodeCall = (iface, fn, values) => iface.encodeFunctionResult(fn, values);
 
@@ -78,6 +113,18 @@ export function createMockChain(overrides = {}) {
       }
     }
 
+    if (target === lc(CHAINLINK_ETH_USD)) {
+      const sel = data.slice(0, 10);
+      if (sel === chainlinkIface.getFunction('decimals').selector) {
+        return encodeCall(chainlinkIface, 'decimals', [state.ethUsdDecimals]);
+      }
+      if (sel === chainlinkIface.getFunction('latestRoundData').selector) {
+        const updatedAt = state.ethUsdUpdatedAt ?? Math.floor(Date.now() / 1000);
+        return encodeCall(chainlinkIface, 'latestRoundData',
+          [1n, state.ethUsdPrice, updatedAt, updatedAt, 1n]);
+      }
+    }
+
     if (target === lc(WETH)) {
       const [pool] = erc20.decodeFunctionData('balanceOf', data);
       return encodeCall(erc20, 'balanceOf', [state.poolWeth[lc(pool)] ?? 0n]);
@@ -97,10 +144,13 @@ export function createMockChain(overrides = {}) {
 
     if (target === lc(UNI_V3_QUOTER)) {
       const [p] = uniQuoterIface.decodeFunctionData('quoteExactInputSingle', data);
-      const out = state.uniQuote({
-        tokenIn: p.tokenIn, tokenOut: p.tokenOut,
-        amountIn: p.amountIn, fee: Number(p.fee)
-      });
+      const fee = Number(p.fee);
+      const out = state.uniQuote
+        ? state.uniQuote({ tokenIn: p.tokenIn, tokenOut: p.tokenOut, amountIn: p.amountIn, fee })
+        : reserveQuote({
+            pool: state.uniPools[fee], amountIn: p.amountIn,
+            tokenIn: p.tokenIn, feeBps: BigInt(fee) / 100n
+          });
       if (out === null) throw new Error('execution reverted: no pool');
       return encodeCall(uniQuoterIface, 'quoteExactInputSingle', [out, 0n, 0, 0n]);
     }
@@ -109,9 +159,11 @@ export function createMockChain(overrides = {}) {
       const sel = data.slice(0, 10);
       if (sel === aeroRouterIface.getFunction('getAmountsOut').selector) {
         const [amountIn, routes] = aeroRouterIface.decodeFunctionData('getAmountsOut', data);
-        const out = state.aeroQuote({
-          amountIn, from: routes[0][0], to: routes[0][1], stable: routes[0][2]
-        });
+        const out = state.aeroQuote
+          ? state.aeroQuote({ amountIn, from: routes[0][0], to: routes[0][1], stable: routes[0][2] })
+          : reserveQuote({
+              pool: state.aeroPool, amountIn, tokenIn: routes[0][0], feeBps: 30n
+            });
         if (out === null) throw new Error('execution reverted');
         return encodeCall(aeroRouterIface, 'getAmountsOut', [[amountIn, out]]);
       }

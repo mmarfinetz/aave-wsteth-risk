@@ -13,6 +13,8 @@ const DEFAULTS = {
   COW_BASE_URL: 'https://api.cow.fi',
   POSITION_FILE: './position.json',
   MAX_SCAN_STALENESS_MS: '4000',
+  MAX_PRICE_IMPACT_BPS: '1000',
+  MAX_FEED_AGE_SEC: '3600',
   BLOCK_WATCHDOG_MS: '60000'
 };
 
@@ -38,12 +40,28 @@ export function loadConfig(env = process.env) {
 
   const LIVE = String(env.LIVE).toLowerCase() === 'true';
 
+  // Size in ETH or in USD, never both -- two sources of truth for trade size is exactly
+  // the ambiguity you do not want at launch.
+  const BUY_USD = env.BUY_USD;
+  if (BUY_USD !== undefined && env.BUY_ETH !== undefined) {
+    errors.push('Set BUY_USD or BUY_ETH, not both');
+  }
+  if (BUY_USD !== undefined && !/^\d+(\.\d+)?$/.test(String(BUY_USD).trim())) {
+    errors.push(`BUY_USD must be a positive decimal number: ${BUY_USD}`);
+  }
+  if (BUY_USD !== undefined && Number(BUY_USD) <= 0) {
+    errors.push('BUY_USD must be greater than 0');
+  }
+
+  // Resolved at arm time from the price feed when BUY_USD is set.
   let BUY_WEI = 0n;
-  try {
-    BUY_WEI = ethers.parseEther(pick('BUY_ETH'));
-    if (BUY_WEI <= 0n) errors.push('BUY_ETH must be greater than 0');
-  } catch {
-    errors.push(`BUY_ETH is not a valid ether amount: ${pick('BUY_ETH')}`);
+  if (BUY_USD === undefined) {
+    try {
+      BUY_WEI = ethers.parseEther(pick('BUY_ETH'));
+      if (BUY_WEI <= 0n) errors.push('BUY_ETH must be greater than 0');
+    } catch {
+      errors.push(`BUY_ETH is not a valid ether amount: ${pick('BUY_ETH')}`);
+    }
   }
 
   let MIN_WETH_LIQ = 0n;
@@ -105,6 +123,16 @@ export function loadConfig(env = process.env) {
     errors.push(`EXIT_TTL_HOURS must be a positive number, got ${pick('EXIT_TTL_HOURS')}`);
   }
 
+  let MAX_PRICE_IMPACT_BPS = 0n;
+  try {
+    MAX_PRICE_IMPACT_BPS = BigInt(pick('MAX_PRICE_IMPACT_BPS'));
+    if (MAX_PRICE_IMPACT_BPS < 0n || MAX_PRICE_IMPACT_BPS > 10_000n) {
+      errors.push('MAX_PRICE_IMPACT_BPS must be between 0 and 10000');
+    }
+  } catch {
+    errors.push(`MAX_PRICE_IMPACT_BPS is not an integer: ${pick('MAX_PRICE_IMPACT_BPS')}`);
+  }
+
   const REQUIRE_SELL_PATH = String(env.REQUIRE_SELL_PATH ?? 'true').toLowerCase() === 'true';
   const MAX_SCAN_STALENESS_MS = Number(pick('MAX_SCAN_STALENESS_MS'));
   const BLOCK_WATCHDOG_MS = Number(pick('BLOCK_WATCHDOG_MS'));
@@ -119,6 +147,7 @@ export function loadConfig(env = process.env) {
     BASE_WSS,
     PRIVATE_KEY,
     LIVE,
+    BUY_USD,
     BUY_WEI,
     MIN_WETH_LIQ,
     GAS_BUFFER_WEI,
@@ -127,6 +156,8 @@ export function loadConfig(env = process.env) {
     MIN_TOKENS_OUT,
     REQUIRE_SELL_PATH,
     MAX_SCAN_STALENESS_MS,
+    MAX_PRICE_IMPACT_BPS,
+    MAX_FEED_AGE_SEC: Number(pick('MAX_FEED_AGE_SEC')),
     BLOCK_WATCHDOG_MS,
     EXIT_LADDER,
     EXIT_LADDER_SPEC: pick('EXIT_LADDER'),

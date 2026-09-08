@@ -1,15 +1,17 @@
 import { ethers } from 'ethers';
 import { WETH, LAPTOP } from './constants.js';
 import { maxBigInt, slippageMin } from './config.js';
-import { inspectUniswapV3, inspectAerodrome, probeSellPath, retentionBps } from './venues.js';
+import { inspectUniswapV3, inspectAerodrome, probeSellPath, retentionBps, probeSpot } from './venues.js';
+import { priceImpactBps } from './pricing.js';
 
 // If the round trip returns less than this, treat the token as untradable rather than
 // merely expensive. 5000 bps = you would get half your ETH back selling straight away.
 const MIN_RETENTION_BPS = 5_000n;
 
 export class Sniper {
-  constructor({ contracts, wallet, config, logger = console, now = () => Date.now() }) {
+  constructor({ contracts, wallet, config, logger = console, now = () => Date.now(), token = LAPTOP }) {
     this.contracts = contracts;
+    this.token = token;
     this.wallet = wallet;
     this.config = config;
     this.logger = logger;
@@ -35,6 +37,7 @@ export class Sniper {
   probeContext(diagnostics) {
     return {
       ...this.contracts,
+      token: this.token,
       buyWei: this.config.BUY_WEI,
       minWethLiq: this.config.MIN_WETH_LIQ,
       diagnostics
@@ -90,6 +93,29 @@ export class Sniper {
     // Belt and braces: config.js already refuses LIVE without MIN_TOKENS_OUT at startup.
     if (this.absoluteMinOut === 0n) {
       return { status: 'blocked', reason: 'missing-absolute-min-out', op };
+    }
+
+    // How much of the fill is this trade pushing the pool? At small size this is noise;
+    // at four figures against a thin launch pool it is most of the cost.
+    if (config.MAX_PRICE_IMPACT_BPS > 0n) {
+      const probeIn = config.BUY_WEI / 100n;
+      const probeOut = probeIn > 0n ? await probeSpot(ctx, op, probeIn) : null;
+      const impact = probeOut
+        ? priceImpactBps({ probeIn, probeOut, actualIn: config.BUY_WEI, actualOut: op.quotedOut })
+        : null;
+
+      if (impact !== null) {
+        op.priceImpactBps = impact;
+        if (impact > config.MAX_PRICE_IMPACT_BPS) {
+          logger.error(
+            `Price impact ${Number(impact) / 100}% exceeds the ` +
+            `${Number(config.MAX_PRICE_IMPACT_BPS) / 100}% cap - pool is too thin for ` +
+            `${ethers.formatEther(config.BUY_WEI)} ETH. Not buying.`
+          );
+          return { status: 'blocked', reason: 'price-impact', impact, op };
+        }
+        logger.log(`price impact: ~${Number(impact) / 100}%`);
+      }
     }
 
     if (config.REQUIRE_SELL_PATH) {
@@ -154,7 +180,7 @@ export class Sniper {
     const { uniRouter } = this.contracts;
     const params = {
       tokenIn: WETH,
-      tokenOut: LAPTOP,
+      tokenOut: this.token,
       fee: op.fee,
       recipient: this.wallet.address,
       amountIn: this.config.BUY_WEI,

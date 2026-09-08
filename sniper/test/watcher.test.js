@@ -5,7 +5,6 @@ import { ethers } from 'ethers';
 import { createMockChain } from './mock-chain.js';
 import { loadConfig } from '../src/config.js';
 import { Watcher } from '../src/watcher.js';
-import { WETH } from '../src/constants.js';
 
 const POOL = '0x1111111111111111111111111111111111111111';
 const TEST_KEY = ethers.Wallet.createRandom().privateKey;
@@ -83,10 +82,10 @@ test('a completed buy is not repeated after a reconnect', async () => {
     chain: {
       uniPools: { 3000: POOL },
       poolWeth: { [POOL.toLowerCase()]: ethers.parseEther('50') },
-      uniQuote: ({ tokenIn }) =>
-        tokenIn.toLowerCase() === WETH.toLowerCase()
-          ? ethers.parseUnits('5000', 18)
-          : ethers.parseEther('0.0098')
+      poolReserves: {
+        [POOL.toLowerCase()]:
+          { weth: ethers.parseEther('50'), token: ethers.parseUnits('25000000', 18) }
+      }
     }
   });
 

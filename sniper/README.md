@@ -14,6 +14,33 @@ npm run demo:exit         # offline walkthrough of the exit path, no network
 npm run exit -- --plan    # show the take-profit ladder, touch nothing
 ```
 
+## How much of this is actually verified
+
+Worth being blunt, because the test count is misleading on its own.
+
+| Layer | What it proves | What it does not |
+|---|---|---|
+| `npm test` (59 tests) | The code is self-consistent: guard ordering, exact bigint math, real ABI encode/decode, EIP-712 signatures that recover, reconnect behaviour | Nothing about Base or CoW. The mocks encode this repo's *assumptions*; where an assumption is wrong, mock and code are wrong together and the tests still pass |
+| `npm run preflight` | Real Base answers: chain, token, wallet funding, live pool state, the ETH/USD price actually used | Nothing about executing a trade |
+| `npm run fork-test` | The **real** Uniswap/Aerodrome contracts accept the calls and the buy fills, at real reserves | Nothing about the target token before it launches, or about winning the race |
+| a small live buy | The whole path, with real money | Only what that size and moment showed |
+
+The mocks are the weak link by construction: `src/cow.js` and `test/mock-cow.js` were
+written together, so a misread of the CoW API breaks both identically. Treat the suite as
+evidence there are no *silly* bugs, not evidence the thing fills.
+
+`npm run fork-test` is the cheapest real evidence available and the one worth running
+before committing size. It needs foundry and a Base RPC:
+
+```
+anvil --fork-url https://mainnet.base.org --port 8545
+FORK_RPC=http://127.0.0.1:8545 TOKEN=0x<a token that already trades> npm run fork-test
+```
+
+Point `TOKEN` at something with existing liquidity. Before launch the real target has no
+pool, so a fork of today only proves discovery correctly finds nothing — which is worth
+knowing, but does not exercise the buy.
+
 ## Safety model
 
 The watcher will not send a transaction unless **all** of these hold:
@@ -26,6 +53,7 @@ The watcher will not send a transaction unless **all** of these hold:
 | `MIN_TOKENS_OUT` | absolute floor on tokens received — **required** when `LIVE=true` |
 | `SLIPPAGE_BPS` | relative floor against the quote just taken |
 | `REQUIRE_SELL_PATH` | round trip must quote, and return >50% of input |
+| `MAX_PRICE_IMPACT_BPS` | refuse a fill worse than this vs. the pool's undisturbed price |
 | staleness | quote older than `MAX_SCAN_STALENESS_MS` is discarded, not traded on |
 | `staticCall` | full simulation from the buying wallet before anything is broadcast |
 
@@ -49,6 +77,28 @@ input. That catches a missing sell side and a punitive transfer tax.
 It does **not** prove the token is sellable. A contract can allow the quote and block the
 transfer, or whitelist addresses, or switch behaviour after launch. Nothing checkable
 before the buy rules that out. Size the position accordingly.
+
+## Sizing, and why it changes the other settings
+
+`MIN_WETH_LIQ` is a threshold on the pool, but what matters is your size *relative* to
+the pool. The defaults suit a 0.01 ETH buy. Scaling to four figures without touching them
+means trading into a pool a tenth as deep as you need:
+
+| Buy | Pool WETH | Approx. price impact |
+|---|---|---|
+| 0.01 ETH | 5 | ~0.1% |
+| 0.227 ETH (~$1k) | 5 | ~9% |
+| 0.227 ETH (~$1k) | 25 | ~1.8% |
+| 0.227 ETH (~$1k) | 50 | ~0.9% |
+
+So a four-figure buy wants `MIN_WETH_LIQ` in the 25-50 range, not 5. `MAX_PRICE_IMPACT_BPS`
+is the backstop that catches this regardless: it quotes a probe at 1/100th your size,
+compares the rates, and refuses the trade if the gap exceeds the cap.
+
+`BUY_USD=1000` reads Chainlink ETH/USD on Base at arm time. The feed address is in
+`src/constants.js` and is **not** verified by this repo — preflight prints the price it
+read, so a wrong feed shows up as an obviously wrong number rather than a quietly
+mis-sized trade. Check that line before every live run.
 
 ## Verify the token
 
