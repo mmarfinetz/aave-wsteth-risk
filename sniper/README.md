@@ -20,14 +20,30 @@ Worth being blunt, because the test count is misleading on its own.
 
 | Layer | What it proves | What it does not |
 |---|---|---|
-| `npm test` (59 tests) | The code is self-consistent: guard ordering, exact bigint math, real ABI encode/decode, EIP-712 signatures that recover, reconnect behaviour | Nothing about Base or CoW. The mocks encode this repo's *assumptions*; where an assumption is wrong, mock and code are wrong together and the tests still pass |
+| `test/contracts.test.js` | **Interface identity.** Every selector, the CoW order type hash and the domain separator are pinned to independently verified constants. A selector is a hash over the full signature including struct field order, so this pins the exact calldata the deployed contracts expect | That the addresses are the right *contracts* — see VERIFICATION.md for how each was checked |
+| `npm test` (84 tests) | The code is self-consistent: guard ordering, exact bigint math, real ABI encode/decode, EIP-712 signatures that recover, reconnect behaviour | Little about live Base. The hand-written mocks encode this repo's *assumptions*; where an assumption is wrong, mock and code are wrong together and those tests still pass |
+| `npm run record-fixtures` then `npm test` | Replays **real recorded Base responses** through the real decode path. Unlike the mocks, these bytes cannot agree with a mistake in `src/` | Only the read path, at the block it was recorded |
 | `npm run preflight` | Real Base answers: chain, token, wallet funding, live pool state, the ETH/USD price actually used | Nothing about executing a trade |
 | `npm run fork-test` | The **real** Uniswap/Aerodrome contracts accept the calls and the buy fills, at real reserves | Nothing about the target token before it launches, or about winning the race |
 | a small live buy | The whole path, with real money | Only what that size and moment showed |
 
-The mocks are the weak link by construction: `src/cow.js` and `test/mock-cow.js` were
-written together, so a misread of the CoW API breaks both identically. Treat the suite as
-evidence there are no *silly* bugs, not evidence the thing fills.
+The hand-written mocks are the weak link by construction: `src/cow.js` and
+`test/mock-cow.js` were written together, so a misread of the CoW API breaks both
+identically. Two things now push back on that:
+
+- **`test/contracts.test.js`** pins selectors and the CoW `TYPE_HASH` to constants taken
+  from the protocols themselves. These cannot drift along with a mistake in `src/`.
+- **`npm run record-fixtures`** captures real Base responses to `test/fixtures/`, which
+  the replay tests then feed through the real decode path. Commit the fixture and CI
+  exercises genuine wire data with no network of its own.
+
+```
+BASE_RPC=https://... TOKEN=0x<a token with liquidity> npm run record-fixtures
+npm test        # replay tests light up automatically once a fixture exists
+```
+
+See **VERIFICATION.md** for every address, what it was checked against, and how strong
+each check is.
 
 `npm run fork-test` is the cheapest real evidence available and the one worth running
 before committing size. It needs foundry and a Base RPC:
