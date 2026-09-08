@@ -37,6 +37,8 @@ export function createMockChain(overrides = {}) {
     poolWeth: {},        // pool address (lowercase) -> WETH balance
     uniQuote: () => 0n,  // ({ fee, amountIn, tokenIn, tokenOut }) -> bigint
     aeroQuote: () => 0n, // ({ amountIn, from, to }) -> bigint
+    tokenBalances: {},   // address -> LAPTOP balance
+    allowances: {},      // "owner:spender" -> allowance
     uniSwapReverts: false,
     aeroSwapReverts: false,
     receiptStatus: 1,
@@ -61,6 +63,18 @@ export function createMockChain(overrides = {}) {
       }
       if (sel === erc20.getFunction('totalSupply').selector) {
         return encodeCall(erc20, 'totalSupply', [state.totalSupply]);
+      }
+      if (sel === erc20.getFunction('balanceOf').selector) {
+        const [who] = erc20.decodeFunctionData('balanceOf', data);
+        return encodeCall(erc20, 'balanceOf', [state.tokenBalances[lc(who)] ?? 0n]);
+      }
+      if (sel === erc20.getFunction('allowance').selector) {
+        const [owner, spender] = erc20.decodeFunctionData('allowance', data);
+        return encodeCall(erc20, 'allowance',
+          [state.allowances[`${lc(owner)}:${lc(spender)}`] ?? 0n]);
+      }
+      if (sel === erc20.getFunction('approve').selector) {
+        return encodeCall(erc20, 'approve', [true]);
       }
     }
 
@@ -143,6 +157,12 @@ export function createMockChain(overrides = {}) {
         venue: 'Aerodrome', amountOutMin: d[0], recipient: d[2],
         deadline: d[3], value: tx.value
       });
+    } else if (target === lc(LAPTOP)) {
+      const [spender, amount] = erc20.decodeFunctionData('approve', tx.data);
+      sent.push({ venue: 'approve', spender, amount });
+      state.allowances[`${lc(ethers.recoverAddress(
+        ethers.Transaction.from(raw).unsignedHash, tx.signature
+      ))}:${lc(spender)}`] = amount;
     } else {
       sent.push({ venue: 'unknown', to: tx.to, data: tx.data });
     }

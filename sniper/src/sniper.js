@@ -127,7 +127,20 @@ export class Sniper {
 
     this.bought = true;
     logger.log(`SUCCESS in block ${receipt.blockNumber}: ${tx.hash}`);
-    return { status: 'bought', op, tx, receipt };
+
+    // Read the resulting balance so the exit ladder can be priced off the real entry
+    // rather than the quote, which is what was hoped for rather than what was filled.
+    let tokensHeld = 0n;
+    try {
+      tokensHeld = await this.contracts.laptop.balanceOf(this.wallet.address);
+    } catch (err) {
+      logger.error(`Could not read post-buy balance: ${err.shortMessage ?? err.message}`);
+    }
+
+    return {
+      status: 'bought', op, tx, receipt, tokensHeld,
+      entryWei: config.BUY_WEI, txHash: tx.hash, blockNumber: receipt.blockNumber
+    };
   }
 
   minOutFor(op) {

@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { parseLadder } from './exit.js';
 
 const DEFAULTS = {
   BUY_ETH: '0.01',
@@ -6,6 +7,11 @@ const DEFAULTS = {
   SLIPPAGE_BPS: '500',
   EARLIEST_BUY: '2026-09-09T00:00:00-04:00',
   GAS_BUFFER_ETH: '0.0005',
+  EXIT_LADDER: '3x:25,5x:25,10x:50',
+  EXIT_TTL_HOURS: '72',
+  EXIT_RECEIVE: 'WETH',
+  COW_BASE_URL: 'https://api.cow.fi',
+  POSITION_FILE: './position.json',
   MAX_SCAN_STALENESS_MS: '4000',
   BLOCK_WATCHDOG_MS: '60000'
 };
@@ -81,6 +87,24 @@ export function loadConfig(env = process.env) {
     errors.push(`MIN_TOKENS_OUT must be a positive decimal number: ${MIN_TOKENS_OUT}`);
   }
 
+  // Parse the ladder here so a typo fails at startup, not after the position is open.
+  let EXIT_LADDER = [];
+  try {
+    EXIT_LADDER = parseLadder(pick('EXIT_LADDER'));
+  } catch (err) {
+    errors.push(`EXIT_LADDER: ${err.message}`);
+  }
+
+  const EXIT_RECEIVE = String(pick('EXIT_RECEIVE')).toUpperCase();
+  if (!['WETH', 'ETH'].includes(EXIT_RECEIVE)) {
+    errors.push(`EXIT_RECEIVE must be WETH or ETH, got ${EXIT_RECEIVE}`);
+  }
+
+  const EXIT_TTL_HOURS = Number(pick('EXIT_TTL_HOURS'));
+  if (!Number.isFinite(EXIT_TTL_HOURS) || EXIT_TTL_HOURS <= 0) {
+    errors.push(`EXIT_TTL_HOURS must be a positive number, got ${pick('EXIT_TTL_HOURS')}`);
+  }
+
   const REQUIRE_SELL_PATH = String(env.REQUIRE_SELL_PATH ?? 'true').toLowerCase() === 'true';
   const MAX_SCAN_STALENESS_MS = Number(pick('MAX_SCAN_STALENESS_MS'));
   const BLOCK_WATCHDOG_MS = Number(pick('BLOCK_WATCHDOG_MS'));
@@ -103,7 +127,13 @@ export function loadConfig(env = process.env) {
     MIN_TOKENS_OUT,
     REQUIRE_SELL_PATH,
     MAX_SCAN_STALENESS_MS,
-    BLOCK_WATCHDOG_MS
+    BLOCK_WATCHDOG_MS,
+    EXIT_LADDER,
+    EXIT_LADDER_SPEC: pick('EXIT_LADDER'),
+    EXIT_TTL_HOURS,
+    EXIT_RECEIVE,
+    COW_BASE_URL: pick('COW_BASE_URL'),
+    POSITION_FILE: pick('POSITION_FILE')
   };
 }
 

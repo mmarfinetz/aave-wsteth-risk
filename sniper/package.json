@@ -11,7 +11,9 @@
     "start": "node index.js",
     "watch": "node index.js",
     "test": "node --test test/*.test.js",
-    "preflight": "node scripts/preflight.js"
+    "preflight": "node scripts/preflight.js",
+    "exit": "node scripts/exit.js",
+    "demo:exit": "node scripts/demo-exit.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

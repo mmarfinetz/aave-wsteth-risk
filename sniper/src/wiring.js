@@ -10,6 +10,7 @@ import {
 export function buildContracts(provider, wallet) {
   return {
     laptop: new ethers.Contract(LAPTOP, ERC20_ABI, provider),
+    laptopWrite: new ethers.Contract(LAPTOP, ERC20_ABI, wallet),
     weth: new ethers.Contract(WETH, ERC20_ABI, provider),
     uniFactory: new ethers.Contract(UNI_V3_FACTORY, UNI_FACTORY_ABI, provider),
     uniQuoter: new ethers.Contract(UNI_V3_QUOTER, UNI_QUOTER_ABI, provider),

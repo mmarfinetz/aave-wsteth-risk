@@ -3,3 +3,5 @@ node_modules/
 .env.*
 !.env.example
 npm-debug.log*
+position.json
+position.orders.json

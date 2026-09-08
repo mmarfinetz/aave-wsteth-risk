@@ -290,6 +290,25 @@ test('a reverting router aborts before anything is broadcast', async () => {
   await h.close();
 });
 
+test('a fill reports the position the exit ladder needs to price against', async () => {
+  const quoted = ethers.parseUnits('5000', 18);
+  const filled = ethers.parseUnits('4900', 18);   // less than quoted, e.g. a transfer tax
+  const h = await harness({
+    env: { LIVE: 'true', MIN_TOKENS_OUT: '1' },
+    chain: liveUniPool(quoted)
+  });
+  // The wallet ends up holding what actually landed, not what was quoted.
+  h.mock.state.tokenBalances[h.wallet.address.toLowerCase()] = filled;
+
+  const result = await h.sniper.scan(7);
+  assert.equal(result.status, 'bought');
+  assert.equal(result.tokensHeld, filled, 'must report the real balance, not the quote');
+  assert.equal(result.entryWei, ethers.parseEther('0.01'));
+  assert.equal(result.blockNumber, 30_000_000);
+  assert.ok(result.txHash?.startsWith('0x'));
+  await h.close();
+});
+
 test('the banner dedupes across blocks instead of reprinting every quote', async () => {
   const lines = [];
   const h = await harness({ chain: liveUniPool(ethers.parseUnits('5000', 18)) });
