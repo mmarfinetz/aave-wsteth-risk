@@ -75,6 +75,51 @@ Point `TOKEN` at something with existing liquidity. Before launch the real targe
 pool, so a fork of today only proves discovery correctly finds nothing — which is worth
 knowing, but does not exercise the buy.
 
+## Running it locally
+
+Nothing here depends on the sandbox it was built in. `src/` has no proxy or localhost
+assumptions; the one place that touches a proxy is `scripts/_proxy.js`, which no-ops when
+`HTTPS_PROXY` is unset — so on your own machine it simply goes direct.
+
+```
+git clone -b token-sniper <repo> && cd <repo>/sniper
+npm install
+cp .env.example .env          # BASE_WSS + PRIVATE_KEY, then the sizing knobs
+npm test                      # 86 tests, no network needed
+BASE_RPC=https://base-mainnet.g.alchemy.com/v2/<key> npm run verify
+```
+
+Use your own RPC. `mainnet.base.org` works for reads but rate-limits under load, and it
+rate-limited once mid-recording during this work.
+
+Two things are **easier locally** than they were here:
+
+- **anvil works.** foundryup downloads binaries from GitHub release assets, which the
+  sandbox refuses for unattached repos — hence `scripts/fork-node/` wrapping Hardhat.
+  Locally, `curl -L https://foundry.paradigm.xyz | bash && foundryup` just works, and you
+  can skip the shim entirely:
+
+  ```
+  anvil --fork-url $BASE_RPC --port 8545
+  FORK_RPC=http://127.0.0.1:8545 TOKEN=0x<liquid token> npm run fork-test
+  ```
+
+  `npm run fork-node` still works if you'd rather not install foundry.
+
+- **The watcher survives.** Here it dies whenever the container is reclaimed, which is why
+  it needs a scheduled backstop. On your machine it just runs:
+
+  ```
+  BASE_RPC=... THRESHOLD_WETH=5 npm run watch
+  ```
+
+  Exit code 0 means the threshold was crossed, 2 the time budget ran out, 3 the RPC kept
+  failing — so it drops straight into a shell loop or a systemd unit.
+
+The only thing that needs your funded wallet is an actual live run. Everything else —
+tests, verification, fork execution, the watcher, `npm run exit -- --plan` — works with a
+throwaway key or none at all.
+
 ## Safety model
 
 The watcher will not send a transaction unless **all** of these hold:
