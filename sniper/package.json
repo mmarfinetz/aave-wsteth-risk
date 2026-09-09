@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "watch": "node index.js",
+    "watch": "node scripts/watch-liquidity.js",
     "test": "node --test test/*.test.js",
     "preflight": "node scripts/preflight.js",
     "exit": "node scripts/exit.js",

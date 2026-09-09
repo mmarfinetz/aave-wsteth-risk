@@ -5,3 +5,4 @@ node_modules/
 npm-debug.log*
 position.json
 position.orders.json
+liquidity-watch.log
