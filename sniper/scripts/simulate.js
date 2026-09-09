@@ -64,6 +64,7 @@ async function runScenario(sc) {
     token: tokenReserveFor(sc)
   };
   const key = (sc.venue === 'aero' ? AERO_POOL : POOL).toLowerCase();
+  const feeTier = sc.fee ?? 3000;
 
   const chainState = {
     walletBalance: ethers.parseEther('5'),
@@ -72,7 +73,7 @@ async function runScenario(sc) {
     poolReserves: { [key]: reserves },
     ...(sc.venue === 'aero'
       ? { aeroPool: AERO_POOL }
-      : { uniPools: { 3000: POOL } })
+      : { uniPools: { [feeTier]: POOL } })
   };
 
   // Override only the sell direction for the honeypot cases.
@@ -115,9 +116,44 @@ async function runScenario(sc) {
   return { result, config, reserves };
 }
 
+const SWEEP = process.argv.includes('--sweep');
+
 console.log(`Simulated snipe of $${BUY_USD} at ETH $${ETH_USD}` +
   (live ? ' (live Chainlink)' : ' (assumed - set BASE_RPC for the live price)'));
 console.log('Chain is simulated; guards, math and order construction are the real code.\n');
+
+if (SWEEP) {
+  // What the real decision path does as a launch pool fills up. The 1% tier is used
+  // because that is where the token's existing dust pool sits, and its fee is paid on
+  // both legs of the round trip.
+  console.log('Depth sweep — 1% fee tier, the tier the launch pool is sitting on\n');
+  const pad = (s, n) => String(s).padEnd(n);
+  console.log(pad('pool WETH', 12) + pad('pool value', 13) + pad('outcome', 28) +
+    pad('impact', 9) + pad('tokens', 11) + 'round trip');
+  console.log('-'.repeat(92));
+
+  for (const wethEth of [1, 3, 5, 8, 13, 20, 30, 50, 80, 150]) {
+    const { result } = await runScenario({
+      label: `${wethEth} WETH`, wethEth, fdvUsd: 80_000_000,
+      minWethLiq: 0.001, maxImpactBps: 10_000, fee: 10_000
+    });
+    const impact = result.impact ?? result.op?.priceImpactBps;
+    const retention = result.op?.retentionBps;
+    console.log(
+      pad(wethEth, 12) +
+      pad('$' + (wethEth * Number(ETH_USD)).toLocaleString('en-US', { maximumFractionDigits: 0 }), 13) +
+      pad(result.status === 'bought' ? 'BUY' : `${result.status}${result.reason ? ': ' + result.reason : ''}`, 28) +
+      pad(impact != null ? `${(Number(impact) / 100).toFixed(2)}%` : '-', 9) +
+      pad(result.op?.quotedOut
+        ? Number(fmt(result.op.quotedOut)).toLocaleString('en-US', { maximumFractionDigits: 0 })
+        : '-', 11) +
+      (retention != null ? `keeps ${(Number(retention) / 100).toFixed(1)}%` : '-')
+    );
+  }
+  console.log('\n"round trip" is what an immediate buy-then-sell returns: both impacts plus');
+  console.log('both fees. It is the floor on what a position costs before price moves at all.');
+  process.exit(0);
+}
 
 const scenarios = [
   { label: 'thin launch pool',      wethEth: 3,   fdvUsd: 80_000_000,  minWethLiq: 1 },

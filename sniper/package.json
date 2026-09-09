@@ -20,7 +20,8 @@
     "verify": "node scripts/verify-contracts.js",
     "verify:cow": "node scripts/verify-cow.js",
     "fork-node": "node scripts/start-fork.js",
-    "scan": "node scripts/scan.js"
+    "scan": "node scripts/scan.js",
+    "liquidity": "node scripts/liquidity-curve.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
