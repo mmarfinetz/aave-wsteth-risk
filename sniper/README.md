@@ -7,6 +7,7 @@ on whichever of Uniswap V3 or Aerodrome quotes better.
 npm install
 cp .env.example .env      # fill in BASE_WSS and PRIVATE_KEY
 npm test                  # 30 tests, no network required
+npm run scan              # one read-only scan of live Base: pools, gate, decision
 npm run verify            # read every contract on chain and cross-check them
 npm run verify:cow        # check the live CoW orderbook accepts our order format
 npm run preflight         # read-only check against real Base, sends nothing
